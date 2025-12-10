@@ -4,7 +4,7 @@ A Unix shell with modern features like fuzzy history search and interactive file
 
 ## What is this?
 
-`fgshell` is a functional Unix shell implementation written in JavaScript/Bun. It has everything you expect from a shell (pipes, redirections, job control, scripting) plus some genuinely useful features that bash/zsh don't have out of the box:
+`fgshell` is a functional Unix shell implementation written mostly in JavaScript/Bun, with a tiny bit of C. It has everything you expect from a shell (pipes, redirections, job control, scripting) plus some genuinely useful features that bash/zsh don't have out of the box:
 
 - **Interactive file picker** (Ctrl+N) with live preview
 - **Fuzzy history search** (Ctrl+R) with Fuse.js
