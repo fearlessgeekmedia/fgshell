@@ -134,4 +134,4 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 
 ## License
 
-Probably shouldn't exist, so probably shouldn't be licensed. Use at your own risk.
+Probably shouldn't exist, so probably shouldn't be licensed. Use at your own risk. Regardless, it's under the MIT license anyway.
