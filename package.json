@@ -1,0 +1,13 @@
+{
+  "name": "fgshell",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "bun run build-fgsh.js"
+  },
+  "dependencies": {
+    "bun-pty": "^0.4.2",
+    "enquirer": "^2.4.1",
+    "fuse.js": "^7.1.0",
+    "glob": "^13.0.0"
+  }
+}

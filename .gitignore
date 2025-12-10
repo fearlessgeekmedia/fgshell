@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+package-lock.json
+bun.lock
+
+# Lock files
+flake.lock
+
+# Build artifacts
+*.node
+*.so
+*.o
+*.a
+fgsh
+result/
+
+# Backup and temporary files
+fgsh-backup
+chat.md
+fakehome/
+yazi.session
+
+# OS files
+.DS_Store
+.env
+.env.local

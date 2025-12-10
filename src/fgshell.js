@@ -1,0 +1,2002 @@
+#!/usr/bin/env bun
+/**
+ * fgshell - a simple interactive shell in Node.js
+ *
+ * Features:
+ * - Parse commands with quotes and escapes
+ * - Pipes, redirection: >, >>, <
+ * - Background jobs with &
+ * - Builtins: cd, pwd, exit, export, unset, env, jobs, fg, bg
+ * - Environment variable expansion: $VAR
+ * - Tab completion for files/dirs
+ * - Basic job control and signal forwarding (SIGINT only after removal of SIGTSTP)
+ * - Ctrl+N file picker: Navigate and select files/directories
+ *
+ * Save as file, chmod +x, run: ./fgsh
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const readline = require('readline');
+const os = require('os');
+const glob = require('glob');
+const SHELL = require('./shell');
+const historyDB = require('./history-db');
+const ptctl = require('./ptctl');
+
+let currentReadlineInput = ''; // Track current readline input
+let isLoadingRcFile = false; // Track if we're loading RC file
+let isFilePickerActive = false; // Track if file picker is active
+let filePickerState = null; // { files, selectedIndex, maxVisible }
+let filePickerResolve = null; // Promise resolver for file picker
+let commandStartTime = 0; // Track when command started for duration calculation
+
+// Shell process group control (for job control with Ctrl+Z)
+let shellPgid = process.pid;
+if (ptctl.available) {
+  try {
+    // Make shell its own process group leader (pgid = 0 means use own PID)
+    ptctl.setpgid(0, 0);
+    shellPgid = ptctl.getpgrp();
+  } catch (e) {
+    debug('Failed to set shell process group:', e.message);
+    shellPgid = process.pid;
+  }
+}
+
+// Check if we're running as a login shell (stdin/stdout are TTY)
+const isLoginShell = process.stdin.isTTY && process.stdout.isTTY;
+
+let rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  prompt: '',
+  completer: completer,
+  terminal: isLoginShell && (!process.argv[2] || process.argv[2] === '-c'),  // Only terminal mode in interactive TTY
+  historySize: 1000,
+});
+
+function isPickerNavKey(key) {
+  if (!key) return false;
+  return (
+    key.name === 'up' ||
+    key.name === 'down' ||
+    key.name === 'left' ||
+    key.name === 'right' ||
+    key.name === 'return' ||
+    key.name === 'escape'
+  );
+}
+
+const originalTtyWrite = rl._ttyWrite.bind(rl);
+
+rl._ttyWrite = function(s, key) {
+  if (isFilePickerActive) {
+    // When picker is active, suppress echo but still allow keypress events
+    return;
+  }
+  return originalTtyWrite(s, key);
+};
+
+function debug(...args) {
+  if (process.env.FGSH_DEBUG) {
+    console.error('[DEBUG]', ...args);
+  }
+}
+
+function completer(line) {
+  // simple completion: complete filenames in cwd or after space complete nothing fancy.
+  try {
+    const parts = line.split(/\s+/);
+    const last = parts[parts.length - 1];
+    const dir = path.dirname(last || '.');
+    const base = path.basename(last || '');
+    const list = fs.readdirSync(path.resolve(SHELL.cwd, dir === '.' ? '' : dir));
+    const hits = list.filter(f => f.startsWith(base)).map(f => (dir === '.' ? f : path.join(dir, f)));
+    return [hits.length ? hits : list, last];
+  } catch (e) {
+    return [[], line];
+  }
+}
+
+// ---------------------- Parsing ----------------------
+function tokenize(input) {
+  // returns array of tokens (not handling pipes/redir specially here)
+  const tokens = [];
+  let i = 0;
+  const L = input.length;
+  let cur = '';
+  let state = 'normal'; // normal, single, double, esc
+  while (i < L) {
+    const ch = input[i];
+    if (state === 'esc') {
+      cur += ch;
+      state = 'normal';
+    } else if (ch === '\\') {
+      state = 'esc';
+    } else if (state === 'single') {
+      if (ch === "'") state = 'normal';
+      else cur += ch;
+    } else if (state === 'double') {
+      if (ch === '"') state = 'normal';
+      else if (ch === '$') {
+        // leave $ as is for expansion phase
+        cur += ch;
+      } else cur += ch;
+    } else {
+      if (ch === "'") {
+        state = 'single';
+      } else if (ch === '"') {
+        state = 'double';
+      } else if (/\s/.test(ch)) {
+        if (cur !== '') {
+          tokens.push(cur);
+          cur = '';
+        }
+      } else {
+        // treat special single-char tokens as separate tokens where needed: | < > &
+        if ('|&<>'.includes(ch)) {
+          if (cur !== '') {
+            tokens.push(cur);
+            cur = '';
+          }
+          // handle >> as combined token
+          if ((ch === '>' || ch === '<') && input[i+1] === '>') {
+            tokens.push(ch + '>');
+            i++;
+          } else tokens.push(ch);
+        } else cur += ch;
+      }
+    }
+    i++;
+  }
+  if (cur !== '') tokens.push(cur);
+  return tokens;
+}
+
+function splitCommands(tokens) {
+  // Convert tokens into a pipeline of command objects
+  // each command: {args:[], stdin:null|file, stdout:null|file, stdoutAppend:false, background:false}
+  const cmds = [];
+  let cur = { args: [], stdin: null, stdout: null, stdoutAppend: false };
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === '|') {
+      cmds.push(cur);
+      cur = { args: [], stdin: null, stdout: null, stdoutAppend: false };
+    } else if (t === '>') {
+      const file = tokens[++i];
+      if (!file) throw new Error('No filename after >');
+      cur.stdout = file;
+      cur.stdoutAppend = false;
+    } else if (t === '>>') {
+      const file = tokens[++i];
+      if (!file) throw new Error('No filename after >>');
+      cur.stdout = file;
+      cur.stdoutAppend = true;
+    } else if (t === '<') {
+      const file = tokens[++i];
+      if (!file) throw new Error('No filename after <');
+      cur.stdin = file;
+    } else if (t === '&') {
+      cur.background = true;
+    } else {
+      cur.args.push(t);
+    }
+    i++;
+  }
+  cmds.push(cur);
+  // if last command had &, mark background
+  if (cmds.length > 0) {
+    const last = cmds[cmds.length - 1];
+    if (last.background === undefined) last.background = false;
+  }
+  return cmds;
+}
+
+// expand $VAR in token (simple)
+function expandVars(str) {
+  // handle ~ expansion
+  if (str === '~') {
+    return SHELL.env.HOME || os.homedir();
+  }
+  if (str.startsWith('~/')) {
+    return (SHELL.env.HOME || os.homedir()) + str.slice(1);
+  }
+  
+  // handle $((arithmetic)) expansion
+  str = str.replace(/\$\(\(([^)]+)\)\)/g, (_, expr) => {
+    try {
+      // Replace variable references with their values
+      const expandedExpr = expr.replace(/([A-Za-z_]\w*)/g, (match) => {
+        return (match in SHELL.env) ? SHELL.env[match] : '0';
+      });
+      // Evaluate the expression
+      const result = Function('"use strict"; return (' + expandedExpr + ')')();
+      return result.toString();
+    } catch (e) {
+      return '0';
+    }
+  });
+  
+  // handle ${VAR} and $VAR
+  return str.replace(/\$(\w+)|\$\{([^}]+)\}/g, (_, a, b) => {
+    const key = a || b;
+    return (key in SHELL.env) ? SHELL.env[key] : '';
+  });
+}
+
+// expand $(command) - command substitution
+async function expandCommandSubstitution(str) {
+  // Find all $(...) patterns
+  const regex = /\$\(([^)]+)\)/g;
+  let result = str;
+  let match;
+  
+  const matches = [];
+  while ((match = regex.exec(str)) !== null) {
+    matches.push({ full: match[0], cmd: match[1], index: match.index });
+  }
+  
+  // Execute each command and replace from right to left to preserve indices
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i];
+    const output = await executeSubshellCommand(m.cmd);
+    result = result.slice(0, m.index) + output.trim() + result.slice(m.index + m.full.length);
+  }
+  
+  return result;
+}
+
+async function executeSubshellCommand(cmdStr) {
+  let tokens = tokenize(cmdStr);
+  if (tokens.length === 0) {
+    return '';
+  }
+  tokens = expandAliases(tokens);
+  tokens = expandGlobs(tokens);
+  const cmds = splitCommands(tokens);
+  cmds.forEach(expandTokens);
+  
+  // For other builtins, we can't capture output
+  if (cmds.length === 1 && isBuiltin(cmds[0].args[0])) {
+    const name = cmds[0].args[0];
+    builtins[name](cmds[0].args);
+    return '';
+  }
+  
+  // Execute the external command and capture output
+  return new Promise((resolve) => {
+    let output = '';
+    const lastCmd = cmds[cmds.length - 1];
+    const command = lastCmd.args[0];
+    const args = lastCmd.args.slice(1);
+    
+    const exe = resolveExecutable(command);
+    if (!exe) {
+      resolve('');
+      return;
+    }
+    
+    const child = spawn(exe, args, {
+      cwd: SHELL.cwd,
+      env: SHELL.env,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    
+    child.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    child.on('exit', () => {
+      resolve(output);
+    });
+  });
+}
+
+function expandTokens(cmd) {
+  cmd.args = cmd.args.map(a => expandVars(a));
+  if (cmd.stdin) cmd.stdin = expandVars(cmd.stdin);
+  if (cmd.stdout) cmd.stdout = expandVars(cmd.stdout);
+}
+
+// ---------------------- Builtins ----------------------
+const builtins = {
+  echo: function(args) {
+    let interpretEscapes = false;
+    let startIdx = 1;
+    
+    // Check for -e flag
+    if (args[1] === '-e') {
+      interpretEscapes = true;
+      startIdx = 2;
+    }
+    
+    let output = args.slice(startIdx).join(' ');
+    
+    if (interpretEscapes) {
+      // Interpret escape sequences
+      output = output
+        .replace(/\\n/g, '\n')
+        .replace(/\\t/g, '\t')
+        .replace(/\\r/g, '\r')
+        .replace(/\\033/g, '\033')
+        .replace(/\\x([0-9a-fA-F]{2})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
+    }
+    
+    console.log(output);
+    return 0;
+  },
+  cd: function(args) {
+    const target = args[1] || SHELL.env.HOME || os.homedir();
+    try {
+      const newdir = path.resolve(SHELL.cwd, target);
+      fs.accessSync(newdir);
+      SHELL.cwd = newdir;
+      process.chdir(SHELL.cwd); // align node process cwd
+    } catch (e) {
+      console.error('cd: ' + e.message);
+      return 1;
+    }
+    return 0;
+  },
+  pwd: function() {
+    console.log(SHELL.cwd);
+    return 0;
+  },
+  exit: function(args) {
+    const code = args[1] ? Number(args[1]) || 0 : 0;
+    process.exit(code);
+  },
+  export: function(args) {
+    // export KEY=VALUE or export KEY
+    for (let i = 1; i < args.length; i++) {
+      const part = args[i];
+      const eq = part.indexOf('=');
+      if (eq >= 0) {
+        const key = part.slice(0, eq);
+        const val = part.slice(eq+1);
+        SHELL.env[key] = val;
+      } else {
+        SHELL.env[part] = process.env[part] || '';
+      }
+    }
+    return 0;
+  },
+  unset: function(args) {
+    for (let i = 1; i < args.length; i++) {
+      delete SHELL.env[args[i]];
+    }
+    return 0;
+  },
+  env: function(args) {
+    for (const k of Object.keys(SHELL.env)) {
+      console.log(`${k}=${SHELL.env[k]}`);
+    }
+    return 0;
+  },
+  jobs: function() {
+    for (const j of SHELL.jobs) {
+      console.log(`[${j.id}] ${j.status}\t${j.cmdline}`);
+    }
+    return 0;
+  },
+  fg: async function(args) {
+    const id = args[1] ? Number(args[1].replace('%','')) : (SHELL.jobs.length ? SHELL.jobs[SHELL.jobs.length-1].id : null);
+    if (!id) { console.error('fg: no job'); return 1; }
+    const job = SHELL.jobs.find(j => j.id === id);
+    if (!job) { console.error('fg: job not found'); return 1; }
+    
+    console.log(job.cmdline);
+    job.background = false;
+    job.status = 'running';
+
+    // If job was started with pty, re-attach it
+    if (job.pty) {
+      rl.pause();
+      process.stdin.setRawMode(true);
+      
+      const ptyInputHandler = (data) => job.pty.write(data.toString());
+      process.stdin.on('data', ptyInputHandler);
+
+      const resizeHandler = () => {
+        if(job.pty) job.pty.resize(process.stdout.columns, process.stdout.rows);
+      };
+      process.stdout.on('resize', resizeHandler);
+      resizeHandler(); // Initial resize
+
+      // Resume the process
+      try {
+        process.kill(job.pty.pid, 'SIGCONT');
+      } catch(e) {
+        // process might have died already
+      }
+
+      // Wait for it to finish or get suspended again
+      await new Promise(resolve => {
+        const exitHandler = job.pty.onExit(() => {
+          process.stdin.removeListener('data', ptyInputHandler);
+          process.stdout.removeListener('resize', resizeHandler);
+          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          resolve();
+        });
+
+        const checkSuspended = setInterval(() => {
+          if (job.status === 'stopped') {
+            process.stdin.removeListener('data', ptyInputHandler);
+            process.stdout.removeListener('resize', resizeHandler);
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            clearInterval(checkSuspended);
+            console.log(`\n[${job.id}] Stopped\t${job.cmdline}`);
+            resolve();
+          }
+        }, 100);
+      });
+      
+      // After job is done, resume shell
+      if (rl.paused) {
+        rl.resume();
+        prompt().catch(() => {});
+      }
+    } else {
+      // For non-pty jobs (background tasks), just bring them to foreground and wait
+      try {
+        for (const pid of job.pids) {
+          process.kill(pid, 'SIGCONT');
+        }
+      } catch(e) {
+        console.error('fg:', e.message);
+        return 1;
+      }
+      await waitForJob(job);
+    }
+    return 0;
+  },
+  bg: function(args) {
+    const id = args[1] ? Number(args[1].replace('%','')) : (SHELL.jobs.length ? SHELL.jobs[SHELL.jobs.length-1].id : null);
+    if (!id) { console.error('bg: no job'); return 1; }
+    const job = SHELL.jobs.find(j => j.id === id);
+    if (!job) { console.error('bg: job not found'); return 1; }
+    // resume job in background
+    try {
+      for (const pid of job.pids) {
+        process.kill(pid, 'SIGCONT');
+      }
+      job.status = 'running';
+    } catch (e) {
+      console.error('bg:', e.message);
+      return 1;
+    }
+    return 0;
+  },
+  history: function(args) {
+    // history [query] - search history, or list all if no query
+    if (args.length === 1) {
+      // List all history
+      const entries = historyDB.getAll(1000);
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        const timestamp = new Date(e.timestamp * 1000).toLocaleString();
+        const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
+        console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
+      }
+    } else {
+      // Search history
+      const query = args.slice(1).join(' ');
+      const results = historyDB.search(query, 50);
+      if (results.length === 0) {
+        console.log('No matching commands found');
+      } else {
+        for (let i = 0; i < results.length; i++) {
+          const e = results[i];
+          const timestamp = new Date(e.timestamp * 1000).toLocaleString();
+          const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
+          console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
+        }
+      }
+    }
+    return 0;
+  },
+  alias: function(args) {
+    if (args.length === 1) {
+      for (const alias in SHELL.aliases) {
+        console.log(`alias ${alias}='${SHELL.aliases[alias]}'`);
+      }
+    } else {
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i];
+        const eq = arg.indexOf('=');
+        if (eq > 0) {
+          const key = arg.slice(0, eq);
+          const val = arg.slice(eq + 1);
+          SHELL.aliases[key] = val;
+        } else {
+          if (arg in SHELL.aliases) {
+            console.log(`alias ${arg}='${SHELL.aliases[arg]}'`);
+          }
+        }
+      }
+    }
+    return 0;
+  },
+  unalias: function(args) {
+    if (args.length === 1) {
+      console.error('unalias: usage: unalias [-a] name [name ...]');
+      return 1;
+    }
+    for (let i = 1; i < args.length; i++) {
+      delete SHELL.aliases[args[i]];
+    }
+    return 0;
+  },
+  source: async function(args) {
+    if (args.length < 2) {
+      console.error('source: usage: source <file>');
+      return 1;
+    }
+    const file = args[1];
+    const filePath = path.resolve(SHELL.cwd, expandVars(file));
+    try {
+      const script = fs.readFileSync(filePath, 'utf8');
+      const lines = script.split('\n');
+      for (let idx = 0; idx < lines.length; idx++) {
+        const line = lines[idx];
+        if (line.trim() && !line.trim().startsWith('#')) {
+          await runLine(line);
+        }
+      }
+      return 0;
+    } catch (e) {
+      console.error(`source: ${e.message}`);
+      return 1;
+    }
+  },
+  js: async function(args) {
+    if (args.length < 2) {
+      console.error('js: usage: js <code>');
+      return 1;
+    }
+    
+    const code = args.slice(1).join(' ');
+    
+    try {
+      // Create context with shell access
+      const context = {
+        env: SHELL.env,
+        cwd: SHELL.cwd,
+        home: os.homedir(),
+        user: os.userInfo().username,
+        // Utility functions
+        cd: (dir) => {
+          const target = path.resolve(SHELL.cwd, expandVars(dir));
+          try {
+            fs.accessSync(target);
+            SHELL.cwd = target;
+            process.chdir(SHELL.cwd);
+            return true;
+          } catch (e) {
+            return false;
+          }
+        },
+        pwd: () => SHELL.cwd,
+        ls: (dir) => {
+          const target = dir ? path.resolve(SHELL.cwd, dir) : SHELL.cwd;
+          try {
+            return fs.readdirSync(target);
+          } catch (e) {
+            return [];
+          }
+        },
+        readFile: (file) => {
+          const target = path.resolve(SHELL.cwd, file);
+          return fs.readFileSync(target, 'utf8');
+        },
+        writeFile: (file, content) => {
+          const target = path.resolve(SHELL.cwd, file);
+          fs.writeFileSync(target, content, 'utf8');
+          return true;
+        },
+      };
+      
+      // Use Function constructor to create and execute code with context
+      // This allows access to context properties while keeping it isolated
+      const contextKeys = Object.keys(context);
+      const contextValues = Object.values(context);
+      
+      // Wrap in async IIFE to support both statements and expressions
+      // Try to evaluate as expression first, fall back to statement
+      const fn = new Function(
+        ...contextKeys,
+        `return (async () => { return ${code} })()`
+      );
+      
+      let result;
+      try {
+        result = await fn(...contextValues);
+      } catch (e) {
+        // If it fails (e.g., statements), try without the return
+        const fn2 = new Function(
+          ...contextKeys,
+          `return (async () => { ${code} })()`
+        );
+        result = await fn2(...contextValues);
+      }
+      
+      // Only output if result is explicitly returned/awaited
+      if (result !== undefined && result !== null) {
+        if (typeof result === 'object') {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(result);
+        }
+      }
+      
+      return 0;
+    } catch (e) {
+      console.error(`js error: ${e.message}`);
+      return 1;
+    }
+  },
+  read: async function(args) {
+    // read VAR1 VAR2 ... 
+    // Reads a line from stdin and stores it in the variables
+    // Usage: read [-p "prompt"] VAR1 [VAR2 ...]
+    if (args.length < 2) {
+      console.error('read: usage: read [-p prompt] VAR1 [VAR2 ...]');
+      return 1;
+    }
+    
+    let varNames = [];
+    let promptText = '';
+    let i = 1;
+    
+    // Check for -p option
+    if (args[i] === '-p' && i + 1 < args.length) {
+      promptText = args[i + 1];
+      i += 2;
+    }
+    
+    // Collect variable names
+    while (i < args.length) {
+      varNames.push(args[i]);
+      i++;
+    }
+    
+    if (varNames.length === 0) {
+      console.error('read: no variable names specified');
+      return 1;
+    }
+    
+    return new Promise((resolve) => {
+      // Pause main readline if it's active
+      if (!rl.paused) {
+        rl.pause();
+      }
+      
+      // Flush stdout before reading
+      if (promptText) {
+        process.stdout.write(promptText);
+      }
+      
+      // Create a new readline interface for reading from stdin
+      // Force terminal to false to prevent readline from printing its own prompt
+      const rlLocal = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: false
+      });
+      
+      let resolved = false;
+      
+      rlLocal.once('line', (line) => {
+        if (!resolved) {
+          resolved = true;
+          const parts = line.split(/\s+/);
+          for (let j = 0; j < varNames.length; j++) {
+            SHELL.env[varNames[j]] = parts[j] || '';
+          }
+          rlLocal.close();
+          resolve(0);
+        }
+      });
+      
+      rlLocal.once('close', () => {
+        if (!resolved) {
+          resolved = true;
+          rlLocal.close();
+          resolve(0);
+        }
+      });
+      
+      rlLocal.once('error', () => {
+        if (!resolved) {
+          resolved = true;
+          rlLocal.close();
+          resolve(1);
+        }
+      });
+    });
+  },
+  '[': function(args) {
+    // The test command: [ expression ]
+    // Last argument must be ]
+    if (args[args.length - 1] !== ']') {
+      console.error('[: missing ]');
+      return 1;
+    }
+    
+    const expr = args.slice(1, -1);
+    if (expr.length === 0) {
+      return 1;
+    }
+    
+    // Handle comparison operators
+    if (expr.length === 3) {
+      const [left, op, right] = expr;
+      const lVal = expandVars(left);
+      const rVal = expandVars(right);
+      
+      // Numeric comparisons
+      const lNum = Number(lVal);
+      const rNum = Number(rVal);
+      
+      let result = false;
+      switch (op) {
+        case '-eq': result = lNum === rNum; break;
+        case '-ne': result = lNum !== rNum; break;
+        case '-lt': result = lNum < rNum; break;
+        case '-le': result = lNum <= rNum; break;
+        case '-gt': result = lNum > rNum; break;
+        case '-ge': result = lNum >= rNum; break;
+        case '=':
+        case '==': result = lVal === rVal; break;
+        case '!=': result = lVal !== rVal; break;
+        case '-z': result = lVal.length === 0; break;
+        case '-n': result = lVal.length > 0; break;
+      }
+      return result ? 0 : 1;
+    }
+    
+    // Handle single argument (check if non-empty)
+    if (expr.length === 1) {
+      const val = expandVars(expr[0]);
+      return val.length > 0 ? 0 : 1;
+    }
+    
+    return 1;
+  },
+  test: function(args) {
+    // test is the same as [, but doesn't require ]
+    return builtins['['](args.concat(']'));
+  },
+};
+
+// ---------------------- Job control helpers ----------------------
+function addJob(pids, cmdline, background) {
+  const job = { id: SHELL.nextJobId++, pids: Array.isArray(pids) ? pids : [pids], cmdline, status: 'running', background: !!background };
+  SHELL.jobs.push(job);
+  return job;
+}
+function removeJob(job) {
+  SHELL.jobs = SHELL.jobs.filter(j => j !== job);
+}
+function findJobByPid(pid) {
+  return SHELL.jobs.find(j => j.pids.includes(pid));
+}
+function markJobDone(job) {
+  job.status = 'done';
+  removeJob(job);
+}
+
+function waitForJob(job) {
+  return new Promise((resolve) => {
+    // wait until no pids left or status changed to done
+    function check() {
+      if (!SHELL.jobs.find(j => j.id === job.id)) {
+        resolve(0);
+      } else {
+        setTimeout(check, 100);
+      }
+    }
+    check();
+  }).then(() => 0);
+}
+
+// ---------------------- Execution ----------------------
+async function runLine(line) {
+  line = line.trim();
+  if (!line) {
+    return;
+  }
+  
+  const isBuiltinCommand = !line.startsWith('history') && !line.startsWith('exit');
+  if (isBuiltinCommand) {
+    SHELL.history.push(line);
+    if (rl.history) {
+      rl.history.push(line);
+    }
+  }
+  
+  commandStartTime = Date.now();
+  
+  // support command sequences with ; (simple)
+  const sequences = splitTopLevel(line, ';');
+  for (const seq of sequences) {
+    await runSingle(seq);
+  }
+  
+  // Record to history DB (but not commands from .fgshrc)
+  if (isBuiltinCommand && !isLoadingRcFile) {
+    const duration = Date.now() - commandStartTime;
+    historyDB.addEntry(line, SHELL.lastExitCode, SHELL.cwd, duration);
+  }
+}
+
+function splitTopLevel(str, sep) {
+  // split on sep not in quotes
+  const parts = [];
+  let cur = '';
+  let state = null;
+  for (let i=0;i<str.length;i++) {
+    const ch = str[i];
+    if (ch === "'" && state !== 'double') { state = (state === 'single' ? null : 'single'); cur += ch; continue; }
+    if (ch === '"' && state !== 'single') { state = (state === 'double' ? null : 'double'); cur += ch; continue; }
+    if (ch === sep && !state) {
+      parts.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  if (cur !== '') parts.push(cur);
+  return parts;
+}
+
+function expandAliases(args) {
+  if (args.length === 0) return args;
+  const cmd = args[0];
+  if (cmd in SHELL.aliases) {
+    const aliasValue = SHELL.aliases[cmd];
+    const aliasTokens = tokenize(aliasValue);
+    return [...aliasTokens, ...args.slice(1)];
+  }
+  return args;
+}
+
+function expandGlobs(args) {
+  const newArgs = [];
+  for (const arg of args) {
+    if (glob.hasMagic(arg)) {
+      const files = glob.sync(arg, { cwd: SHELL.cwd });
+      if (files.length > 0) {
+        newArgs.push(...files);
+      } else {
+        newArgs.push(arg);
+      }
+    } else {
+      newArgs.push(arg);
+    }
+  }
+  return newArgs;
+}
+
+async function runSingle(line) {
+  try {
+    // Check for variable assignment (VAR=value)
+    const assignMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (assignMatch) {
+      const varName = assignMatch[1];
+      let value = assignMatch[2];
+      // Expand variables in the value
+      value = expandVars(value);
+      SHELL.env[varName] = value;
+      SHELL.lastExitCode = 0;
+      return;
+    }
+    
+    // First expand command substitutions
+    line = await expandCommandSubstitution(line);
+    
+    let tokens = tokenize(line);
+    if (tokens.length === 0) return;
+    tokens = expandAliases(tokens);
+    tokens = expandGlobs(tokens);
+    const cmds = splitCommands(tokens);
+    cmds.forEach(expandTokens);
+    // Check for simple builtin-only (no pipes, no redir)
+    if (cmds.length === 1 && isBuiltin(cmds[0].args[0]) && !cmds[0].stdin && !cmds[0].stdout && !cmds[0].background) {
+      const name = cmds[0].args[0];
+      const res = builtins[name](cmds[0].args);
+      if (typeof res === 'number') SHELL.lastExitCode = res;
+      else if (res && typeof res.then === 'function') {
+        const code = await res;
+        SHELL.lastExitCode = code || 0;
+      }
+      return;
+    }
+    // otherwise execute pipeline
+    await executePipeline(cmds);
+  } catch (e) {
+    console.error('Error:', e.message);
+    SHELL.lastExitCode = 1;
+  }
+}
+
+function isBuiltin(name) {
+  return name && (name in builtins);
+}
+
+function spawnCommand(cmd, args, options) {
+  // options: stdio mapping
+  debug('spawn', cmd, args, options);
+  try {
+    return spawn(cmd, args, options);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function executePipeline(cmds) {
+  const n = cmds.length;
+  const procs = [];
+  let pids = [];
+
+  for (let i = 0; i < n; i++) {
+    const c = cmds[i];
+    const argv = c.args.map(a => a);
+    if (argv.length === 0) continue;
+
+    const command = argv[0];
+    const args = argv.slice(1);
+
+    const isInteractive = !c.stdin && !c.stdout && !c.background && n === 1 && !isLoadingRcFile;
+
+    let child;
+    
+    // Check if this is a builtin command (before trying to resolve as executable)
+    if (isBuiltin(command)) {
+      const res = builtins[command]([command, ...args]);
+      if (typeof res === 'number') SHELL.lastExitCode = res;
+      else if (res && typeof res.then === 'function') {
+        const code = await res;
+        SHELL.lastExitCode = code || 0;
+      }
+      continue;
+    }
+    
+    if (isInteractive) {
+      // Check if executable exists first
+      const exe = resolveExecutable(command);
+      if (!exe) {
+        console.error(`${command}: command not found`);
+        SHELL.lastExitCode = 127;
+        return;
+      }
+      
+      // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
+      
+      // 1. Pause readline to yield control of the TTY
+      rl.pause();
+      
+      debug(`Shell PGID: ${shellPgid}, spawning: ${command}`);
+      
+      // 2. Spawn child with inherited stdio and in a new process group
+      // TUI apps require 'inherit' to take full control of the terminal
+      // (including raw mode and alternate screen buffer).
+      // Use 'detached: true' to create a new process group for the child
+      const childProcess = spawn(exe, args, {
+        cwd: SHELL.cwd,
+        env: SHELL.env,
+        stdio: 'inherit', // *** CHANGED: Revert to 'inherit' for full TTY support ***
+        detached: true,   // *** NEW: Create new process group for proper job control ***
+      });
+
+      debug(`Child spawned PID: ${childProcess.pid}`);
+
+      // REMOVED: Manual raw mode setting and keypress handler that broke TUI apps.
+      
+      // 3. Set up proper job control if ptctl is available
+      //    This allows Ctrl+Z to properly suspend the child without corrupting terminal state
+      if (ptctl.available) {
+        try {
+          // Get the child's actual process group (created by detached: true)
+          const childPgid = ptctl.getpgid(childProcess.pid);
+          debug(`Child process group: ${childPgid}`);
+          
+          // Give terminal control to the child process group
+          ptctl.tcsetpgrp(1, childPgid); // fd 1 = stdout
+          const termFgpg = ptctl.tcgetpgrp(1);
+          debug(`Terminal foreground process group: ${termFgpg}`);
+        } catch (e) {
+          debug('ptctl job control setup error:', e.message);
+          // Continue anyway - TTY will still work without proper job control
+        }
+      }
+      
+      // Register job before waiting
+      const cmdline = args.length ? [command, ...args].join(' ') : command;
+      const job = addJob([childProcess.pid], cmdline, false);
+      pids.push(childProcess.pid);
+
+      // Wait for process to exit
+      await new Promise((resolve) => {
+        childProcess.on('exit', (code, signal) => {
+          debug(`Child exited with code ${code}, signal ${signal}`);
+          SHELL.lastExitCode = code || 0;
+          
+          const job = findJobByPid(childProcess.pid);
+          if (job) {
+            markJobDone(job);
+          }
+          
+          // 4. Restore terminal control to the shell if ptctl is available
+          if (ptctl.available) {
+            try {
+              debug(`Restoring terminal to shell PGID: ${shellPgid}`);
+              ptctl.tcsetpgrp(1, shellPgid); // Restore shell's process group to terminal
+              const termFgpg = ptctl.tcgetpgrp(1);
+              debug(`Terminal foreground process group after restore: ${termFgpg}`);
+            } catch (e) {
+              debug('ptctl restore error:', e.message);
+            }
+          }
+          
+          // 5. Resume readline after process exits
+          if (rl.paused) {
+            debug('Resuming readline');
+            rl.resume();
+            rl.line = '';
+            rl.cursor = 0;
+          }
+          
+          resolve();
+        });
+
+        childProcess.on('error', (err) => {
+          console.error(`Error executing ${command}:`, err.message);
+          SHELL.lastExitCode = 1;
+          
+          const job = findJobByPid(childProcess.pid);
+          if (job) {
+            markJobDone(job);
+          }
+          
+          if (rl.paused) {
+            rl.resume();
+          }
+          
+          resolve();
+        });
+      });
+      
+      await prompt();
+      return;
+      // *** END FIX ***
+
+    } else {
+      // Fallback to child_process.spawn for non-interactive commands or pipelines
+      // For single commands without redirects or pipes, inherit stdio for proper interaction
+      const isSingleCommand = n === 1 && !c.stdin && !c.stdout && !c.background;
+      let stdio;
+      if (isSingleCommand) {
+        // During RC file loading, close stdin to prevent reading from piped input
+        if (isLoadingRcFile) {
+          stdio = ['ignore', 'inherit', 'inherit'];
+        } else {
+          stdio = 'inherit';
+        }
+        // Pause readline even during RC file loading to prevent state corruption
+        rl.pause();
+      } else {
+        // prepare stdio array for spawn: [stdin, stdout, stderr]
+        stdio = ['pipe', 'pipe', 'pipe'];
+        // set up input redirection for first cmd
+        if (i === 0 && c.stdin) {
+          try {
+            stdio[0] = fs.openSync(path.resolve(SHELL.cwd, c.stdin), 'r');
+          } catch (e) {
+            console.error('Input redirect error:', e.message);
+            return;
+          }
+        }
+        // set up output redirection for last cmd
+        if (i === n - 1 && c.stdout) {
+          try {
+            const flags = c.stdoutAppend ? 'a' : 'w';
+            stdio[1] = fs.openSync(path.resolve(SHELL.cwd, c.stdout), flags);
+          } catch (e) {
+            console.error('Output redirect error:', e.message);
+            return;
+          }
+        }
+      }
+
+      const options = {
+        cwd: SHELL.cwd,
+        env: SHELL.env,
+        stdio: stdio,
+        detached: false,
+      };
+
+      const exe = resolveExecutable(command);
+      if (!exe) {
+        console.error(`${command}: command not found`);
+        SHELL.lastExitCode = 127;
+        return;
+      }
+      child = spawn(exe, args, options);
+      if (!child) {
+        console.error('Failed to spawn', exe);
+        SHELL.lastExitCode = 1;
+        return;
+      }
+      
+
+      
+      // Store options for later piping check
+      child._cmdOptions = options;
+      
+      // Store resume handler for single commands to be called after child exits
+      if (isSingleCommand) {
+        child._resumeRl = true;
+      }
+    }
+    
+    procs.push(child);
+    pids.push(child.pid);
+
+    // handle piping for regular child_process.spawn (skip if stdio is inherited)
+    const stdioIsInherited = child._cmdOptions && (child._cmdOptions.stdio === 'inherit' || (Array.isArray(child._cmdOptions.stdio) && child._cmdOptions.stdio[1] === 'inherit'));
+    if (!isInteractive && child._cmdOptions && !stdioIsInherited) {
+      try {
+        if (i > 0) {
+          const prev = procs[i-1];
+          if (prev.stdout && child.stdin) {
+            prev.stdout.pipe(child.stdin);
+          }
+        }
+
+        if (i === n-1) {
+          if (!c.stdout && child.stdout) {
+            child.stdout.pipe(process.stdout);
+          }
+        }
+        if (i === 0 && !c.stdin && procs.length === 1 && !c.background) {
+          if (process.stdin.isTTY && child.stdin) {
+            process.stdin.pipe(child.stdin);
+          }
+        }
+        if (child.stderr) {
+          child.stderr.pipe(process.stderr);
+        }
+      } catch (e) {
+        debug('Piping error:', e.message);
+      }
+    }
+    
+    // handle child exit
+    child.on('exit', (code, signal) => {
+      // Resume readline for single commands
+      if (child._resumeRl && rl.paused) {
+        rl.resume();
+      }
+      const job = findJobByPid(child.pid);
+      if (job) {
+        job.pids = job.pids.filter(p => p !== child.pid);
+        if (job.pids.length === 0) {
+          markJobDone(job);
+        }
+      }
+    });
+  }
+
+  // register job
+  const cmdline = cmds.map(c => c.args.join(' ')).join(' | ');
+  const background = cmds[cmds.length-1].background;
+  const job = addJob(pids, cmdline, background);
+
+  if (background) {
+    console.log(`[${job.id}] ${job.pids[0]}`);
+    return;
+  } else {
+    await waitForJob(job).catch(() => {});
+    return;
+  }
+}
+
+function resolveExecutable(cmd) {
+  // If absolute or relative path, test it
+  if (cmd.startsWith('/') || cmd.startsWith('./') || cmd.startsWith('../')) {
+    try {
+      fs.accessSync(cmd, fs.constants.X_OK);
+      return cmd;
+    } catch (e) {
+      return null;
+    }
+  }
+  // search PATH
+  const PATH = (SHELL.env.PATH || process.env.PATH || '/usr/bin:/bin').split(':');
+  for (const p of PATH) {
+    const full = path.join(p, cmd);
+    try {
+      fs.accessSync(full, fs.constants.X_OK);
+      return full;
+    } catch (e) {}
+  }
+  return null;
+}
+
+// ---------------------- Signal handling ----------------------
+process.on('SIGINT', () => {
+  // forward SIGINT to foreground jobs (all jobs not background)
+  for (const j of SHELL.jobs) {
+    if (!j.background) {
+      for (const pid of j.pids) {
+        try { process.kill(pid, 'SIGINT'); } catch(e){}
+      }
+    }
+  }
+  // redisplay prompt via setImmediate to allow signal handling to complete
+  setImmediate(() => {
+    prompt().catch(() => {});
+  });
+});
+
+// reap children to update job table even if not foreground
+process.on('exit', () => {
+  historyDB.closeDB();
+});
+
+// Helper to read directory asynchronously without blocking
+function readDirAsync(dirPath) {
+  return fs.promises.readdir(dirPath, { withFileTypes: true })
+    .then(entries => {
+      return entries
+        .map(dirent => ({
+          name: dirent.name,
+          isDirectory: dirent.isDirectory(),
+        }))
+        .sort((a, b) => {
+          if (a.isDirectory && !b.isDirectory) return -1;
+          if (!a.isDirectory && b.isDirectory) return 1;
+          return a.name.localeCompare(b.name);
+        });
+    });
+}
+
+// Helper to get preview text for a file (text or fallback)
+async function getFilePreview(filePath, maxLines = 20) {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    if (stat.isDirectory()) {
+      return '[Directory]';
+    }
+    
+    const sizeStr = (stat.size / 1024).toFixed(1) + ' KB';
+    
+    // Skip preview for very large files
+    if (stat.size > 50000) {
+      return '[File: ' + sizeStr + ']';
+    }
+    
+    // Skip known binary file extensions
+    const ext = path.extname(filePath).toLowerCase();
+    const binaryExts = ['.db', '.sqlite', '.sqlite3', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.pdf', '.zip', '.gz', '.tar', '.exe', '.bin', '.so', '.dylib', '.o', '.a', '.node'];
+    if (binaryExts.includes(ext)) {
+      return '[Binary: ' + sizeStr + ']';
+    }
+    
+    // Skip files that look like databases or binary
+    const baseName = path.basename(filePath);
+    if (baseName.startsWith('.') && baseName.includes('history')) {
+      return '[Database: ' + sizeStr + ']';
+    }
+    
+    // Try to read as text
+    try {
+      const content = await fs.promises.readFile(filePath, 'utf8');
+      
+      // Check if content looks binary (contains null bytes or control chars)
+      if (content.indexOf('\0') !== -1 || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(content.slice(0, 1000))) {
+        return '[Binary: ' + sizeStr + ']';
+      }
+      
+      // It's text, show preview - strip any remaining escape sequences
+      const lines = content.split('\n').slice(0, maxLines);
+      return lines.map(l => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join('\n');
+    } catch (readErr) {
+      // Failed to read as text, likely binary
+      return '[Binary: ' + sizeStr + ']';
+    }
+  } catch (e) {
+    return '[Cannot read file]';
+  }
+}
+
+function renderFilePickerOverlay() {
+  if (!isFilePickerActive || !filePickerState) return;
+
+  const { files, selectedIndex, maxVisible, filterMode, filterQuery } = filePickerState;
+  const displayFiles = files;
+  const terminalCols = process.stdout.columns || 80;
+
+  const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
+  process.stdout.write(`\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`);
+  process.stdout.write(`(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`);
+  
+  if (filterMode) {
+    process.stdout.write(`Filter: ${filterQuery}\n`);
+  }
+  
+  process.stdout.write('-'.repeat(Math.min(80, terminalCols)) + '\n');
+
+  const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
+  const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
+
+  if (displayFiles.length === 0) {
+    process.stdout.write('(no files)\n');
+  } else {
+    for (let i = startIdx; i < endIdx; i++) {
+      const item = displayFiles[i];
+      const isSelected = i === selectedIndex;
+      const prefix = isSelected ? '> ' : '  ';
+      const icon = item.isDirectory ? '[D] ' : '[F] ';
+      let line = `${prefix}${icon} ${item.name}`;
+
+      if (line.length > terminalCols) {
+        line = line.slice(0, terminalCols - 1) + '...';
+      }
+      if (isSelected) {
+        line = `\x1b[7m${line}\x1b[0m`;
+      }
+      process.stdout.write(line + '\n');
+    }
+  }
+}
+
+function clearFilePickerOverlay() {
+  // Use a safe upper bound for the number of lines to clear. 
+  // The terminal height (or a safe default like 25) is a good upper bound.
+  const MAX_LINES_TO_CLEAR = process.stdout.rows || 25; 
+
+  process.stdout.write('\x1b7'); // 1. Save cursor (current prompt position)
+  
+  // 2. Move to the start of the line *below* the prompt (where the overlay starts)
+  process.stdout.write('\r\n'); 
+  
+  // 3. Explicitly delete the maximum possible number of lines, removing the overlay content
+  process.stdout.write(`\x1b[${MAX_LINES_TO_CLEAR}M`); 
+  
+  process.stdout.write('\x1b8'); // 4. Restore cursor (back to the prompt position)
+}
+
+function handleFilePickerKey(str, key) {
+  if (!filePickerState) return;
+  const { files } = filePickerState;
+
+  // Handle filter mode
+  if (filePickerState.filterMode) {
+    if (key.name === 'escape') {
+      filePickerState.filterMode = false;
+      filePickerState.filterQuery = '';
+      filePickerState.files = [...filePickerState.allFiles];
+      filePickerState.selectedIndex = 0;
+      renderFilePickerOverlay();
+      return;
+    }
+    
+    if (key.name === 'backspace') {
+      if (filePickerState.filterQuery.length > 0) {
+        filePickerState.filterQuery = filePickerState.filterQuery.slice(0, -1);
+      }
+      // Refilter with updated query using fuzzy search with fallback
+      if (filePickerState.filterQuery.length > 0) {
+        const Fuse = require('fuse.js');
+        const fuse = new Fuse(filePickerState.allFiles, {
+          keys: ['name'],
+          threshold: 0.3,
+        });
+        let results = fuse.search(filePickerState.filterQuery).map(r => r.item);
+        
+        // Fallback to substring match if fuzzy search finds nothing
+        if (results.length === 0) {
+          const lowerQuery = filePickerState.filterQuery.toLowerCase();
+          results = filePickerState.allFiles.filter(f => 
+            f.name.toLowerCase().includes(lowerQuery)
+          );
+        }
+        filePickerState.files = results;
+      } else {
+        filePickerState.files = [...filePickerState.allFiles];
+      }
+      filePickerState.selectedIndex = 0;
+      renderFilePickerOverlay();
+      return;
+    }
+    
+    if (key.name === 'return') {
+      const selected = filePickerState.files[filePickerState.selectedIndex];
+      if (!selected) return;
+      if (selected.isDirectory) {
+        SHELL.cwd = path.resolve(SHELL.cwd, selected.name);
+        readDirAsync(SHELL.cwd).then(newFiles => {
+          filePickerState.files = newFiles;
+          filePickerState.allFiles = newFiles;
+          filePickerState.filterQuery = '';
+          filePickerState.filterMode = false;
+          filePickerState.selectedIndex = 0;
+          renderFilePickerOverlay();
+        });
+      } else {
+        if (filePickerResolve) filePickerResolve(selected.name);
+      }
+      return;
+    }
+    
+    // Handle regular character input in filter mode
+    if (str) {
+      filePickerState.filterQuery += str;
+      // Fuzzy search using Fuse.js with fallback to substring match
+      if (filePickerState.filterQuery.length > 0) {
+        const Fuse = require('fuse.js');
+        const fuse = new Fuse(filePickerState.allFiles, {
+          keys: ['name'],
+          threshold: 0.3,
+        });
+        let results = fuse.search(filePickerState.filterQuery).map(r => r.item);
+        
+        // Fallback to substring match if fuzzy search finds nothing
+        if (results.length === 0) {
+          const lowerQuery = filePickerState.filterQuery.toLowerCase();
+          results = filePickerState.allFiles.filter(f => 
+            f.name.toLowerCase().includes(lowerQuery)
+          );
+        }
+        filePickerState.files = results;
+      } else {
+        filePickerState.files = [...filePickerState.allFiles];
+      }
+      filePickerState.selectedIndex = 0;
+      renderFilePickerOverlay();
+      return;
+    }
+    
+    if (key && (key.name === 'up' || key.name === 'down')) {
+      if (key.name === 'up') {
+        filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
+      } else {
+        filePickerState.selectedIndex = Math.min(files.length - 1, filePickerState.selectedIndex + 1);
+      }
+      renderFilePickerOverlay();
+      return;
+    }
+    return;
+  }
+
+  // Normal mode
+  if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+    if (filePickerResolve) filePickerResolve(null);
+    return;
+  }
+  
+  if (key.ctrl && key.name === 'f') {
+    filePickerState.filterMode = true;
+    filePickerState.filterQuery = '';
+    filePickerState.allFiles = [...files];
+    renderFilePickerOverlay();
+    return;
+  }
+
+  if (key.name === 'up') {
+    filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
+    renderFilePickerOverlay();
+  } else if (key.name === 'down') {
+    filePickerState.selectedIndex = Math.min(filePickerState.files.length - 1, filePickerState.selectedIndex + 1);
+    renderFilePickerOverlay();
+  } else if (key.name === 'left') {
+    const parentDir = path.dirname(SHELL.cwd);
+    if (parentDir !== SHELL.cwd) {
+      SHELL.cwd = parentDir;
+      readDirAsync(SHELL.cwd).then(newFiles => {
+        filePickerState.files = newFiles;
+        filePickerState.allFiles = newFiles;
+        filePickerState.selectedIndex = 0;
+        renderFilePickerOverlay();
+      });
+    }
+  } else if (key.name === 'right' || key.name === 'return') {
+    const selected = filePickerState.files[filePickerState.selectedIndex];
+    if (!selected) return;
+    if (selected.isDirectory) {
+      SHELL.cwd = path.resolve(SHELL.cwd, selected.name);
+      readDirAsync(SHELL.cwd).then(newFiles => {
+        filePickerState.files = newFiles;
+        filePickerState.allFiles = newFiles;
+        filePickerState.filterQuery = '';
+        filePickerState.selectedIndex = 0;
+        renderFilePickerOverlay();
+      });
+    } else {
+      if (filePickerResolve) filePickerResolve(selected.name);
+    }
+  }
+}
+
+async function showFilePicker() {
+  if (isFilePickerActive || !process.stdin.isTTY) {
+    return null;
+  }
+  isFilePickerActive = true;
+
+  let files;
+  try {
+    files = await readDirAsync(SHELL.cwd);
+  } catch (e) {
+    isFilePickerActive = false;
+    return null;
+  }
+
+  const terminalRows = process.stdout.rows || 24;
+  const maxVisible = Math.min(Math.floor(terminalRows * 0.6), terminalRows - 5);
+
+  filePickerState = {
+    files,
+    allFiles: files,
+    selectedIndex: 0,
+    maxVisible,
+    filterMode: false,
+    filterQuery: '',
+  };
+
+  return new Promise((resolve) => {
+    filePickerResolve = (result) => {
+      isFilePickerActive = false;
+      clearFilePickerOverlay(); // Clear before nulling state for maximum compatibility
+      filePickerState = null;
+      filePickerResolve = null;
+      rl._refreshLine();
+      resolve(result);
+    };
+
+    renderFilePickerOverlay();
+  });
+}
+
+function showHistoryPicker() {
+  return new Promise(async (resolve) => {
+    if (isFilePickerActive || !process.stdin.isTTY) {
+      return resolve(null);
+    }
+    isFilePickerActive = true;
+
+    let allEntries = historyDB.getAll(500);
+    let filteredEntries = [...allEntries];
+    let searchQuery = '';
+
+    let selectedIndex = 0;
+    const terminalRows = process.stdout.rows || 24;
+    const terminalCols = process.stdout.columns || 80;
+    const maxVisible = Math.min(Math.floor(terminalRows * 0.8), terminalRows - 4);
+    
+    // Clear screen and hide cursor
+    process.stdout.write('\x1b[2J\x1b[H');
+    process.stdout.write('\x1b[?25l');
+
+    async function renderPicker() {
+      // Clear screen and reset cursor
+      process.stdout.write('\x1b[2J\x1b[H');
+      process.stdout.write(`\x1b[1mHistory Search (Ctrl+F to search, Ctrl+C to cancel)\x1b[0m\n`);
+      process.stdout.write(`Filter: ${searchQuery}\n`);
+      process.stdout.write('-'.repeat(Math.min(80, terminalCols)) + '\n');
+      
+      const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), filteredEntries.length - maxVisible));
+      const endIdx = Math.min(startIdx + maxVisible, filteredEntries.length);
+
+      // Render history list
+      for (let i = startIdx; i < endIdx; i++) {
+        const entry = filteredEntries[i];
+        const isSelected = i === selectedIndex;
+        const prefix = isSelected ? '> ' : '  ';
+        const timestamp = new Date(entry.timestamp * 1000).toLocaleString();
+        const exitCode = entry.exit_code !== null ? ` [${entry.exit_code}]` : '';
+        let cmd = entry.command;
+        
+        // Truncate command to fit in terminal
+        const maxCmdLength = Math.max(20, terminalCols - 40);
+        if (cmd.length > maxCmdLength) {
+          cmd = cmd.slice(0, maxCmdLength - 3) + '...';
+        }
+        
+        let line = `${prefix}${timestamp}${exitCode}  ${cmd}`;
+        
+        // Ensure we don't exceed terminal width
+        if (line.length > terminalCols) {
+          line = line.slice(0, terminalCols);
+        }
+        
+        // Apply highlight if selected
+        if (isSelected) {
+          line = `\x1b[7m${line}\x1b[0m`;
+        }
+        
+        process.stdout.write(line + '\n');
+      }
+      
+      if (filteredEntries.length === 0) {
+        process.stdout.write('(no commands found)\n');
+      }
+    }
+
+    await renderPicker();
+    
+    let pickerDone = false;
+    const keypressHandler = (str, key) => {
+      if (pickerDone) return;
+
+      const finalize = (result) => {
+        pickerDone = true;
+        process.stdin.removeAllListeners('keypress');
+        process.stdout.write('\x1b[?25h'); // Show cursor
+        isFilePickerActive = false;
+        resolve(result);
+      }
+
+      if (key && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {
+        finalize(null);
+      } else if (key && key.ctrl && key.name === 'f') {
+        // Ctrl+F to activate search - just position cursor in search field (already active)
+        // This is more of a confirmation that search is active
+        renderPicker().catch(() => {});
+      } else if (key && key.name === 'up') {
+        selectedIndex = Math.max(0, selectedIndex - 1);
+        renderPicker().catch(() => {});
+      } else if (key && key.name === 'down') {
+        selectedIndex = Math.min(filteredEntries.length - 1, filteredEntries.length + 1);
+        renderPicker().catch(() => {});
+      } else if (key && key.name === 'return') {
+        const selected = filteredEntries[selectedIndex];
+        if (selected) {
+          finalize(selected.command);
+        }
+      } else if (key && key.name === 'backspace') {
+        if (searchQuery.length > 0) {
+          searchQuery = searchQuery.slice(0, -1);
+          // Re-filter based on search query
+          if (searchQuery.length === 0) {
+            filteredEntries = [...allEntries];
+          } else {
+            const Fuse = require('fuse.js');
+            const fuse = new Fuse(allEntries, {
+              keys: ['command'],
+              threshold: 0.3,
+            });
+            filteredEntries = fuse.search(searchQuery).map(r => r.item);
+          }
+          selectedIndex = 0;
+          renderPicker().catch(() => {});
+        }
+      } else if (str && str.match(/^[a-zA-Z0-9\-_./]$/)) {
+        // Add printable characters to search
+        searchQuery += str;
+        // Re-filter based on search query
+        const Fuse = require('fuse.js');
+        const fuse = new Fuse(allEntries, {
+          keys: ['command'],
+          threshold: 0.3,
+        });
+        filteredEntries = fuse.search(searchQuery).map(r => r.item);
+        selectedIndex = 0;
+        renderPicker().catch(() => {});
+      }
+    };
+    
+    // Remove all keypress listeners temporarily
+    const listeners = process.stdin.listeners('keypress');
+    listeners.forEach(l => process.stdin.removeListener('keypress', l));
+    
+    // Add only our handler
+    process.stdin.on('keypress', keypressHandler);
+    
+    // When done, restore original listeners
+    const originalResolve = resolve;
+    return new Promise((res) => {
+      resolve = (result) => {
+        // Restore original keypress listeners
+        listeners.forEach(l => process.stdin.on('keypress', l));
+        originalResolve(result);
+        res(result);
+      };
+    });
+  });
+}
+
+// Handle Ctrl+N for file picker and Ctrl+R for history picker
+if (process.stdin.isTTY) {
+  readline.emitKeypressEvents(process.stdin);
+  process.stdin.on('keypress', (str, key) => {
+    // Route ALL input to file picker when active
+    if (isFilePickerActive) {
+      handleFilePickerKey(str, key);
+      return;
+    }
+
+    if (key && key.ctrl && key.name === 'n') {
+      (async () => {
+        try {
+          const selectedFile = await showFilePicker();
+          
+          if (selectedFile) {
+            const line = rl.line;
+            const cursor = rl.cursor;
+            const needsSpace = line.length > 0 && !line.endsWith(' ');
+            const insertText = (needsSpace ? ' ' : '') + selectedFile.replace(/ /g, '\\ ');
+            
+            const left = line.slice(0, cursor);
+            const right = line.slice(cursor);
+            
+            rl.line = left + insertText + right;
+            rl.cursor = left.length + insertText.length;
+            rl._refreshLine();
+          }
+        } catch (e) {
+          console.error('Picker error:', e);
+        }
+      })();
+    } else if (key && key.ctrl && key.name === 'r') {
+      const savedLine = rl.line;
+      const savedCursor = rl.cursor;
+      
+      // Spawn history picker in a separate context
+      (async () => {
+        try {
+          const selectedCommand = await showHistoryPicker();
+          
+          // After picker completes, replace the entire line with selected command
+          rl.line = '';
+          rl.cursor = 0;
+          
+          if (selectedCommand) {
+            rl.line = selectedCommand;
+            rl.cursor = selectedCommand.length;
+          } else {
+            // User cancelled, restore original line
+            rl.line = savedLine;
+            rl.cursor = savedCursor;
+          }
+          
+          // Force redraw
+          rl._refreshLine();
+        } catch (e) {
+          console.error('History picker error:', e);
+        }
+      })();
+    }
+  });
+}
+
+// ---------------------- REPL ----------------------
+async function prompt() {
+  let ps1 = SHELL.env.PS1;
+  
+  // Color codes
+  const cyan = '\x1b[1;36m';
+  const green = '\x1b[1;32m';
+  const red = '\x1b[1;31m';
+  const yellow = '\x1b[1;33m';
+  const reset = '\x1b[0m';
+  const uname = os.userInfo().username;
+  const base = path.basename(SHELL.cwd);
+  
+  if (!ps1) {
+    // Default prompt with colors if PS1 not set
+    ps1 = `${cyan}${uname}${reset}:${green}${base}${reset} > `;
+  } else {
+    // Replace placeholders and expand variables
+    ps1 = ps1
+      .replace(/%user%/g, uname)
+      .replace(/%pwd%/g, SHELL.cwd)
+      .replace(/%dir%/g, base)
+      .replace(/%cyan%/g, cyan)
+      .replace(/%green%/g, green)
+      .replace(/%red%/g, red)
+      .replace(/%yellow%/g, yellow)
+      .replace(/%reset%/g, reset);
+    
+    // Expand variables and command substitutions
+    ps1 = expandVars(ps1);
+    ps1 = await expandCommandSubstitution(ps1);
+  }
+  
+  rl.setPrompt(ps1);
+  rl.prompt(true);
+}
+
+// Only set up interactive handlers if we're in interactive mode
+// (not running a script or -c command)
+const isScriptMode = process.argv[2] && process.argv[2] !== '-c';
+const isCommandMode = process.argv[2] === '-c' && process.argv[3];
+
+if (!isScriptMode && !isCommandMode) {
+  rl.on('line', async (line) => {
+    rl.pause();
+    await runLine(line);
+    rl.resume();
+    await prompt();
+  });
+
+  rl.on('SIGINT', () => {
+    // handled above by process SIGINT; do nothing
+  });
+}
+
+rl.on('close', () => {
+  console.log();
+  process.exit(0);
+});
+
+
+
+function loadHistory() {
+  historyDB.initDB();
+  const entries = historyDB.getAll(1000);
+  for (const e of entries) {
+    SHELL.history.push(e.command);
+  }
+  if (rl.history) {
+    rl.history.push(...SHELL.history);
+    debug('Loaded', entries.length, 'history entries from database');
+  }
+}
+
+async function loadRcFile() {
+  const rcFile = path.join(os.homedir(), '.fgshrc');
+  if (fs.existsSync(rcFile)) {
+    try {
+      isLoadingRcFile = true;
+      const script = fs.readFileSync(rcFile, 'utf8');
+      const lines = script.split('\n');
+      for (let idx = 0; idx < lines.length; idx++) {
+        const line = lines[idx];
+        if (line.trim() && !line.trim().startsWith('#')) {
+          await runLine(line);
+        }
+      }
+      isLoadingRcFile = false;
+      // Ensure readline is resumed and in a clean state after RC file
+      if (!rl.terminal) {
+        rl.resume();
+      }
+    } catch (e) {
+      console.error('Error loading .fgshrc:', e.message);
+      isLoadingRcFile = false;
+      if (!rl.terminal) {
+        rl.resume();
+      }
+    }
+  }
+}
+
+
+
+// Start
+if (process.argv[2] === '-c' && process.argv[3]) {
+  // command mode
+  (async () => {
+    await runLine(process.argv[3]);
+    process.exit(SHELL.lastExitCode);
+  })();
+} else if (process.argv[2]) {
+  // script mode
+  const scriptPath = path.resolve(SHELL.cwd, process.argv[2]);
+  try {
+    const script = fs.readFileSync(scriptPath, 'utf8');
+    const lines = script.split('\n');
+    
+    // For script mode, remove the readline event handlers to prevent interference
+    rl.removeAllListeners('line');
+    rl.pause();
+    
+    // Parse script into statements with control flow support
+    function parseScript(lines) {
+      const statements = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i].trim();
+        if (!line || line.startsWith('#')) {
+          i++;
+          continue;
+        }
+        
+        if (line.startsWith('while ')) {
+          const condition = line.slice(6).trim();
+          let body = [];
+          i++;
+          // Skip 'do' keyword if present
+          if (i < lines.length && lines[i].trim() === 'do') {
+            i++;
+          }
+          while (i < lines.length) {
+            const l = lines[i].trim();
+            if (l === 'done') {
+              i++;
+              break;
+            }
+            body.push(lines[i]);
+            i++;
+          }
+          statements.push({ type: 'while', condition, body });
+        } else if (line.startsWith('if ')) {
+          const condition = line.slice(3).trim();
+          let thenBody = [];
+          let elseBody = [];
+          i++;
+          let inElse = false;
+          while (i < lines.length) {
+            const l = lines[i].trim();
+            if (l === 'fi') break;
+            if (l === 'else') {
+              inElse = true;
+              i++;
+              continue;
+            }
+            if (inElse) elseBody.push(lines[i]);
+            else thenBody.push(lines[i]);
+            i++;
+          }
+          i++;
+          statements.push({ type: 'if', condition, thenBody, elseBody });
+        } else {
+          statements.push({ type: 'exec', line });
+          i++;
+        }
+      }
+      return statements;
+    }
+    
+    async function executeStatements(stmts) {
+      for (const stmt of stmts) {
+        if (stmt.type === 'exec') {
+          await runLine(stmt.line);
+        } else if (stmt.type === 'while') {
+          while (true) {
+            const condResult = await runLine(stmt.condition);
+            if (SHELL.lastExitCode !== 0) break;
+            await executeStatements(parseScript(stmt.body));
+          }
+        } else if (stmt.type === 'if') {
+          const condResult = await runLine(stmt.condition);
+          if (SHELL.lastExitCode === 0) {
+            await executeStatements(parseScript(stmt.thenBody));
+          } else if (stmt.elseBody.length > 0) {
+            await executeStatements(parseScript(stmt.elseBody));
+          }
+        }
+      }
+    }
+    
+    (async () => {
+      try {
+        const statements = parseScript(lines);
+        await executeStatements(statements);
+      } catch (e) {
+        console.error('Script error:', e.message);
+        process.exit(1);
+      }
+      process.exit(SHELL.lastExitCode);
+    })();
+  } catch (e) {
+    console.error('Error running script:', e.message);
+    process.exit(1);
+  }
+} else {
+  // interactive mode
+  (async () => {
+    loadHistory();
+    // Only load RC file if stdin is a TTY (not piped input)
+    if (process.stdin.isTTY) {
+      await loadRcFile();
+    }
+    await new Promise(r => setTimeout(r, 50)); // Let output flush
+    await prompt();
+  })();
+}
