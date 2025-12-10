@@ -1,0 +1,33 @@
+{
+  "name": "empty-iterator",
+  "version": "1.0.0",
+  "description": "Creates an iterator that finishes immediately.",
+  "keywords": [
+    "empty",
+    "iterator"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/empty-iterator",
+  "repository": "lamansky/empty-iterator",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=4.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "is-iterator": "^1.0.1",
+    "mocha": "^5.1.1"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

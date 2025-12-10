@@ -54,11 +54,20 @@ The project depends on:
 
 ### Setup
 
-```bash
-# Enter the nix shell (if using NixOS)
-nix flake check
+#### Using Nix
 
-# Or install dependencies manually
+```bash
+# Build with NixOS/Nix
+nix build . --no-sandbox
+
+# Or disable sandbox globally in /etc/nixos/configuration.nix:
+# nix.settings.sandbox = false;
+```
+
+#### Manual Setup
+
+```bash
+# Install dependencies
 npm install  # or: bun install
 
 # Compile the native process group control library

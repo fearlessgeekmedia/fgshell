@@ -1,0 +1,40 @@
+{
+  "name": "ofn",
+  "version": "1.0.0",
+  "description": "Overloads a function. Makes parameters optional.",
+  "keywords": [
+    "overload",
+    "function",
+    "optional",
+    "parameters"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/ofn",
+  "repository": "lamansky/ofn",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {
+    "has-duplicates": "^1.0.0",
+    "wfn": "^1.0.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    },
+    "rules": {
+      "no-invalid-this": 0
+    }
+  }
+}

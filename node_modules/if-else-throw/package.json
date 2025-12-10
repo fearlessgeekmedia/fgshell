@@ -1,0 +1,37 @@
+{
+  "name": "if-else-throw",
+  "version": "1.0.0",
+  "description": "If X, return Y, else throw Z.",
+  "keywords": [
+    "error",
+    "throw",
+    "test",
+    "check",
+    "passthrough"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/if-else-throw",
+  "repository": "lamansky/if-else-throw",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=5.0.0"
+  },
+  "dependencies": {
+    "possible-function": "^1.0.1"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^3.2.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

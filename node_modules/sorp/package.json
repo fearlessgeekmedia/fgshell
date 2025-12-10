@@ -1,0 +1,34 @@
+{
+  "name": "sorp",
+  "version": "1.0.0",
+  "description": "Returns a singular or plural form depending on a given number.",
+  "keywords": [
+    "singular",
+    "plural",
+    "string",
+    "number"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/sorp",
+  "repository": "lamansky/sorp",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=4.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

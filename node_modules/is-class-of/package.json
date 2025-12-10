@@ -1,0 +1,35 @@
+{
+  "name": "is-class-of",
+  "version": "1.0.1",
+  "description": "Returns true if A is a subclass of B or the same class as B.",
+  "keywords": [
+    "class",
+    "subclass"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/is-class-of",
+  "repository": "lamansky/is-class-of",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {
+    "class-chain": "^1.0.0",
+    "sbo": "^1.0.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.5"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

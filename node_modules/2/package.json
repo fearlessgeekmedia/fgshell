@@ -1,0 +1,60 @@
+{
+  "name": "2",
+  "version": "3.0.0",
+  "description": "The Type Conversion Library. Numbers, Strings, Arrays, Maps, Objects, and Iterators.",
+  "keywords": [
+    "type",
+    "convert",
+    "conversion",
+    "to",
+    "array",
+    "iterator",
+    "map",
+    "number",
+    "int",
+    "integer",
+    "float",
+    "object",
+    "string"
+  ],
+  "author": {
+    "name": "Fr. John Lamansky",
+    "url": "lamansky.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/2",
+  "repository": "lamansky/2",
+  "main": "index.js",
+  "engines": {
+    "node": ">=8.3.0"
+  },
+  "dependencies": {
+    "@lamansky/every": "^1.0.0",
+    "add-counter": "^1.0.0",
+    "empty-iterator": "^1.0.0",
+    "is-array-of-length": "^1.0.0",
+    "is-instance-of": "^1.0.2",
+    "is-iterable": "^1.1.1",
+    "is-nil": "^1.0.1",
+    "is-object": "^1.0.1",
+    "map-iter": "^1.0.0",
+    "new-object": "^4.0.0",
+    "otherwise": "^2.0.0",
+    "parser-factory": "^1.1.0",
+    "round-to": "^4.0.0",
+    "sbo": "^1.1.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^2.0.0",
+    "mocha": "^6.2.2"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

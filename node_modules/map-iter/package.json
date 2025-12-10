@@ -1,0 +1,40 @@
+{
+  "name": "map-iter",
+  "version": "1.0.0",
+  "description": "Applies a callback to each value outputted by an iterable.",
+  "keywords": [
+    "iterable",
+    "map",
+    "values",
+    "callback"
+  ],
+  "author": {
+    "name": "Fr. John Lamansky",
+    "url": "lamansky.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/map-iter",
+  "repository": "lamansky/map-iter",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {
+    "sbo": "^1.1.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "is-iterable-with": "^1.0.0",
+    "mocha": "^5.2.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

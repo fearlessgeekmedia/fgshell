@@ -31,6 +31,10 @@
           buildPhase = ''
             export HOME=$TMPDIR
             export BUN_INSTALL=$TMPDIR/.bun
+            mkdir -p $BUN_INSTALL
+            
+            # Install dependencies from lock file
+            bun install
             
             # Build native job control library
             bash build-ptctl.sh

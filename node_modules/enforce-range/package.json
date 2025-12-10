@@ -1,0 +1,36 @@
+{
+  "name": "enforce-range",
+  "version": "1.0.0",
+  "description": "Enforce a minimum and/or maximum value for a number.",
+  "keywords": [
+    "number",
+    "range",
+    "min",
+    "minimum",
+    "max",
+    "maximum",
+    "value"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/enforce-range",
+  "repository": "lamansky/enforce-range",
+  "main": "index.js",
+  "files": [],
+  "dependencies": {
+    "2": "^1.0.2"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^4.0.1"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

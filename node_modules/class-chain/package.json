@@ -1,0 +1,39 @@
+{
+  "name": "class-chain",
+  "version": "1.0.0",
+  "description": "Returns an object’s class and its ancestors.",
+  "keywords": [
+    "object",
+    "class",
+    "function",
+    "prototype",
+    "constructor",
+    "chain",
+    "ancestors",
+    "extends"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/class-chain",
+  "repository": "lamansky/class-chain",
+  "main": "index.js",
+  "engines": {
+    "node": ">=4.0.0"
+  },
+  "dependencies": {
+    "is-object": "^1.0.1"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^3.2.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

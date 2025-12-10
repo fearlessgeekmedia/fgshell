@@ -1,0 +1,51 @@
+{
+  "name": "def-props",
+  "version": "1.0.0",
+  "description": "Defines multiple object properties all at once, optionally with shared settings.",
+  "keywords": [
+    "object",
+    "define",
+    "property",
+    "properties",
+    "descriptor",
+    "getter",
+    "setter",
+    "configurable",
+    "enumerable",
+    "writable",
+    "entries",
+    "key",
+    "value"
+  ],
+  "author": {
+    "name": "Fr. John Lamansky",
+    "url": "lamansky.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/def-props",
+  "repository": "lamansky/def-props",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=8.3.0"
+  },
+  "dependencies": {
+    "errate": "^1.3.0",
+    "is-iterable": "^1.1.1",
+    "is-obj": "^2.0.0",
+    "type-error": "^1.0.3"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^2.0.0",
+    "mocha": "^6.2.2"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

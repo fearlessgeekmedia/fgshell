@@ -1,0 +1,37 @@
+{
+  "name": "copy-own",
+  "version": "1.2.0",
+  "description": "Copies an object’s own properties to another object.",
+  "keywords": [
+    "copy",
+    "own",
+    "object",
+    "properties"
+  ],
+  "author": {
+    "name": "Fr. John Lamansky",
+    "url": "lamansky.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/copy-own",
+  "repository": "lamansky/copy-own",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "eslint-config-lamansky": "^2.0.0",
+    "mocha": "^6.2.1"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

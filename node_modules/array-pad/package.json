@@ -1,0 +1,28 @@
+{
+  "name": "array-pad",
+  "version": "0.0.1",
+  "description": "Module for returning arrays with a specific length by padding values.",
+  "main": "index.js",
+  "scripts": {
+    "test": "./node_modules/.bin/mocha"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tur-nr/node-array-pad"
+  },
+  "keywords": [
+    "array",
+    "pad",
+    "utility",
+    "length"
+  ],
+  "author": "Christopher Turner <turner296@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/tur-nr/node-array-pad/issues"
+  },
+  "homepage": "https://github.com/tur-nr/node-array-pad",
+  "devDependencies": {
+    "mocha": "^2.1.0"
+  }
+}

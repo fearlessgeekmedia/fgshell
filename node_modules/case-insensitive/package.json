@@ -1,0 +1,39 @@
+{
+  "name": "case-insensitive",
+  "version": "1.0.0",
+  "description": "Wraps around an array or string and transforms certain methods into case-insensitive versions.",
+  "keywords": [
+    "case",
+    "case insensitive",
+    "lowercase",
+    "string",
+    "array",
+    "endsWith",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "startsWith",
+    "wrapper"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/case-insensitive",
+  "repository": "lamansky/case-insensitive",
+  "main": "index.js",
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^3.2.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

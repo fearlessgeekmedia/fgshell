@@ -1,0 +1,36 @@
+{
+  "name": "longest-first",
+  "version": "1.0.0",
+  "description": "Sorts items in descending order of length.",
+  "keywords": [
+    "sort",
+    "array",
+    "length",
+    "bind operator"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/longest-first",
+  "repository": "lamansky/longest-first",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {
+    "sbo": "^1.0.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

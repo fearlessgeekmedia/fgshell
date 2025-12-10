@@ -1,0 +1,38 @@
+{
+  "name": "wfn",
+  "version": "1.0.0",
+  "description": "Gives a wrapper function the properties and string value of its underlying function.",
+  "keywords": [
+    "wrapper",
+    "function",
+    "properties",
+    "toString"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/wfn",
+  "repository": "lamansky/wfn",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {
+    "copy-own": "^1.0.0",
+    "english-list": "^1.0.0",
+    "sorp": "^1.0.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

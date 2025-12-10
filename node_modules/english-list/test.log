@@ -1,0 +1,6 @@
+
+> english-list@1.0.0-prerelease-1 test /home/kyle/english-list.js
+> defence -i javascript README.md | replace-require-self | node
+
+sh: 1: defence: not found
+sh: 1: replace-require-self: not found

@@ -1,0 +1,34 @@
+{
+  "name": "ffn",
+  "version": "2.1.0",
+  "description": "Turns arrays and values into Filtering Functions.",
+  "keywords": [
+    "filter",
+    "comparison",
+    "test",
+    "function"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/ffn",
+  "repository": "lamansky/ffn",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.1.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

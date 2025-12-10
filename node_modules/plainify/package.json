@@ -1,0 +1,36 @@
+{
+  "name": "plainify",
+  "version": "1.0.0",
+  "description": "Wraps a value in a plain object, if it isn’t one already.",
+  "keywords": [
+    "plain",
+    "object",
+    "options"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/plainify",
+  "repository": "lamansky/plainify",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=4.0.0"
+  },
+  "dependencies": {
+    "is-plain-object": "^2.0.4"
+  },
+  "devDependencies": {
+    "equals": "^1.0.5",
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.1.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

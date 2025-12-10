@@ -1,0 +1,31 @@
+{
+  "name": "english-list",
+  "description": "make \"X, Y, and Z\"-style lists from arrays",
+  "version": "1.0.0",
+  "author": "Kyle E. Mitchell <kyle@kemitchell.com> (http://kemitchell.com)",
+  "bugs": "https://github.com/kemitchell/english-list.js/issues",
+  "devDependencies": {
+    "defence-cli": "^2.0.1",
+    "literate-assertions": "^0.1.1",
+    "replace-require-self": "^1.1.1",
+    "standard": "^10.0.3",
+    "standard-markdown": "^4.0.2"
+  },
+  "homepage": "https://github.com/kemitchell/english-list.js",
+  "keywords": [
+    "array",
+    "conjunction",
+    "English",
+    "enumeration",
+    "language",
+    "list",
+    "natural"
+  ],
+  "license": "MIT",
+  "repository": "kemitchell/english-list.js",
+  "scripts": {
+    "travis-ci": "npm run test",
+    "lint": "standard && standard-markdown",
+    "test": "defence -i javascript README.md | replace-require-self | node"
+  }
+}

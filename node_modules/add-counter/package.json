@@ -1,0 +1,34 @@
+{
+  "name": "add-counter",
+  "version": "1.0.0",
+  "description": "Adds a counter integer to iterated values.",
+  "keywords": [
+    "add",
+    "iterator",
+    "iteration",
+    "counter"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/add-counter",
+  "repository": "lamansky/add-counter",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=6.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

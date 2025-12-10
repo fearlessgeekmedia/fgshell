@@ -1,0 +1,32 @@
+{
+  "name": "has-duplicates",
+  "version": "1.0.0",
+  "description": "Returns true if an array has duplicate elements or a string has duplicate characters.",
+  "keywords": [
+    "array",
+    "duplicates",
+    "unique",
+    "check"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/has-duplicates",
+  "repository": "lamansky/has-duplicates",
+  "main": "index.js",
+  "engines": {
+    "node": ">=0.12.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^3.2.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "is-global-object",
+  "version": "1.0.0",
+  "description": "Returns true if a value is the global or window object.",
+  "keywords": [
+    "global",
+    "window",
+    "object",
+    "check",
+    "test"
+  ],
+  "author": "John Lamansky",
+  "license": "MIT",
+  "homepage": "https://github.com/lamansky/is-global-object",
+  "repository": "lamansky/is-global-object",
+  "main": "index.js",
+  "files": [],
+  "engines": {
+    "node": ">=4.0.0"
+  },
+  "devDependencies": {
+    "eslint-config-lamansky": "^1.0.0",
+    "mocha": "^5.0.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "eslintConfig": {
+    "extends": "lamansky",
+    "env": {
+      "mocha": true
+    }
+  }
+}
