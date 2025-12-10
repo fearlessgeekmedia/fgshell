@@ -119,7 +119,7 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 
 ## Known Limitations & Issues
 
-- **sudo with default shell**: When `fgshell` is configured as the default login shell, `sudo` without the `-S` flag may fail to read passwords interactively. Workaround: use `sudo -S` or run `fgshell` as a non-default shell
+- **sudo TTY access**: `sudo` without the `-S` flag fails to read passwords interactively when run inside `fgshell`, regardless of whether `fgshell` is the default shell or a subshell. Workaround: use `sudo -S` to read password from stdin
 - **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
 - **Script features**: Limited to basic if/while blocks, no functions or advanced control flow
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
