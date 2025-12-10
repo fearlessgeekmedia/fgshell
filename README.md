@@ -1,17 +1,30 @@
 # fgshell
 
-A shell written in JavaScript that probably shouldn't exist, but does.
+A Unix shell with modern features like fuzzy history search and interactive file picker—written in JavaScript/Bun because apparently we can.
 
 ## What is this?
 
-`fgshell` is a functional Unix shell implementation written mostly in JavaScript/Bun. It includes pipes, redirections, job control, aliases, history, file picker, and more. It's designed to be a usable interactive shell despite the obvious architectural absurdity of writing one in JavaScript.
+`fgshell` is a functional Unix shell implementation written in JavaScript/Bun. It has everything you expect from a shell (pipes, redirections, job control, scripting) plus some genuinely useful features that bash/zsh don't have out of the box:
+
+- **Interactive file picker** (Ctrl+N) with live preview
+- **Fuzzy history search** (Ctrl+R) with Fuse.js
+- **SQLite history database** with timestamps, exit codes, and command duration
+- **Customizable prompts** with color support
 
 ## Why?
 
-Because why not? Some projects are born from necessity. This one was born from the question "could we?"
+A shell that searches your command history with fuzzy matching, remembers which directory you ran commands in, and lets you visually browse files without leaving the shell—all without installing 50 plugins. It's a shell designed for the 2020s, not the 1970s.
 
 ## Features
 
+### The Cool Stuff
+- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories with live preview
+- **🔍 Fuzzy history search** (Ctrl+R) — search commands by any part of the command, powered by Fuse.js
+- **💾 SQLite history database** — persistent history with timestamps, exit codes, and execution duration
+- **🎨 Customizable prompts** — full color support and variable expansion
+- **💻 Embedded JavaScript REPL** — `js` command for quick JavaScript evaluation
+
+### Standard Shell Features
 - **Command execution** with proper process spawning
 - **Pipes and redirection**: `|`, `>`, `>>`, `<`
 - **Background jobs**: `cmd &` and `jobs`, `fg`, `bg` builtins
@@ -19,8 +32,6 @@ Because why not? Some projects are born from necessity. This one was born from t
 - **Command substitution**: `$(command)` and arithmetic `$((expr))`
 - **Tab completion** for files and directories
 - **Interactive line editing** with readline
-- **Command history** with full-text search (Ctrl+R)
-- **File picker** (Ctrl+N) for visual file/directory navigation
 - **Aliases**: `alias name=command` syntax
 - **Shell scripting** with if/while control flow
 - **Built-in commands**: `cd`, `pwd`, `echo`, `export`, `unset`, `env`, `history`, `alias`, `unalias`
@@ -65,6 +76,19 @@ bun build-fgsh.js
 ./fgsh -c "echo hello"    # Run a command
 ```
 
+## Quick Comparison: fgshell vs bash/zsh
+
+| Feature | fgshell | bash | zsh |
+|---------|---------|------|-----|
+| Fuzzy history search (Ctrl+R) | ✓ | ✗ | ✓ (with plugins) |
+| Interactive file picker (Ctrl+N) | ✓ | ✗ | ✗ (with plugins) |
+| SQLite history database | ✓ | ✗ | ✗ |
+| Command duration tracking | ✓ | ✗ | ✓ (with plugins) |
+| Exit code in history | ✓ | ✗ | ✗ |
+| Basic shell features | ✓ | ✓ | ✓ |
+| POSIX compatibility | ✓ | ✓ | ✓ |
+| Cross-platform (Unix/Linux/macOS) | ✓ | ✓ | ✓ |
+
 ## Architecture
 
 - **src/fgshell.js** - Main shell implementation with command parsing, execution, and job control
@@ -84,12 +108,20 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 - [JAVASCRIPT.md](docs/JAVASCRIPT.md) - Why JavaScript was chosen (spoiler: bad reasons)
 - [PROMPT.md](docs/PROMPT.md) - Prompt customization
 
-## Known Limitations
+## Known Limitations & Issues
 
-- **Ctrl+Z**: Suspending jobs is not yet fully functional (tcsetpgrp challenges)
-- **Script features**: Limited to basic if/while blocks
-- **Performance**: It's JavaScript, so... don't benchmark it
-- **Portability**: Requires Unix-like OS with proper terminal control
+- **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
+- **Script features**: Limited to basic if/while blocks, no functions or advanced control flow
+- **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
+- **Portability**: Requires Unix-like OS with proper terminal control (Linux, macOS)
+- **POSIX compliance**: Not fully POSIX-compliant; designed for interactive use
+
+## Roadmap
+
+- [ ] Proper Ctrl+Z terminal state handling
+- [ ] Shell functions and advanced scripting
+- [ ] Plugin system for extending commands
+- [ ] Better error messages and debugging output
 
 ## License
 
