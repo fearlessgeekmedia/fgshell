@@ -984,20 +984,22 @@ async function executePipeline(cmds) {
       // TUI apps require 'inherit' to take full control of the terminal
       // (including raw mode and alternate screen buffer).
       // Use 'detached: true' to create a new process group for the child
+      // HOWEVER: sudo needs to stay attached to the TTY to read passwords from /dev/tty
       const childProcess = spawn(exe, args, {
         cwd: SHELL.cwd,
         env: SHELL.env,
         stdio: 'inherit', // *** CHANGED: Revert to 'inherit' for full TTY support ***
-        detached: true,   // *** NEW: Create new process group for proper job control ***
+        detached: command !== 'sudo',   // *** Don't detach sudo - it needs /dev/tty access ***
       });
 
       debug(`Child spawned PID: ${childProcess.pid}`);
 
       // REMOVED: Manual raw mode setting and keypress handler that broke TUI apps.
       
-      // 3. Set up proper job control if ptctl is available
+      // 3. Set up proper job control if ptctl is available and process is detached
       //    This allows Ctrl+Z to properly suspend the child without corrupting terminal state
-      if (ptctl.available) {
+      //    (Note: sudo is not detached so it can access /dev/tty for password prompts)
+      if (ptctl.available && command !== 'sudo') {
         try {
           // Get the child's actual process group (created by detached: true)
           const childPgid = ptctl.getpgid(childProcess.pid);
@@ -1029,8 +1031,8 @@ async function executePipeline(cmds) {
             markJobDone(job);
           }
           
-          // 4. Restore terminal control to the shell if ptctl is available
-          if (ptctl.available) {
+          // 4. Restore terminal control to the shell if ptctl is available and we transferred it
+          if (ptctl.available && command !== 'sudo') {
             try {
               debug(`Restoring terminal to shell PGID: ${shellPgid}`);
               ptctl.tcsetpgrp(1, shellPgid); // Restore shell's process group to terminal
@@ -1077,8 +1079,10 @@ async function executePipeline(cmds) {
       // Fallback to child_process.spawn for non-interactive commands or pipelines
       // For single commands without redirects or pipes, inherit stdio for proper interaction
       const isSingleCommand = n === 1 && !c.stdin && !c.stdout && !c.background;
+      // sudo always needs TTY access to read passwords, so treat it like a single command
+      const isSudo = command === 'sudo';
       let stdio;
-      if (isSingleCommand) {
+      if (isSingleCommand || isSudo) {
         // During RC file loading, close stdin to prevent reading from piped input
         if (isLoadingRcFile) {
           stdio = ['ignore', 'inherit', 'inherit'];

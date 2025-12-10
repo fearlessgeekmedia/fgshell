@@ -10,4 +10,13 @@ const SHELL = {
   aliases: {},
 };
 
+// Ensure critical environment variables for login shells
+// This fixes issues with sudo and other tools that check for a valid terminal environment
+if (process.stdin.isTTY && process.stdout.isTTY) {
+  // Set TERM if not already set (needed by sudo, less, and other TUI apps)
+  if (!SHELL.env.TERM) {
+    SHELL.env.TERM = 'xterm-256color';
+  }
+}
+
 module.exports = SHELL;
