@@ -1,6 +1,6 @@
 # fgshell
 
-A Unix shell with modern features like fuzzy history search and interactive file picker—written in JavaScript/Bun because apparently we can.
+A Unix shell with modern features like fuzzy history search and interactive file picker—written in JavaScript/Bun because apparently we can. It probably shouldn't exist. You probably shouldn't use it. But here it is if you really want to use it. 
 
 ## What is this?
 
