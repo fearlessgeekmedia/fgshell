@@ -6,7 +6,7 @@
  * - Parse commands with quotes and escapes
  * - Pipes, redirection: >, >>, <
  * - Background jobs with &
- * - Builtins: cd, pwd, exit, export, unset, env, jobs, fg, bg
+ * - Builtins: cd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf
  * - Environment variable expansion: $VAR
  * - Tab completion for files/dirs
  * - Basic job control and signal forwarding (SIGINT only after removal of SIGTSTP)
@@ -24,6 +24,21 @@ const glob = require('glob');
 const SHELL = require('./shell');
 const historyDB = require('./history-db');
 const ptctl = require('./ptctl');
+
+// Debug logging (optional)
+let logPath = null;
+if (process.env.FGSH_LOG) {
+  const logLocations = ['/tmp/fgshell-debug.log', '/var/tmp/fgshell-debug.log', os.homedir() + '/fgshell-debug.log'];
+  for (const loc of logLocations) {
+    try {
+      fs.appendFileSync(loc, '[SHELL START] ' + new Date().toISOString() + ' user=' + (process.env.USER || 'unknown') + ' PATH=' + (process.env.PATH || 'UNSET') + '\n');
+      logPath = loc;
+      break;
+    } catch (e) {
+      // Try next location
+    }
+  }
+}
 
 let currentReadlineInput = ''; // Track current readline input
 let isLoadingRcFile = false; // Track if we're loading RC file
@@ -80,8 +95,17 @@ rl._ttyWrite = function(s, key) {
 };
 
 function debug(...args) {
+  const msg = '[DEBUG] ' + args.join(' ');
   if (process.env.FGSH_DEBUG) {
-    console.error('[DEBUG]', ...args);
+    console.error(msg);
+  }
+  // Also log to file for fgshuser debugging
+  if (logPath) {
+    try {
+      fs.appendFileSync(logPath, msg + '\n');
+    } catch (e) {
+      // Ignore log file errors
+    }
   }
 }
 
@@ -110,12 +134,8 @@ function tokenize(input) {
   let state = 'normal'; // normal, single, double, esc
   while (i < L) {
     const ch = input[i];
-    if (state === 'esc') {
-      cur += ch;
-      state = 'normal';
-    } else if (ch === '\\') {
-      state = 'esc';
-    } else if (state === 'single') {
+    // Handle quote modes first (they disable escape processing)
+    if (state === 'single') {
       if (ch === "'") state = 'normal';
       else cur += ch;
     } else if (state === 'double') {
@@ -124,30 +144,34 @@ function tokenize(input) {
         // leave $ as is for expansion phase
         cur += ch;
       } else cur += ch;
+    } else if (state === 'esc') {
+      cur += ch;
+      state = 'normal';
+    } else if (ch === '\\') {
+      // Escape character (only in normal or double-quote mode)
+      state = 'esc';
+    } else if (ch === "'") {
+      state = 'single';
+    } else if (ch === '"') {
+      state = 'double';
+    } else if (/\s/.test(ch)) {
+      if (cur !== '') {
+        tokens.push(cur);
+        cur = '';
+      }
     } else {
-      if (ch === "'") {
-        state = 'single';
-      } else if (ch === '"') {
-        state = 'double';
-      } else if (/\s/.test(ch)) {
+      // treat special single-char tokens as separate tokens where needed: | < > &
+      if ('|&<>'.includes(ch)) {
         if (cur !== '') {
           tokens.push(cur);
           cur = '';
         }
-      } else {
-        // treat special single-char tokens as separate tokens where needed: | < > &
-        if ('|&<>'.includes(ch)) {
-          if (cur !== '') {
-            tokens.push(cur);
-            cur = '';
-          }
-          // handle >> as combined token
-          if ((ch === '>' || ch === '<') && input[i+1] === '>') {
-            tokens.push(ch + '>');
-            i++;
-          } else tokens.push(ch);
-        } else cur += ch;
-      }
+        // handle >> as combined token
+        if ((ch === '>' || ch === '<') && input[i+1] === '>') {
+          tokens.push(ch + '>');
+          i++;
+        } else tokens.push(ch);
+      } else cur += ch;
     }
     i++;
   }
@@ -303,7 +327,9 @@ function expandTokens(cmd) {
 }
 
 // ---------------------- Builtins ----------------------
-const builtins = {
+let builtins = {};
+try {
+  builtins = {
   echo: function(args) {
     let interpretEscapes = false;
     let startIdx = 1;
@@ -497,6 +523,198 @@ const builtins = {
         }
       }
     }
+    return 0;
+  },
+  ls: function(args) {
+    // ls [-la] [path...]
+    let longFormat = false;
+    let allFiles = false;
+    let paths = [];
+    
+    for (let i = 1; i < args.length; i++) {
+      const arg = args[i];
+      if (arg.startsWith('-')) {
+        if (arg.includes('l')) longFormat = true;
+        if (arg.includes('a')) allFiles = true;
+      } else {
+        paths.push(arg);
+      }
+    }
+    
+    if (paths.length === 0) {
+      paths.push(SHELL.cwd);
+    }
+    
+    for (let pathIdx = 0; pathIdx < paths.length; pathIdx++) {
+      const targetPath = path.resolve(SHELL.cwd, paths[pathIdx]);
+      
+      try {
+        let stat;
+        try {
+          stat = fs.statSync(targetPath);
+        } catch (statErr) {
+          // Can't stat the path - it might not exist or permission denied
+          console.error(`ls: cannot access '${paths[pathIdx]}': ${statErr.message}`);
+          continue;
+        }
+        
+        if (!stat.isDirectory()) {
+          // Single file
+          if (longFormat) {
+            const mode = stat.mode.toString(8).slice(-3);
+            const size = stat.size.toString().padStart(10);
+            const mtime = stat.mtime.toLocaleString();
+            console.log(`${mode} ${size} ${mtime} ${path.basename(targetPath)}`);
+          } else {
+            console.log(path.basename(targetPath));
+          }
+          continue;
+        }
+        
+        // Directory
+        if (paths.length > 1) {
+          console.log(`${targetPath}:`);
+        }
+        
+        let entries;
+        try {
+          entries = fs.readdirSync(targetPath);
+        } catch (readErr) {
+          // Permission denied or other error reading directory
+          console.error(`ls: cannot open directory '${paths[pathIdx]}': ${readErr.message}`);
+          continue;
+        }
+        const filtered = allFiles ? entries : entries.filter(e => !e.startsWith('.'));
+        
+        if (longFormat) {
+          filtered.sort();
+          for (const entry of filtered) {
+            const fullPath = path.join(targetPath, entry);
+            const stat = fs.statSync(fullPath);
+            const mode = stat.mode.toString(8).slice(-3);
+            const size = stat.size.toString().padStart(10);
+            const mtime = stat.mtime.toLocaleString();
+            const suffix = stat.isDirectory() ? '/' : '';
+            console.log(`${mode} ${size} ${mtime} ${entry}${suffix}`);
+          }
+        } else {
+          const dirs = [];
+          const files = [];
+          for (const entry of filtered) {
+            const fullPath = path.join(targetPath, entry);
+            const stat = fs.statSync(fullPath);
+            if (stat.isDirectory()) {
+              dirs.push(entry + '/');
+            } else {
+              files.push(entry);
+            }
+          }
+          const all = [...dirs.sort(), ...files.sort()];
+          for (const entry of all) {
+            console.log(entry);
+          }
+        }
+        
+        if (pathIdx < paths.length - 1) {
+          console.log('');
+        }
+      } catch (e) {
+        console.error(`ls: cannot access '${paths[pathIdx]}': ${e.message}`);
+        return 1;
+      }
+    }
+    return 0;
+  },
+  printf: function(args) {
+    // printf format [args...]
+    if (args.length < 2) {
+      console.error('printf: not enough arguments');
+      return 1;
+    }
+    
+    const format = args[1];
+    const values = args.slice(2);
+    let output = '';
+    let valueIdx = 0;
+    
+    for (let i = 0; i < format.length; i++) {
+      if (format[i] === '\\' && i + 1 < format.length) {
+        // Handle escape sequences
+        const esc = format[i + 1];
+        if (esc === 'n') {
+          output += '\n';
+          i++;
+        } else if (esc === 't') {
+          output += '\t';
+          i++;
+        } else if (esc === 'r') {
+          output += '\r';
+          i++;
+        } else if (esc === 'b') {
+          output += '\b';
+          i++;
+        } else if (esc === 'f') {
+          output += '\f';
+          i++;
+        } else if (esc === 'v') {
+          output += '\v';
+          i++;
+        } else if (esc === '\\') {
+          output += '\\';
+          i++;
+        } else if (esc === '0') {
+          output += '\0';
+          i++;
+        } else {
+          output += format[i];
+        }
+      } else if (format[i] === '%' && i + 1 < format.length) {
+        const spec = format[i + 1];
+        if (spec === '%') {
+          output += '%';
+          i++;
+        } else if (spec === 's') {
+          output += values[valueIdx] || '';
+          valueIdx++;
+          i++;
+        } else if (spec === 'd' || spec === 'i') {
+          const val = parseInt(values[valueIdx] || '0', 10);
+          output += val.toString();
+          valueIdx++;
+          i++;
+        } else if (spec === 'f') {
+          const val = parseFloat(values[valueIdx] || '0');
+          output += val.toString();
+          valueIdx++;
+          i++;
+        } else if (spec === 'x') {
+          const val = parseInt(values[valueIdx] || '0', 10);
+          output += val.toString(16);
+          valueIdx++;
+          i++;
+        } else if (spec === 'o') {
+          const val = parseInt(values[valueIdx] || '0', 10);
+          output += val.toString(8);
+          valueIdx++;
+          i++;
+        } else if (spec === 'c') {
+          const val = values[valueIdx] || '';
+          output += val.length > 0 ? val[0] : '';
+          valueIdx++;
+          i++;
+        } else if (spec === 'n') {
+          // %n is not supported (would require variable assignment)
+          i++;
+        } else {
+          output += '%' + spec;
+          i++;
+        }
+      } else {
+        output += format[i];
+      }
+    }
+    
+    process.stdout.write(output);
     return 0;
   },
   alias: function(args) {
@@ -767,11 +985,57 @@ const builtins = {
     
     return 1;
   },
+  cat: function(args) {
+    // Simple cat builtin - concatenate and print files
+    if (args.length < 2) {
+      console.error('cat: missing file operand');
+      return 1;
+    }
+    for (let i = 1; i < args.length; i++) {
+      try {
+        const content = fs.readFileSync(args[i], 'utf8');
+        process.stdout.write(content);
+      } catch (e) {
+        console.error(`cat: ${args[i]}: ${e.message}`);
+        return 1;
+      }
+    }
+    return 0;
+  },
   test: function(args) {
     // test is the same as [, but doesn't require ]
     return builtins['['](args.concat(']'));
   },
-};
+  };
+} catch (e) {
+  debug('CRITICAL ERROR initializing builtins:', e.message);
+  console.error('CRITICAL ERROR initializing builtins:', e.message);
+  try {
+    const logPath = path.join(os.tmpdir(), 'fgshell-debug.log');
+    fs.appendFileSync(logPath, 'CRITICAL ERROR initializing builtins: ' + e.message + '\n' + e.stack + '\n');
+  } catch (logErr) {
+    // Can't even log
+  }
+  // Ensure builtins at least has echo and ls
+  builtins = {
+    echo: function(args) { console.log(args.slice(1).join(' ')); return 0; },
+    ls: function(args) { console.log('[FALLBACK LS]'); return 0; },
+    printf: function(args) { console.log('[FALLBACK PRINTF]'); return 0; },
+    cat: function(args) { 
+      if (args.length > 1) {
+        try {
+          console.log(fs.readFileSync(args[1], 'utf8'));
+        } catch (e) {
+          console.error(e.message);
+        }
+      }
+      return 0;
+    },
+    cd: function(args) { return 0; },
+    pwd: function(args) { console.log('/'); return 0; },
+    exit: function(args) { process.exit(0); },
+  };
+}
 
 // ---------------------- Job control helpers ----------------------
 function addJob(pids, cmdline, background) {
@@ -904,7 +1168,7 @@ async function runSingle(line) {
     const cmds = splitCommands(tokens);
     cmds.forEach(expandTokens);
     // Check for simple builtin-only (no pipes, no redir)
-    if (cmds.length === 1 && isBuiltin(cmds[0].args[0]) && !cmds[0].stdin && !cmds[0].stdout && !cmds[0].background) {
+    if (cmds.length === 1 && cmds[0].args[0] && typeof builtins === 'object' && cmds[0].args[0] in builtins && !cmds[0].stdin && !cmds[0].stdout && !cmds[0].background) {
       const name = cmds[0].args[0];
       const res = builtins[name](cmds[0].args);
       if (typeof res === 'number') SHELL.lastExitCode = res;
@@ -954,7 +1218,7 @@ async function executePipeline(cmds) {
     let child;
     
     // Check if this is a builtin command (before trying to resolve as executable)
-    if (isBuiltin(command)) {
+    if (typeof builtins === 'object' && command in builtins && typeof builtins[command] === 'function') {
       const res = builtins[command]([command, ...args]);
       if (typeof res === 'number') SHELL.lastExitCode = res;
       else if (res && typeof res.then === 'function') {
@@ -1995,12 +2259,18 @@ if (process.argv[2] === '-c' && process.argv[3]) {
 } else {
   // interactive mode
   (async () => {
-    loadHistory();
-    // Only load RC file if stdin is a TTY (not piped input)
-    if (process.stdin.isTTY) {
-      await loadRcFile();
+    try {
+      loadHistory();
+      // Only load RC file if stdin is a TTY (not piped input)
+      if (process.stdin.isTTY) {
+        await loadRcFile();
+      }
+      await new Promise(r => setTimeout(r, 50)); // Let output flush
+      await prompt();
+    } catch (e) {
+      console.error('FATAL ERROR in interactive mode:', e.message);
+      console.error(e.stack);
+      process.exit(1);
     }
-    await new Promise(r => setTimeout(r, 50)); // Let output flush
-    await prompt();
   })();
 }
