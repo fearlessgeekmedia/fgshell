@@ -95,7 +95,7 @@ bun build-fgsh.js
 | Command duration tracking | ✓ | ✗ | ✓ (with plugins) |
 | Exit code in history | ✓ | ✗ | ✗ |
 | Basic shell features | ✓ | ✓ | ✓ |
-| POSIX compatibility | ✓ | ✓ | ✓ |
+| POSIX compatibility | ✗ | ✓ | ✓ |
 | Cross-platform (Unix/Linux/macOS) | ✓ | ✓ | ✓ |
 
 ## Architecture

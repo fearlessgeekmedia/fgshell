@@ -1375,6 +1375,23 @@ try {
     }
     // test is the same as [, but doesn't require ]
     return builtins['['](args.concat(']'));
+  },
+  dadjoke: async function(args) {
+    // Easter egg: fetch a random dad joke from icanhazdadjoke.com
+    try {
+      const response = await fetch('https://icanhazdadjoke.com/', {
+        headers: { 'Accept': 'text/plain' }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const joke = await response.text();
+      writeOutput(joke.trim());
+      return 0;
+    } catch (e) {
+      console.error(`dadjoke: ${e.message}`);
+      return 1;
+    }
   }
 };
 } catch(e) {
