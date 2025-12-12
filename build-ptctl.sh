@@ -8,4 +8,3 @@ gcc -shared -fPIC -o libptctl.so src/ptctl.c
 
 echo "✓ Compiled libptctl.so"
 ls -lh libptctl.so
-file libptctl.so

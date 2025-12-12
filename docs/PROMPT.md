@@ -27,6 +27,7 @@ fgshell provides special placeholders that are replaced when the prompt is displ
 | Placeholder | Description |
 |-------------|-------------|
 | `%user%` | Current username |
+| `%host%` | Hostname |
 | `%pwd%` | Full working directory path |
 | `%dir%` | Directory basename (last component of path) |
 | `%cyan%` | Cyan color code (ANSI bold cyan) |
@@ -57,6 +58,13 @@ Output: `fearlessgeek:fgshell »` (with colors)
 export PS1="%user%@%pwd% $ "
 ```
 Output: `fearlessgeek@/home/fearlessgeek/fgshell $ `
+
+### Hostname in Prompt
+
+```bash
+export PS1="%user%@%host%:%dir% > "
+```
+Output: `fearlessgeek@nixos:fgshell > `
 
 ### Fancy Multi-Color Prompt
 
@@ -102,7 +110,7 @@ echo "This is an experimental shell"
 fastfetch
 
 # Customize prompt using color placeholders:
-# Available: %user%, %pwd%, %dir%, %cyan%, %green%, %red%, %yellow%, %reset%
+# Available: %user%, %host%, %pwd%, %dir%, %cyan%, %green%, %red%, %yellow%, %reset%
 export PS1="%cyan%%user%%reset%:%green%%dir%%reset% » "
 ```
 

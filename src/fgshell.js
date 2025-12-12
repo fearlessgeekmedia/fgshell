@@ -21,14 +21,1370 @@ const { spawn } = require('child_process');
 const readline = require('readline');
 const os = require('os');
 const glob = require('glob');
+const minimist = require('minimist');
 const SHELL = require('./shell');
 const historyDB = require('./history-db');
-const ptctl = require('./ptctl');
+let ptctl;
+try {
+  ptctl = require('./ptctl.node');
+} catch (e) {
+  ptctl = { available: false };
+}
+const help = {
+  echo: `echo [-neE] [STRING]...
+  Write arguments to standard output.
+
+  Options:
+  -n     do not output the trailing newline
+  -e     enable interpretation of backslash escapes (default)
+  -E     disable interpretation of backslash escapes
+
+  Backslash escapes:
+  \\a     alert (bell)
+  \\b     backspace
+  \\c     suppress further output
+  \\e     an escape character
+  \\f     form feed
+  \\n     new line
+  \\r     carriage return
+  \\t     horizontal tab
+  \\v     vertical tab
+  \\\\     backslash
+  \\0nnn  byte with octal value nnn
+  \\xhh   byte with hexadecimal value hh
+
+  Exit status:
+  Always successful (0) unless a write error occurs.
+  `,
+  cd: `cd [-L|-P] [DIR]
+  Change the shell working directory.
+
+  Changes the current working directory to DIR. If DIR is not supplied,
+  the value of HOME is used as the default.
+
+  Options:
+  -P     physical: resolve symlinks to get to the actual directory
+  -L     logical: keep symlinks in the path (default)
+
+  Special values:
+  cd -   switches to the previous working directory
+  cd ~   changes to the home directory
+  cd ~user  changes to user's home directory
+
+  Exit status:
+  Returns 0 on successful change, non-zero if the directory cannot be accessed.
+  `,
+  pwd: `pwd [-LP]
+  Print the current working directory.
+
+  Options:
+  -L     logical: include symlinks in the printed path (default)
+  -P     physical: resolve symlinks to the actual directory
+
+  Exit status:
+  Always successful (0) unless an error occurs reading the directory.
+  `,
+  exit: `exit [n]
+  Exit the shell with status n.
+
+  Causes the shell to exit with a status of n. If n is omitted,
+  the exit status is that of the last command executed.
+
+  Note: If the shell is not interactive, SIGTERM is sent to all jobs
+  before exiting.
+  `,
+  export: `export [-p] [name[=value] ...]
+  Export variables to the environment.
+
+  Marks each name for automatic export to the environment of subsequently
+  executed commands. If value is supplied, it is assigned before exporting.
+
+  Options:
+  -p     print all exported variables in exportable form
+
+  Exit status:
+  Returns 0 unless an invalid option is supplied or assignment fails.
+  `,
+  unset: `unset [-fv] [name ...]
+  Unset shell and environment variables.
+
+  For each name, removes the variable or function definition.
+
+  Options:
+  -f     unset only function names
+  -v     unset only variable names (default)
+
+  Exit status:
+  Returns 0 unless an invalid option is supplied or name is read-only.
+  `,
+  env: `env [NAME=VALUE ...] [COMMAND [ARGS ...]]
+  Execute a command with modified environment.
+
+  With no arguments, prints all environment variables.
+  With NAME=VALUE, sets variables in the environment for a command.
+
+  Examples:
+  env                  # print all variables
+  env PATH=/bin        # print current environment with modified PATH
+  env -i TERM=xterm    # clear environment and set only TERM
+  `,
+  jobs: `jobs [-lnprs] [JOBSPEC ...]
+  Display the status of background jobs.
+
+  Options:
+  -l     list job IDs with process group IDs
+  -n     show only changed jobs
+  -p     list only process group IDs
+  -r     show only running jobs
+  -s     show only stopped jobs
+
+  Exit status:
+  Returns 0 unless an invalid option is supplied or JOBSPEC not found.
+  `,
+  fg: `fg [JOBSPEC]
+  Move a job to the foreground.
+
+  Resumes JOBSPEC in the foreground. If JOBSPEC is not supplied,
+  the shell's notion of the current job is used.
+
+  JOBSPEC can be:
+  %n        nth job in the job list
+  %string   job started with 'string'
+  %%        current job
+  %+        current job (same as %%)
+  %-        previous job
+
+  Exit status:
+  Returns the exit status of the resumed job, or non-zero if not found.
+  `,
+  bg: `bg [JOBSPEC ...]
+  Continue stopped jobs in the background.
+
+  Resumes each JOBSPEC as a background job. If JOBSPEC is not supplied,
+  the shell's notion of the current job is used.
+
+  JOBSPEC can be:
+  %n        nth job in the job list
+  %string   job started with 'string'
+  %%        current job
+  %+        current job (same as %%)
+  %-        previous job
+
+  Exit status:
+  Returns 0 unless an invalid JOBSPEC is given.
+  `,
+  history: `history [-c] [-w] [-r] [FILENAME] or history [-n] [COUNT]
+  Display the command history.
+
+  With no options, displays the entire history with line numbers.
+
+  Options:
+  -c     clear the history list
+  -w     write history to FILENAME (or ~/.bash_history)
+  -r     read history from FILENAME (or ~/.bash_history)
+  -n N   display the last N commands
+
+  Exit status:
+  Returns 0 unless an invalid option is supplied or file cannot be accessed.
+  `,
+  ls: `ls [OPTION]... [FILE]...
+  List information about files and directories.
+
+  Options:
+  -a, --all                 do not ignore entries starting with .
+  -A, --almost-all          same as -a but do not list . and ..
+  -C                        list entries by columns
+  -d, --directory           list directories themselves, not their contents
+  -h, --human-readable      with -l, print sizes in human readable format
+  -l                        use a long listing format
+  -1                        list one file per line
+  -R, --recursive           list subdirectories recursively
+  -r, --reverse             reverse the sort order
+  -S                        sort by file size, largest first
+  -t                        sort by time, newest first
+  -u                        sort by access time
+  -U                        do not sort; list in directory order
+  -v                        sort by version numbers
+  --color[=WHEN]            colorize the output (auto, always, never)
+  -G, --no-group            in long listing, don't print group names
+  --full-time               show full date and time
+  --help                    display this help and exit
+  --version                 output version information and exit
+  `,
+  printf: `printf FORMAT [ARGUMENT]...
+  Write the formatted arguments to the standard output under the control of the format.
+
+  Format string escapes:
+  \\a     alert (bell)
+  \\b     backspace
+  \\c     suppress further output
+  \\e     escape character
+  \\f     form feed
+  \\n     new line
+  \\r     carriage return
+  \\t     horizontal tab
+  \\v     vertical tab
+  \\\\     backslash
+  \\0nnn   character with octal value nnn
+
+  Format conversions:
+  %s     string
+  %d, %i decimal integer
+  %f     floating point
+  %x     hexadecimal
+  %o     octal
+  %c     single character
+  %%     literal %
+  `,
+  alias: `alias [-p] [name[=value] ...]
+  Define or display aliases.
+
+  An alias is an alternative name for a command. When a command is typed,
+  the shell checks for aliases and substitutes the alias value before
+  executing the command.
+
+  Without arguments, prints all defined aliases in the form:
+  alias name='value'
+
+  Options:
+  -p              print all aliases in exportable format
+
+  Arguments:
+  name             display the alias named 'name'
+  name=value       define 'name' as an alias for 'value'
+  name1=v1 ...    define multiple aliases at once
+
+  Alias rules:
+  - Aliases are expanded in non-interactive mode only if on a separate line
+  - Aliases cannot be recursive (alias foo=foo)
+  - An alias cannot reference another alias in expansion
+
+  Examples:
+  alias                      # list all aliases
+  alias ls                   # show what 'ls' is aliased to
+  alias ls='ls -l'           # alias ls to ls -l
+  alias rm='rm -i'           # alias rm to rm -i (confirm deletions)
+  alias mygrep='grep -n'     # create custom alias
+
+  Exit status:
+  Returns 0 unless name is invalid or assignment fails.
+  `,
+  unalias: `unalias [-a] [name ...]
+  Remove aliases.
+
+  Removes each named alias. The -a option removes all aliases.
+
+  Options:
+  -a              remove all defined aliases
+  
+  Without -a, removes only the specified aliases by name.
+  Attempting to unalias a non-existent alias is not an error.
+
+  Examples:
+  unalias ls                 # remove 'ls' alias
+  unalias rm cd              # remove multiple aliases
+  unalias -a                 # remove all aliases at once
+
+  Exit status:
+  Returns 0 unless an invalid option is supplied.
+  `,
+  source: `source FILENAME [ARGUMENTS]
+  Read and execute commands from a file in the current shell.
+
+  The FILENAME is sourced (executed) in the current shell context,
+  rather than in a subshell. This means all variable assignments,
+  function definitions, and other changes are preserved after the
+  file finishes executing.
+
+  Differences from running as script:
+  - Changes to environment variables persist
+  - Changes to shell variables persist
+  - Functions defined in the file are available in the current shell
+  - No subshell is created
+
+  Arguments passed to source are available as $1, $2, etc.
+
+  Exit status:
+  Returns the exit status of the last command executed in FILENAME,
+  or non-zero if FILENAME cannot be read.
+
+  Examples:
+  source ~/.bashrc           # load shell configuration
+  source setup.sh PARAM1     # run setup script with argument
+  `,
+  js: `js [CODE]
+  Execute JavaScript code in the shell context.
+
+  Executes JavaScript CODE and prints the result. The code has access
+  to shell state through:
+  - SHELL.env          object containing environment variables
+  - SHELL.cwd          current working directory
+  - SHELL.jobs         array of background jobs
+  - process.env        Node.js environment variables
+  - require()          load Node.js modules
+
+  The result of the last expression is printed to stdout.
+
+  Examples:
+  js Math.sqrt(16)                       # prints 4
+  js Object.keys(process.env).length     # count env variables
+  js SHELL.env['PATH']                   # show PATH
+  js SHELL.cwd                           # show current directory
+  js require('fs').readdirSync('.')      # list files in directory
+
+  Exit status:
+  Returns 0 on success, non-zero if code throws an error.
+  `,
+  read: `read [-ers] [-p prompt] [-t timeout] [-n nchars] [-d delim] [VARIABLE ...]
+  Read a line from standard input.
+
+  Options:
+  -p prompt     display prompt before reading
+  -t timeout    read times out after timeout seconds
+  -n nchars     read stops after nchars characters
+  -d delim      read stops after delimiter character
+  -e            use Readline for input
+  -r            do not interpret backslash escapes
+  -s            do not echo input (useful for passwords)
+
+  If no VARIABLE is given, the input is assigned to REPLY.
+  The input line is split into fields assigned to multiple variables.
+
+  Exit status:
+  Returns 0 unless EOF is encountered, a timeout expires, or invalid option.
+  `,
+  '[': `[ EXPRESSION ]
+  Evaluate a conditional expression (POSIX test).
+
+  File tests:
+  -b FILE      true if FILE exists and is a block special file
+  -c FILE      true if FILE exists and is a character special file
+  -d FILE      true if FILE exists and is a directory
+  -e FILE      true if FILE exists
+  -f FILE      true if FILE exists and is a regular file
+  -g FILE      true if FILE exists and has setgid bit set
+  -h FILE      true if FILE exists and is a symbolic link
+  -L FILE      true if FILE exists and is a symbolic link (same as -h)
+  -k FILE      true if FILE exists and has sticky bit set
+  -p FILE      true if FILE exists and is a named pipe
+  -r FILE      true if FILE exists and is readable
+  -s FILE      true if FILE exists and has size greater than 0
+  -u FILE      true if FILE exists and has setuid bit set
+  -w FILE      true if FILE exists and is writable
+  -x FILE      true if FILE exists and is executable
+  -O FILE      true if FILE is owned by the effective user ID
+  -G FILE      true if FILE is owned by the effective group ID
+
+  String tests:
+  -n STRING    true if STRING is not empty (default)
+  -z STRING    true if STRING is empty
+  STRING1 = STRING2    true if strings are equal
+  STRING1 != STRING2   true if strings are not equal
+  STRING1 < STRING2    true if STRING1 sorts before STRING2
+  STRING1 > STRING2    true if STRING1 sorts after STRING2
+
+  Arithmetic tests:
+  INT1 -eq INT2   equal
+  INT1 -ne INT2   not equal
+  INT1 -lt INT2   less than
+  INT1 -le INT2   less than or equal
+  INT1 -gt INT2   greater than
+  INT1 -ge INT2   greater than or equal
+
+  Logical:
+  ! EXPR              true if EXPR is false
+  EXPR1 -a EXPR2      true if both are true (AND, implied)
+  EXPR1 -o EXPR2      true if either is true (OR)
+  ( EXPR )            grouping
+
+  Note: This form requires ] as the last argument.
+
+  Exit status:
+  Returns 0 if EXPRESSION is true, 1 if false or invalid.
+  `,
+  cat: `cat [-bEnstv] [FILE ...]
+  Concatenate files and print to standard output.
+
+  With no FILE or when FILE is -, reads from standard input.
+
+  Options:
+  -b      number only non-empty output lines
+  -E      display $ at end of each line
+  -n      number all output lines
+  -s      suppress repeated empty lines
+  -t      display tabs as ^I
+  -v      display non-printing characters
+
+  Exit status:
+  Returns 0 on success, non-zero if FILE cannot be read.
+
+  Examples:
+  cat file.txt                # display file
+  cat file1 file2             # concatenate and display
+  cat > file.txt              # create file from stdin (Ctrl+D to end)
+  cat << EOF                  # read until delimiter
+  `,
+  test: `test [EXPRESSION]
+  Evaluate a conditional expression (same as [ ]).
+
+  Identical to [ EXPRESSION ] but does not require ] as the last argument.
+
+  All operators and syntax are the same as [ ], including:
+  File tests, string tests, arithmetic tests, and logical operators.
+
+  Exit status:
+  Returns 0 if EXPRESSION is true, 1 if false or invalid.
+
+  Examples:
+  test -f /etc/passwd         # check if file exists
+  test "$var" = "value"       # compare strings
+  test -d /tmp                # check if directory exists
+  test $x -gt 5               # arithmetic comparison
+  `,
+};
+
+// ...
+
+// Helper to clear the current readline prompt line and output text properly
+function writeOutput(text) {
+  if (rl.terminal) {
+    // Clear the current prompt line
+    process.stdout.write('\x1b[2K\r');
+  }
+  process.stdout.write(text);
+  if (!text.endsWith('\n')) {
+    process.stdout.write('\n');
+  }
+}
+
+let builtins;
+try {
+  builtins = {
+  echo: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.echo);
+      return 0;
+    }
+    let interpretEscapes = false;
+    let startIdx = 1;
+    
+    // Check for -e flag
+    if (args[1] === '-e') {
+      interpretEscapes = true;
+      startIdx = 2;
+    }
+    
+    let output = args.slice(startIdx).join(' ');
+    
+    if (interpretEscapes) {
+      // Interpret escape sequences
+      output = output
+        .replace(/\\n/g, '\n')
+        .replace(/\\t/g, '\t')
+        .replace(/\\r/g, '\r')
+        .replace(/\\033/g, '\033')
+        .replace(/\\x([0-9a-fA-F]{2})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
+    }
+    
+    writeOutput(output);
+    return 0;
+  },
+  cd: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.cd);
+      return 0;
+    }
+    const target = args[1] || SHELL.env.HOME || process.env.HOME || '/tmp';
+    try {
+      const newdir = path.resolve(SHELL.cwd, target);
+      fs.accessSync(newdir);
+      SHELL.cwd = newdir;
+      process.chdir(SHELL.cwd); // align node process cwd
+    } catch (e) {
+      console.error('cd: ' + e.message);
+      return 1;
+    }
+    return 0;
+  },
+  pwd: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.pwd);
+      return 0;
+    }
+    console.log(SHELL.cwd);
+    return 0;
+  },
+  exit: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.exit);
+      return 0;
+    }
+    const code = args[1] ? Number(args[1]) || 0 : 0;
+    process.exit(code);
+  },
+  export: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.export);
+      return 0;
+    }
+    // export KEY=VALUE or export KEY
+    for (let i = 1; i < args.length; i++) {
+      const part = args[i];
+      const eq = part.indexOf('=');
+      if (eq >= 0) {
+        const key = part.slice(0, eq);
+        const val = part.slice(eq+1);
+        SHELL.env[key] = val;
+      } else {
+        SHELL.env[part] = process.env[part] || '';
+      }
+    }
+    return 0;
+  },
+  unset: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.unset);
+      return 0;
+    }
+    for (let i = 1; i < args.length; i++) {
+      delete SHELL.env[args[i]];
+    }
+    return 0;
+  },
+  env: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.env);
+      return 0;
+    }
+    for (const k of Object.keys(SHELL.env)) {
+      console.log(`${k}=${SHELL.env[k]}`);
+    }
+    return 0;
+  },
+  jobs: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.jobs);
+      return 0;
+    }
+    for (const j of SHELL.jobs) {
+      console.log(`[${j.id}] ${j.status}\t${j.cmdline}`);
+    }
+    return 0;
+  },
+  fg: async function(args) {
+    if (args.includes('--help')) {
+      console.log(help.fg);
+      return 0;
+    }
+    const id = args[1] ? Number(args[1].replace('%','')) : (SHELL.jobs.length ? SHELL.jobs[SHELL.jobs.length-1].id : null);
+    if (!id) { console.error('fg: no job'); return 1; }
+    const job = SHELL.jobs.find(j => j.id === id);
+    if (!job) { console.error('fg: job not found'); return 1; }
+    
+    console.log(job.cmdline);
+    job.background = false;
+    job.status = 'running';
+
+    // If job was started with pty, re-attach it
+    if (job.pty) {
+      rl.pause();
+      process.stdin.setRawMode(true);
+      
+      const ptyInputHandler = (data) => job.pty.write(data.toString());
+      process.stdin.on('data', ptyInputHandler);
+
+      const resizeHandler = () => {
+        if(job.pty) job.pty.resize(process.stdout.columns, process.stdout.rows);
+      };
+      process.stdout.on('resize', resizeHandler);
+      resizeHandler(); // Initial resize
+
+      // Resume the process
+      try {
+        process.kill(job.pty.pid, 'SIGCONT');
+      } catch(e) {
+        // process might have died already
+      }
+
+      // Wait for it to finish or get suspended again
+      await new Promise(resolve => {
+        const exitHandler = job.pty.onExit(() => {
+          process.stdin.removeListener('data', ptyInputHandler);
+          process.stdout.removeListener('resize', resizeHandler);
+          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          resolve();
+        });
+
+        const checkSuspended = setInterval(() => {
+          if (job.status === 'stopped') {
+            process.stdin.removeListener('data', ptyInputHandler);
+            process.stdout.removeListener('resize', resizeHandler);
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            clearInterval(checkSuspended);
+            console.log(`\n[${job.id}] Stopped\t${job.cmdline}`);
+            resolve();
+          }
+        }, 100);
+      });
+      
+      // After job is done, resume shell
+      if (rl.paused) {
+        rl.resume();
+        prompt().catch(() => {});
+      }
+    } else {
+      // For non-pty jobs (background tasks), just bring them to foreground and wait
+      try {
+        for (const pid of job.pids) {
+          process.kill(pid, 'SIGCONT');
+        }
+      } catch(e) {
+        console.error('fg:', e.message);
+        return 1;
+      }
+      await waitForJob(job);
+    }
+    return 0;
+  },
+  bg: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.bg);
+      return 0;
+    }
+    const id = args[1] ? Number(args[1].replace('%','')) : (SHELL.jobs.length ? SHELL.jobs[SHELL.jobs.length-1].id : null);
+    if (!id) { console.error('bg: no job'); return 1; }
+    const job = SHELL.jobs.find(j => j.id === id);
+    if (!job) { console.error('bg: job not found'); return 1; }
+    // resume job in background
+    try {
+      for (const pid of job.pids) {
+        process.kill(pid, 'SIGCONT');
+      }
+      job.status = 'running';
+    } catch (e) {
+      console.error('bg:', e.message);
+      return 1;
+    }
+    return 0;
+  },
+  history: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.history);
+      return 0;
+    }
+    // history [query] - search history, or list all if no query
+    if (args.length === 1) {
+      // List all history
+      const entries = historyDB.getAll(1000);
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        const timestamp = new Date(e.timestamp * 1000).toLocaleString();
+        const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
+        console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
+      }
+    } else {
+      // Search history
+      const query = args.slice(1).join(' ');
+      const results = historyDB.search(query, 50);
+      if (results.length === 0) {
+        console.log('No matching commands found');
+      } else {
+        for (let i = 0; i < results.length; i++) {
+          const e = results[i];
+          const timestamp = new Date(e.timestamp * 1000).toLocaleString();
+          const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
+          console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
+        }
+      }
+    }
+    return 0;
+  },
+  ls: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.ls);
+      return 0;
+    }
+    const argv = minimist(args.slice(1), {
+      alias: {
+        all: 'a',
+        'almost-all': 'A',
+        long: 'l',
+        'human-readable': 'h',
+        reverse: 'r',
+        recursive: 'R',
+        sort: 'S',
+        time: 't',
+        directory: 'd',
+        classify: 'F',
+        inode: 'i',
+        size: 's',
+      },
+      boolean: ['a', 'A', 'l', 'h', 'r', 'R', 'S', 't', 'c', 'C', 'd', 'D', 'f', 'F', 'g', 'G', 'i', 'k', 'L', 'm', 'n', 'N', 'o', 'p', 'q', 'Q', 's', 'U', 'v', 'x', 'X', 'Z', '1', 'G'],
+      string: ['color'],
+    });
+
+    const longFormat = argv.l;
+    const allFiles = argv.a;
+    const almostAll = argv.A;
+    const humanReadable = argv.h;
+    const reverse = argv.r;
+    const recursive = argv.R;
+    const sortBySize = argv.S;
+    const sortByTime = argv.t;
+    const directory = argv.d;
+    const classify = argv.F;
+    const showInode = argv.i;
+    const showSize = argv.s;
+    
+    // Color support
+    let useColor = false;
+    if (argv.color === true || argv.color === 'always') {
+      useColor = true;
+    } else if (argv.color === 'auto' || (argv.color !== 'never' && process.stdout.isTTY)) {
+      useColor = true;
+    }
+    
+    const colorize = (name, stat) => {
+      if (!useColor) return name;
+      // Color codes
+      const colors = {
+        dir: '\x1b[34m',      // blue for directories
+        link: '\x1b[36m',     // cyan for symlinks
+        exe: '\x1b[32m',      // green for executables
+        special: '\x1b[33m',  // yellow for special files
+        reset: '\x1b[0m'
+      };
+      
+      if (stat.isDirectory()) return colors.dir + name + colors.reset;
+      if (stat.isSymbolicLink()) return colors.link + name + colors.reset;
+      if (stat.mode & 0o111) return colors.exe + name + colors.reset;
+      if (stat.isCharacterDevice() || stat.isBlockDevice() || stat.isFIFO() || stat.isSocket()) {
+        return colors.special + name + colors.reset;
+      }
+      return name;
+    };
+
+
+    let paths = argv._;
+    if (paths.length === 0) {
+      paths.push(SHELL.cwd);
+    }
+
+    const listPath = (targetPath) => {
+      try {
+        let stat;
+        try {
+          stat = fs.statSync(targetPath);
+        } catch (statErr) {
+          console.error(`ls: cannot access '${targetPath}': ${statErr.message}`);
+          return;
+        }
+
+        if (directory) {
+          printEntries([path.basename(targetPath)], path.dirname(targetPath));
+          return;
+        }
+
+        if (!stat.isDirectory()) {
+          printEntries([path.basename(targetPath)], path.dirname(targetPath));
+          return;
+        }
+
+        if (paths.length > 1 || recursive) {
+          console.log(`${targetPath}:`);
+        }
+
+        let entries;
+        try {
+          entries = fs.readdirSync(targetPath);
+        } catch (readErr) {
+          console.error(`ls: cannot open directory '${targetPath}': ${readErr.message}`);
+          return;
+        }
+
+        let filteredEntries = entries;
+        if (!allFiles && !almostAll) {
+          filteredEntries = entries.filter(e => !e.startsWith('.'));
+        }
+        if (almostAll) {
+          filteredEntries = entries.filter(e => e !== '.' && e !== '..');
+        }
+
+        printEntries(filteredEntries, targetPath);
+
+        if (recursive) {
+          for (const entry of filteredEntries) {
+            const fullPath = path.join(targetPath, entry);
+            const entryStat = fs.statSync(fullPath);
+            if (entryStat.isDirectory()) {
+              console.log('');
+              listPath(fullPath);
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`ls: cannot access '${targetPath}': ${e.message}`);
+      }
+    };
+
+    const printEntries = (entries, basePath) => {
+      let files = entries.map(entry => {
+        const fullPath = path.join(basePath, entry);
+        try {
+          const stat = fs.statSync(fullPath);
+          return { name: entry, stat };
+        } catch (e) {
+          return { name: entry, stat: null };
+        }
+      }).filter(file => file.stat);
+
+      if (sortBySize) {
+        files.sort((a, b) => b.stat.size - a.stat.size);
+      } else if (sortByTime) {
+        files.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+      } else {
+        files.sort((a, b) => a.name.localeCompare(b.name));
+      }
+
+      if (reverse) {
+        files.reverse();
+      }
+
+      const getIndicator = (stat) => {
+        if (!classify) return '';
+        if (stat.isDirectory()) return '/';
+        if (stat.isSymbolicLink()) return '@';
+        if (stat.isSocket()) return '=';
+        if (stat.isFIFO()) return '|';
+        if (stat.mode & 0o111) return '*';
+        return '';
+      };
+
+      if (longFormat) {
+         for (const file of files) {
+           const { name, stat } = file;
+           const inode = showInode ? `${stat.ino} ` : '';
+           const sizeInBlocks = showSize ? `${Math.ceil(stat.size / 1024)} ` : '';
+           const mode = stat.mode.toString(8).slice(-3);
+           const size = humanReadable ? formatSize(stat.size) : stat.size.toString().padStart(10);
+           const mtime = stat.mtime.toLocaleString();
+           const indicator = getIndicator(stat);
+           const coloredName = colorize(name, stat);
+           console.log(`${inode}${sizeInBlocks}${mode} ${size} ${mtime} ${coloredName}${indicator}`);
+         }
+       } else if (argv.m) {
+         const names = files.map(f => {
+           const indicator = getIndicator(f.stat);
+           const coloredName = colorize(f.name, f.stat);
+           return `${coloredName}${indicator}`;
+         });
+         console.log(names.join(', '));
+       } else if (argv['1']) {
+         const names = files.map(f => {
+           const indicator = getIndicator(f.stat);
+           const coloredName = colorize(f.name, f.stat);
+           return `${coloredName}${indicator}`;
+         });
+         for (const name of names) {
+           const inode = showInode ? `${f.stat.ino} ` : '';
+           const sizeInBlocks = showSize ? `${Math.ceil(f.stat.size / 1024)} ` : '';
+           console.log(`${inode}${sizeInBlocks}${name}`);
+         }
+       } else if (argv.C || argv.x) {
+         const names = files.map(f => {
+           const indicator = getIndicator(f.stat);
+           const inode = showInode ? `${f.stat.ino} ` : '';
+           const sizeInBlocks = showSize ? `${Math.ceil(f.stat.size / 1024)} ` : '';
+           const coloredName = colorize(f.name, f.stat);
+           return `${inode}${sizeInBlocks}${coloredName}${indicator}`;
+         });
+         const termWidth = process.stdout.columns || 80;
+         if (argv.x) {
+           // list entries by lines
+           let output = '';
+           for (const name of names) {
+             if (output.length + name.length + 2 > termWidth) {
+               console.log(output);
+               output = '';
+             }
+             output += name + '  ';
+           }
+           if (output) {
+             console.log(output);
+           }
+         } else {
+           // list entries by columns
+           const maxNameLength = Math.max(...names.map(n => n.length)) + 2;
+           const numCols = Math.floor(termWidth / maxNameLength);
+           const numRows = Math.ceil(names.length / numCols);
+           for (let i = 0; i < numRows; i++) {
+             let line = '';
+             for (let j = 0; j < numCols; j++) {
+               const index = i + j * numRows;
+               if (index < names.length) {
+                 line += names[index].padEnd(maxNameLength);
+               }
+             }
+             console.log(line);
+           }
+         }
+       } else {
+         const names = files.map(f => {
+           const indicator = getIndicator(f.stat);
+           const inode = showInode ? `${f.stat.ino} ` : '';
+           const sizeInBlocks = showSize ? `${Math.ceil(f.stat.size / 1024)} ` : '';
+           const coloredName = colorize(f.name, f.stat);
+           return `${inode}${sizeInBlocks}${coloredName}${indicator}`;
+         });
+         for (const name of names) {
+           console.log(name);
+         }
+       }
+    };
+
+    const formatSize = (bytes) => {
+      if (bytes === 0) return '0B';
+      const k = 1024;
+      const sizes = ['B', 'K', 'M', 'G', 'T'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + sizes[i];
+    };
+
+    for (let i = 0; i < paths.length; i++) {
+      const targetPath = path.resolve(SHELL.cwd, paths[i]);
+      listPath(targetPath);
+      if (i < paths.length - 1) {
+        console.log('');
+      }
+    }
+    return 0;
+  },
+  printf: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.printf);
+      return 0;
+    }
+    // printf format [args...]
+    if (args.length < 2) {
+      console.error('printf: not enough arguments');
+      return 1;
+    }
+    
+    const format = args[1];
+    const values = args.slice(2);
+    let output = '';
+    let valueIdx = 0;
+    
+    for (let i = 0; i < format.length; i++) {
+      if (format[i] === '\\' && i + 1 < format.length) {
+        // Handle escape sequences
+        const esc = format[i + 1];
+        if (esc === 'n') {
+          output += '\n';
+          i++;
+        } else if (esc === 't') {
+          output += '\t';
+          i++;
+        } else if (esc === 'r') {
+          output += '\r';
+          i++;
+        } else if (esc === 'b') {
+          output += '\b';
+          i++;
+        } else if (esc === 'f') {
+          output += '\f';
+          i++;
+        } else if (esc === 'v') {
+          output += '\v';
+          i++;
+        } else if (esc === '\\') {
+          output += '\\';
+          i++;
+        } else if (esc === '0') {
+          output += '\0';
+          i++;
+        } else {
+          output += format[i];
+        }
+      } else if (format[i] === '%' && i + 1 < format.length) {
+        const spec = format[i + 1];
+        if (spec === '%') {
+          output += '%';
+          i++;
+        } else if (spec === 's') {
+          output += values[valueIdx] || '';
+          valueIdx++;
+          i++;
+        } else if (spec === 'd' || spec === 'i') {
+          const val = parseInt(values[valueIdx] || '0', 10);
+          output += val.toString();
+          valueIdx++;
+          i++;
+        } else if (spec === 'f') {
+          const val = parseFloat(values[valueIdx] || '0');
+          output += val.toString();
+          valueIdx++;
+          i++;
+        } else if (spec === 'x') {
+          const val = parseInt(values[valueIdx] || '0', 10);
+          output += val.toString(16);
+          valueIdx++;
+          i++;
+        } else if (spec === 'o') {
+          const val = parseInt(values[valueIdx] || '0', 10);
+          output += val.toString(8);
+          valueIdx++;
+          i++;
+        } else if (spec === 'c') {
+          const val = values[valueIdx] || '';
+          output += val.length > 0 ? val[0] : '';
+          valueIdx++;
+          i++;
+        } else if (spec === 'n') {
+          // %n is not supported (would require variable assignment)
+          i++;
+        } else {
+          output += '%' + spec;
+          i++;
+        }
+      } else {
+        output += format[i];
+      }
+    }
+    
+    writeOutput(output);
+    return 0;
+  },
+  alias: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.alias);
+      return 0;
+    }
+    if (args.length === 1) {
+      for (const alias in SHELL.aliases) {
+        console.log(`alias ${alias}='${SHELL.aliases[alias]}'`);
+      }
+    } else {
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i];
+        const eq = arg.indexOf('=');
+        if (eq > 0) {
+          const key = arg.slice(0, eq);
+          const val = arg.slice(eq + 1);
+          SHELL.aliases[key] = val;
+        } else {
+          if (arg in SHELL.aliases) {
+            console.log(`alias ${arg}='${SHELL.aliases[arg]}'`);
+          }
+        }
+      }
+    }
+    return 0;
+  },
+  unalias: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.unalias);
+      return 0;
+    }
+    if (args.length === 1) {
+      console.error('unalias: usage: unalias [-a] name [name ...]');
+      return 1;
+    }
+    for (let i = 1; i < args.length; i++) {
+      delete SHELL.aliases[args[i]];
+    }
+    return 0;
+  },
+  source: async function(args) {
+    if (args.includes('--help')) {
+      console.log(help.source);
+      return 0;
+    }
+    if (args.length < 2) {
+      console.error('source: usage: source <file>');
+      return 1;
+    }
+    const file = args[1];
+    const filePath = path.resolve(SHELL.cwd, expandVars(file));
+    try {
+      const script = fs.readFileSync(filePath, 'utf8');
+      const lines = script.split('\n');
+      for (let idx = 0; idx < lines.length; idx++) {
+        const line = lines[idx];
+        if (line.trim() && !line.trim().startsWith('#')) {
+          await runLine(line);
+        }
+      }
+      return 0;
+    } catch (e) {
+      console.error(`source: ${e.message}`);
+      return 1;
+    }
+  },
+  js: async function(args) {
+    if (args.includes('--help')) {
+      console.log(help.js);
+      return 0;
+    }
+    if (args.length < 2) {
+      console.error('js: usage: js <code>');
+      return 1;
+    }
+    
+    const code = args.slice(1).join(' ');
+    
+    try {
+      // Create context with shell access
+      const context = {
+        env: SHELL.env,
+        cwd: SHELL.cwd,
+        home: SHELL.env.HOME || process.env.HOME || '/tmp',
+        user: (() => { try { return os.userInfo().username; } catch (e) { return SHELL.env.USER || SHELL.env.LOGNAME || 'user'; } })(),
+        // Utility functions
+        cd: (dir) => {
+          const target = path.resolve(SHELL.cwd, expandVars(dir));
+          try {
+            fs.accessSync(target);
+            SHELL.cwd = target;
+            process.chdir(SHELL.cwd);
+            return true;
+          } catch (e) {
+            return false;
+          }
+        },
+        pwd: () => SHELL.cwd,
+        ls: (dir) => {
+          const target = dir ? path.resolve(SHELL.cwd, dir) : SHELL.cwd;
+          try {
+            return fs.readdirSync(target);
+          } catch (e) {
+            return [];
+          }
+        },
+        readFile: (file) => {
+          const target = path.resolve(SHELL.cwd, file);
+          return fs.readFileSync(target, 'utf8');
+        },
+        writeFile: (file, content) => {
+          const target = path.resolve(SHELL.cwd, file);
+          fs.writeFileSync(target, content, 'utf8');
+          return true;
+        },
+      };
+      
+      // Use Function constructor to create and execute code with context
+      // This allows access to context properties while keeping it isolated
+      const contextKeys = Object.keys(context);
+      const contextValues = Object.values(context);
+      
+      // Wrap in async IIFE to support both statements and expressions
+      // Try to evaluate as expression first, fall back to statement
+      const fn = new Function(
+        ...contextKeys,
+        `return (async () => { return ${code} })()`
+      );
+      
+      let result;
+      try {
+        result = await fn(...contextValues);
+      } catch (e) {
+        // If it fails (e.g., statements), try without the return
+        const fn2 = new Function(
+          ...contextKeys,
+          `return (async () => { ${code} })()`
+        );
+        result = await fn2(...contextValues);
+      }
+      
+      // Only output if result is explicitly returned/awaited
+      if (result !== undefined && result !== null) {
+        if (typeof result === 'object') {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(result);
+        }
+      }
+      
+      return 0;
+    } catch (e) {
+      console.error(`js error: ${e.message}`);
+      return 1;
+    }
+  },
+  read: async function(args) {
+    if (args.includes('--help')) {
+      console.log(help.read);
+      return 0;
+    }
+    // read VAR1 VAR2 ... 
+    // Reads a line from stdin and stores it in the variables
+    // Usage: read [-p "prompt"] VAR1 [VAR2 ...]
+    if (args.length < 2) {
+      console.error('read: usage: read [-p prompt] VAR1 [VAR2 ...]');
+      return 1;
+    }
+    
+    let varNames = [];
+    let promptText = '';
+    let i = 1;
+    
+    // Check for -p option
+    if (args[i] === '-p' && i + 1 < args.length) {
+      promptText = args[i + 1];
+      i += 2;
+    }
+    
+    // Collect variable names
+    while (i < args.length) {
+      varNames.push(args[i]);
+      i++;
+    }
+    
+    if (varNames.length === 0) {
+      console.error('read: no variable names specified');
+      return 1;
+    }
+    
+    return new Promise((resolve) => {
+      // Pause main readline if it's active
+      if (!rl.paused) {
+        rl.pause();
+      }
+      
+      // Flush stdout before reading
+      if (promptText) {
+        process.stdout.write(promptText);
+      }
+      
+      // Create a new readline interface for reading from stdin
+      // Force terminal to false to prevent readline from printing its own prompt
+      const rlLocal = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: false
+      });
+      
+      let resolved = false;
+      
+      rlLocal.once('line', (line) => {
+        if (!resolved) {
+          resolved = true;
+          const parts = line.split(/\s+/);
+          for (let j = 0; j < varNames.length; j++) {
+            SHELL.env[varNames[j]] = parts[j] || '';
+          }
+          rlLocal.close();
+          resolve(0);
+        }
+      });
+      
+      rlLocal.once('close', () => {
+        if (!resolved) {
+          resolved = true;
+          rlLocal.close();
+          resolve(0);
+        }
+      });
+      
+      rlLocal.once('error', () => {
+        if (!resolved) {
+          resolved = true;
+          rlLocal.close();
+          resolve(1);
+        }
+      });
+    });
+  },
+  '[': function(args) {
+    if (args.includes('--help')) {
+      console.log(help['[']);
+      return 0;
+    }
+    // The test command: [ expression ]
+    // Last argument must be ]
+    if (args[args.length - 1] !== ']') {
+      console.error('[: missing ]');
+      return 1;
+    }
+    
+    const expr = args.slice(1, -1);
+    if (expr.length === 0) {
+      return 1;
+    }
+    
+    // Handle comparison operators
+    if (expr.length === 3) {
+      const [left, op, right] = expr;
+      const lVal = expandVars(left);
+      const rVal = expandVars(right);
+      
+      // Numeric comparisons
+      const lNum = Number(lVal);
+      const rNum = Number(rVal);
+      
+      let result = false;
+      switch (op) {
+        case '-eq': result = lNum === rNum; break;
+        case '-ne': result = lNum !== rNum; break;
+        case '-lt': result = lNum < rNum; break;
+        case '-le': result = lNum <= rNum; break;
+        case '-gt': result = lNum > rNum; break;
+        case '-ge': result = lNum >= rNum; break;
+        case '=':
+        case '==': result = lVal === rVal; break;
+        case '!=': result = lVal !== rVal; break;
+        case '-z': result = lVal.length === 0; break;
+        case '-n': result = lVal.length > 0; break;
+      }
+      return result ? 0 : 1;
+    }
+    
+    // Handle single argument (check if non-empty)
+    if (expr.length === 1) {
+      const val = expandVars(expr[0]);
+      return val.length > 0 ? 0 : 1;
+    }
+    
+    return 1;
+  },
+  cat: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.cat);
+      return 0;
+    }
+    // Simple cat builtin - concatenate and print files
+    if (args.length < 2) {
+      console.error('cat: missing file operand');
+      return 1;
+    }
+    for (let i = 1; i < args.length; i++) {
+      try {
+        const content = fs.readFileSync(args[i], 'utf8');
+        process.stdout.write(content);
+      } catch (e) {
+        console.error(`cat: ${args[i]}: ${e.message}`);
+        return 1;
+      }
+    }
+    return 0;
+  },
+  test: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.test);
+      return 0;
+    }
+    // test is the same as [, but doesn't require ]
+    return builtins['['](args.concat(']'));
+  }
+};
+} catch(e) {
+  console.error('Failed to initialize builtins:', e);
+}
 
 // Debug logging (optional)
 let logPath = null;
 if (process.env.FGSH_LOG) {
-  const logLocations = ['/tmp/fgshell-debug.log', '/var/tmp/fgshell-debug.log', os.homedir() + '/fgshell-debug.log'];
+  const logLocations = ['/tmp/fgshell-debug.log', '/var/tmp/fgshell-debug.log', (process.env.HOME || '/tmp') + '/fgshell-debug.log'];
   for (const loc of logLocations) {
     try {
       fs.appendFileSync(loc, '[SHELL START] ' + new Date().toISOString() + ' user=' + (process.env.USER || 'unknown') + ' PATH=' + (process.env.PATH || 'UNSET') + '\n');
@@ -224,10 +1580,10 @@ function splitCommands(tokens) {
 function expandVars(str) {
   // handle ~ expansion
   if (str === '~') {
-    return SHELL.env.HOME || os.homedir();
+    return SHELL.env.HOME || process.env.HOME || '/tmp';
   }
   if (str.startsWith('~/')) {
-    return (SHELL.env.HOME || os.homedir()) + str.slice(1);
+    return (SHELL.env.HOME || process.env.HOME || '/tmp') + str.slice(1);
   }
   
   // handle $((arithmetic)) expansion
@@ -274,6 +1630,27 @@ async function expandCommandSubstitution(str) {
   return result;
 }
 
+// Helper function to get an accessible CWD or fallback to a safe directory
+function getAccessibleCwd() {
+  try {
+    fs.accessSync(SHELL.cwd, fs.constants.R_OK);
+    return SHELL.cwd;
+  } catch (e) {
+    // Current directory is not accessible, try HOME
+    if (SHELL.env.HOME) {
+      try {
+        fs.accessSync(SHELL.env.HOME, fs.constants.R_OK);
+        return SHELL.env.HOME;
+      } catch (e2) {
+        // Fall back to /tmp
+        return '/tmp';
+      }
+    }
+    // Final fallback
+    return '/tmp';
+  }
+}
+
 async function executeSubshellCommand(cmdStr) {
   let tokens = tokenize(cmdStr);
   if (tokens.length === 0) {
@@ -305,7 +1682,7 @@ async function executeSubshellCommand(cmdStr) {
     }
     
     const child = spawn(exe, args, {
-      cwd: SHELL.cwd,
+      cwd: getAccessibleCwd(),
       env: SHELL.env,
       stdio: ['ignore', 'pipe', 'ignore'],
     });
@@ -324,717 +1701,6 @@ function expandTokens(cmd) {
   cmd.args = cmd.args.map(a => expandVars(a));
   if (cmd.stdin) cmd.stdin = expandVars(cmd.stdin);
   if (cmd.stdout) cmd.stdout = expandVars(cmd.stdout);
-}
-
-// ---------------------- Builtins ----------------------
-let builtins = {};
-try {
-  builtins = {
-  echo: function(args) {
-    let interpretEscapes = false;
-    let startIdx = 1;
-    
-    // Check for -e flag
-    if (args[1] === '-e') {
-      interpretEscapes = true;
-      startIdx = 2;
-    }
-    
-    let output = args.slice(startIdx).join(' ');
-    
-    if (interpretEscapes) {
-      // Interpret escape sequences
-      output = output
-        .replace(/\\n/g, '\n')
-        .replace(/\\t/g, '\t')
-        .replace(/\\r/g, '\r')
-        .replace(/\\033/g, '\033')
-        .replace(/\\x([0-9a-fA-F]{2})/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
-    }
-    
-    console.log(output);
-    return 0;
-  },
-  cd: function(args) {
-    const target = args[1] || SHELL.env.HOME || os.homedir();
-    try {
-      const newdir = path.resolve(SHELL.cwd, target);
-      fs.accessSync(newdir);
-      SHELL.cwd = newdir;
-      process.chdir(SHELL.cwd); // align node process cwd
-    } catch (e) {
-      console.error('cd: ' + e.message);
-      return 1;
-    }
-    return 0;
-  },
-  pwd: function() {
-    console.log(SHELL.cwd);
-    return 0;
-  },
-  exit: function(args) {
-    const code = args[1] ? Number(args[1]) || 0 : 0;
-    process.exit(code);
-  },
-  export: function(args) {
-    // export KEY=VALUE or export KEY
-    for (let i = 1; i < args.length; i++) {
-      const part = args[i];
-      const eq = part.indexOf('=');
-      if (eq >= 0) {
-        const key = part.slice(0, eq);
-        const val = part.slice(eq+1);
-        SHELL.env[key] = val;
-      } else {
-        SHELL.env[part] = process.env[part] || '';
-      }
-    }
-    return 0;
-  },
-  unset: function(args) {
-    for (let i = 1; i < args.length; i++) {
-      delete SHELL.env[args[i]];
-    }
-    return 0;
-  },
-  env: function(args) {
-    for (const k of Object.keys(SHELL.env)) {
-      console.log(`${k}=${SHELL.env[k]}`);
-    }
-    return 0;
-  },
-  jobs: function() {
-    for (const j of SHELL.jobs) {
-      console.log(`[${j.id}] ${j.status}\t${j.cmdline}`);
-    }
-    return 0;
-  },
-  fg: async function(args) {
-    const id = args[1] ? Number(args[1].replace('%','')) : (SHELL.jobs.length ? SHELL.jobs[SHELL.jobs.length-1].id : null);
-    if (!id) { console.error('fg: no job'); return 1; }
-    const job = SHELL.jobs.find(j => j.id === id);
-    if (!job) { console.error('fg: job not found'); return 1; }
-    
-    console.log(job.cmdline);
-    job.background = false;
-    job.status = 'running';
-
-    // If job was started with pty, re-attach it
-    if (job.pty) {
-      rl.pause();
-      process.stdin.setRawMode(true);
-      
-      const ptyInputHandler = (data) => job.pty.write(data.toString());
-      process.stdin.on('data', ptyInputHandler);
-
-      const resizeHandler = () => {
-        if(job.pty) job.pty.resize(process.stdout.columns, process.stdout.rows);
-      };
-      process.stdout.on('resize', resizeHandler);
-      resizeHandler(); // Initial resize
-
-      // Resume the process
-      try {
-        process.kill(job.pty.pid, 'SIGCONT');
-      } catch(e) {
-        // process might have died already
-      }
-
-      // Wait for it to finish or get suspended again
-      await new Promise(resolve => {
-        const exitHandler = job.pty.onExit(() => {
-          process.stdin.removeListener('data', ptyInputHandler);
-          process.stdout.removeListener('resize', resizeHandler);
-          if (process.stdin.isTTY) process.stdin.setRawMode(false);
-          resolve();
-        });
-
-        const checkSuspended = setInterval(() => {
-          if (job.status === 'stopped') {
-            process.stdin.removeListener('data', ptyInputHandler);
-            process.stdout.removeListener('resize', resizeHandler);
-            if (process.stdin.isTTY) process.stdin.setRawMode(false);
-            clearInterval(checkSuspended);
-            console.log(`\n[${job.id}] Stopped\t${job.cmdline}`);
-            resolve();
-          }
-        }, 100);
-      });
-      
-      // After job is done, resume shell
-      if (rl.paused) {
-        rl.resume();
-        prompt().catch(() => {});
-      }
-    } else {
-      // For non-pty jobs (background tasks), just bring them to foreground and wait
-      try {
-        for (const pid of job.pids) {
-          process.kill(pid, 'SIGCONT');
-        }
-      } catch(e) {
-        console.error('fg:', e.message);
-        return 1;
-      }
-      await waitForJob(job);
-    }
-    return 0;
-  },
-  bg: function(args) {
-    const id = args[1] ? Number(args[1].replace('%','')) : (SHELL.jobs.length ? SHELL.jobs[SHELL.jobs.length-1].id : null);
-    if (!id) { console.error('bg: no job'); return 1; }
-    const job = SHELL.jobs.find(j => j.id === id);
-    if (!job) { console.error('bg: job not found'); return 1; }
-    // resume job in background
-    try {
-      for (const pid of job.pids) {
-        process.kill(pid, 'SIGCONT');
-      }
-      job.status = 'running';
-    } catch (e) {
-      console.error('bg:', e.message);
-      return 1;
-    }
-    return 0;
-  },
-  history: function(args) {
-    // history [query] - search history, or list all if no query
-    if (args.length === 1) {
-      // List all history
-      const entries = historyDB.getAll(1000);
-      for (let i = 0; i < entries.length; i++) {
-        const e = entries[i];
-        const timestamp = new Date(e.timestamp * 1000).toLocaleString();
-        const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
-        console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
-      }
-    } else {
-      // Search history
-      const query = args.slice(1).join(' ');
-      const results = historyDB.search(query, 50);
-      if (results.length === 0) {
-        console.log('No matching commands found');
-      } else {
-        for (let i = 0; i < results.length; i++) {
-          const e = results[i];
-          const timestamp = new Date(e.timestamp * 1000).toLocaleString();
-          const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
-          console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
-        }
-      }
-    }
-    return 0;
-  },
-  ls: function(args) {
-    // ls [-la] [path...]
-    let longFormat = false;
-    let allFiles = false;
-    let paths = [];
-    
-    for (let i = 1; i < args.length; i++) {
-      const arg = args[i];
-      if (arg.startsWith('-')) {
-        if (arg.includes('l')) longFormat = true;
-        if (arg.includes('a')) allFiles = true;
-      } else {
-        paths.push(arg);
-      }
-    }
-    
-    if (paths.length === 0) {
-      paths.push(SHELL.cwd);
-    }
-    
-    for (let pathIdx = 0; pathIdx < paths.length; pathIdx++) {
-      const targetPath = path.resolve(SHELL.cwd, paths[pathIdx]);
-      
-      try {
-        let stat;
-        try {
-          stat = fs.statSync(targetPath);
-        } catch (statErr) {
-          // Can't stat the path - it might not exist or permission denied
-          console.error(`ls: cannot access '${paths[pathIdx]}': ${statErr.message}`);
-          continue;
-        }
-        
-        if (!stat.isDirectory()) {
-          // Single file
-          if (longFormat) {
-            const mode = stat.mode.toString(8).slice(-3);
-            const size = stat.size.toString().padStart(10);
-            const mtime = stat.mtime.toLocaleString();
-            console.log(`${mode} ${size} ${mtime} ${path.basename(targetPath)}`);
-          } else {
-            console.log(path.basename(targetPath));
-          }
-          continue;
-        }
-        
-        // Directory
-        if (paths.length > 1) {
-          console.log(`${targetPath}:`);
-        }
-        
-        let entries;
-        try {
-          entries = fs.readdirSync(targetPath);
-        } catch (readErr) {
-          // Permission denied or other error reading directory
-          console.error(`ls: cannot open directory '${paths[pathIdx]}': ${readErr.message}`);
-          continue;
-        }
-        const filtered = allFiles ? entries : entries.filter(e => !e.startsWith('.'));
-        
-        if (longFormat) {
-          filtered.sort();
-          for (const entry of filtered) {
-            const fullPath = path.join(targetPath, entry);
-            const stat = fs.statSync(fullPath);
-            const mode = stat.mode.toString(8).slice(-3);
-            const size = stat.size.toString().padStart(10);
-            const mtime = stat.mtime.toLocaleString();
-            const suffix = stat.isDirectory() ? '/' : '';
-            console.log(`${mode} ${size} ${mtime} ${entry}${suffix}`);
-          }
-        } else {
-          const dirs = [];
-          const files = [];
-          for (const entry of filtered) {
-            const fullPath = path.join(targetPath, entry);
-            const stat = fs.statSync(fullPath);
-            if (stat.isDirectory()) {
-              dirs.push(entry + '/');
-            } else {
-              files.push(entry);
-            }
-          }
-          const all = [...dirs.sort(), ...files.sort()];
-          for (const entry of all) {
-            console.log(entry);
-          }
-        }
-        
-        if (pathIdx < paths.length - 1) {
-          console.log('');
-        }
-      } catch (e) {
-        console.error(`ls: cannot access '${paths[pathIdx]}': ${e.message}`);
-        return 1;
-      }
-    }
-    return 0;
-  },
-  printf: function(args) {
-    // printf format [args...]
-    if (args.length < 2) {
-      console.error('printf: not enough arguments');
-      return 1;
-    }
-    
-    const format = args[1];
-    const values = args.slice(2);
-    let output = '';
-    let valueIdx = 0;
-    
-    for (let i = 0; i < format.length; i++) {
-      if (format[i] === '\\' && i + 1 < format.length) {
-        // Handle escape sequences
-        const esc = format[i + 1];
-        if (esc === 'n') {
-          output += '\n';
-          i++;
-        } else if (esc === 't') {
-          output += '\t';
-          i++;
-        } else if (esc === 'r') {
-          output += '\r';
-          i++;
-        } else if (esc === 'b') {
-          output += '\b';
-          i++;
-        } else if (esc === 'f') {
-          output += '\f';
-          i++;
-        } else if (esc === 'v') {
-          output += '\v';
-          i++;
-        } else if (esc === '\\') {
-          output += '\\';
-          i++;
-        } else if (esc === '0') {
-          output += '\0';
-          i++;
-        } else {
-          output += format[i];
-        }
-      } else if (format[i] === '%' && i + 1 < format.length) {
-        const spec = format[i + 1];
-        if (spec === '%') {
-          output += '%';
-          i++;
-        } else if (spec === 's') {
-          output += values[valueIdx] || '';
-          valueIdx++;
-          i++;
-        } else if (spec === 'd' || spec === 'i') {
-          const val = parseInt(values[valueIdx] || '0', 10);
-          output += val.toString();
-          valueIdx++;
-          i++;
-        } else if (spec === 'f') {
-          const val = parseFloat(values[valueIdx] || '0');
-          output += val.toString();
-          valueIdx++;
-          i++;
-        } else if (spec === 'x') {
-          const val = parseInt(values[valueIdx] || '0', 10);
-          output += val.toString(16);
-          valueIdx++;
-          i++;
-        } else if (spec === 'o') {
-          const val = parseInt(values[valueIdx] || '0', 10);
-          output += val.toString(8);
-          valueIdx++;
-          i++;
-        } else if (spec === 'c') {
-          const val = values[valueIdx] || '';
-          output += val.length > 0 ? val[0] : '';
-          valueIdx++;
-          i++;
-        } else if (spec === 'n') {
-          // %n is not supported (would require variable assignment)
-          i++;
-        } else {
-          output += '%' + spec;
-          i++;
-        }
-      } else {
-        output += format[i];
-      }
-    }
-    
-    process.stdout.write(output);
-    return 0;
-  },
-  alias: function(args) {
-    if (args.length === 1) {
-      for (const alias in SHELL.aliases) {
-        console.log(`alias ${alias}='${SHELL.aliases[alias]}'`);
-      }
-    } else {
-      for (let i = 1; i < args.length; i++) {
-        const arg = args[i];
-        const eq = arg.indexOf('=');
-        if (eq > 0) {
-          const key = arg.slice(0, eq);
-          const val = arg.slice(eq + 1);
-          SHELL.aliases[key] = val;
-        } else {
-          if (arg in SHELL.aliases) {
-            console.log(`alias ${arg}='${SHELL.aliases[arg]}'`);
-          }
-        }
-      }
-    }
-    return 0;
-  },
-  unalias: function(args) {
-    if (args.length === 1) {
-      console.error('unalias: usage: unalias [-a] name [name ...]');
-      return 1;
-    }
-    for (let i = 1; i < args.length; i++) {
-      delete SHELL.aliases[args[i]];
-    }
-    return 0;
-  },
-  source: async function(args) {
-    if (args.length < 2) {
-      console.error('source: usage: source <file>');
-      return 1;
-    }
-    const file = args[1];
-    const filePath = path.resolve(SHELL.cwd, expandVars(file));
-    try {
-      const script = fs.readFileSync(filePath, 'utf8');
-      const lines = script.split('\n');
-      for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx];
-        if (line.trim() && !line.trim().startsWith('#')) {
-          await runLine(line);
-        }
-      }
-      return 0;
-    } catch (e) {
-      console.error(`source: ${e.message}`);
-      return 1;
-    }
-  },
-  js: async function(args) {
-    if (args.length < 2) {
-      console.error('js: usage: js <code>');
-      return 1;
-    }
-    
-    const code = args.slice(1).join(' ');
-    
-    try {
-      // Create context with shell access
-      const context = {
-        env: SHELL.env,
-        cwd: SHELL.cwd,
-        home: os.homedir(),
-        user: os.userInfo().username,
-        // Utility functions
-        cd: (dir) => {
-          const target = path.resolve(SHELL.cwd, expandVars(dir));
-          try {
-            fs.accessSync(target);
-            SHELL.cwd = target;
-            process.chdir(SHELL.cwd);
-            return true;
-          } catch (e) {
-            return false;
-          }
-        },
-        pwd: () => SHELL.cwd,
-        ls: (dir) => {
-          const target = dir ? path.resolve(SHELL.cwd, dir) : SHELL.cwd;
-          try {
-            return fs.readdirSync(target);
-          } catch (e) {
-            return [];
-          }
-        },
-        readFile: (file) => {
-          const target = path.resolve(SHELL.cwd, file);
-          return fs.readFileSync(target, 'utf8');
-        },
-        writeFile: (file, content) => {
-          const target = path.resolve(SHELL.cwd, file);
-          fs.writeFileSync(target, content, 'utf8');
-          return true;
-        },
-      };
-      
-      // Use Function constructor to create and execute code with context
-      // This allows access to context properties while keeping it isolated
-      const contextKeys = Object.keys(context);
-      const contextValues = Object.values(context);
-      
-      // Wrap in async IIFE to support both statements and expressions
-      // Try to evaluate as expression first, fall back to statement
-      const fn = new Function(
-        ...contextKeys,
-        `return (async () => { return ${code} })()`
-      );
-      
-      let result;
-      try {
-        result = await fn(...contextValues);
-      } catch (e) {
-        // If it fails (e.g., statements), try without the return
-        const fn2 = new Function(
-          ...contextKeys,
-          `return (async () => { ${code} })()`
-        );
-        result = await fn2(...contextValues);
-      }
-      
-      // Only output if result is explicitly returned/awaited
-      if (result !== undefined && result !== null) {
-        if (typeof result === 'object') {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(result);
-        }
-      }
-      
-      return 0;
-    } catch (e) {
-      console.error(`js error: ${e.message}`);
-      return 1;
-    }
-  },
-  read: async function(args) {
-    // read VAR1 VAR2 ... 
-    // Reads a line from stdin and stores it in the variables
-    // Usage: read [-p "prompt"] VAR1 [VAR2 ...]
-    if (args.length < 2) {
-      console.error('read: usage: read [-p prompt] VAR1 [VAR2 ...]');
-      return 1;
-    }
-    
-    let varNames = [];
-    let promptText = '';
-    let i = 1;
-    
-    // Check for -p option
-    if (args[i] === '-p' && i + 1 < args.length) {
-      promptText = args[i + 1];
-      i += 2;
-    }
-    
-    // Collect variable names
-    while (i < args.length) {
-      varNames.push(args[i]);
-      i++;
-    }
-    
-    if (varNames.length === 0) {
-      console.error('read: no variable names specified');
-      return 1;
-    }
-    
-    return new Promise((resolve) => {
-      // Pause main readline if it's active
-      if (!rl.paused) {
-        rl.pause();
-      }
-      
-      // Flush stdout before reading
-      if (promptText) {
-        process.stdout.write(promptText);
-      }
-      
-      // Create a new readline interface for reading from stdin
-      // Force terminal to false to prevent readline from printing its own prompt
-      const rlLocal = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-        terminal: false
-      });
-      
-      let resolved = false;
-      
-      rlLocal.once('line', (line) => {
-        if (!resolved) {
-          resolved = true;
-          const parts = line.split(/\s+/);
-          for (let j = 0; j < varNames.length; j++) {
-            SHELL.env[varNames[j]] = parts[j] || '';
-          }
-          rlLocal.close();
-          resolve(0);
-        }
-      });
-      
-      rlLocal.once('close', () => {
-        if (!resolved) {
-          resolved = true;
-          rlLocal.close();
-          resolve(0);
-        }
-      });
-      
-      rlLocal.once('error', () => {
-        if (!resolved) {
-          resolved = true;
-          rlLocal.close();
-          resolve(1);
-        }
-      });
-    });
-  },
-  '[': function(args) {
-    // The test command: [ expression ]
-    // Last argument must be ]
-    if (args[args.length - 1] !== ']') {
-      console.error('[: missing ]');
-      return 1;
-    }
-    
-    const expr = args.slice(1, -1);
-    if (expr.length === 0) {
-      return 1;
-    }
-    
-    // Handle comparison operators
-    if (expr.length === 3) {
-      const [left, op, right] = expr;
-      const lVal = expandVars(left);
-      const rVal = expandVars(right);
-      
-      // Numeric comparisons
-      const lNum = Number(lVal);
-      const rNum = Number(rVal);
-      
-      let result = false;
-      switch (op) {
-        case '-eq': result = lNum === rNum; break;
-        case '-ne': result = lNum !== rNum; break;
-        case '-lt': result = lNum < rNum; break;
-        case '-le': result = lNum <= rNum; break;
-        case '-gt': result = lNum > rNum; break;
-        case '-ge': result = lNum >= rNum; break;
-        case '=':
-        case '==': result = lVal === rVal; break;
-        case '!=': result = lVal !== rVal; break;
-        case '-z': result = lVal.length === 0; break;
-        case '-n': result = lVal.length > 0; break;
-      }
-      return result ? 0 : 1;
-    }
-    
-    // Handle single argument (check if non-empty)
-    if (expr.length === 1) {
-      const val = expandVars(expr[0]);
-      return val.length > 0 ? 0 : 1;
-    }
-    
-    return 1;
-  },
-  cat: function(args) {
-    // Simple cat builtin - concatenate and print files
-    if (args.length < 2) {
-      console.error('cat: missing file operand');
-      return 1;
-    }
-    for (let i = 1; i < args.length; i++) {
-      try {
-        const content = fs.readFileSync(args[i], 'utf8');
-        process.stdout.write(content);
-      } catch (e) {
-        console.error(`cat: ${args[i]}: ${e.message}`);
-        return 1;
-      }
-    }
-    return 0;
-  },
-  test: function(args) {
-    // test is the same as [, but doesn't require ]
-    return builtins['['](args.concat(']'));
-  },
-  };
-} catch (e) {
-  debug('CRITICAL ERROR initializing builtins:', e.message);
-  console.error('CRITICAL ERROR initializing builtins:', e.message);
-  try {
-    const logPath = path.join(os.tmpdir(), 'fgshell-debug.log');
-    fs.appendFileSync(logPath, 'CRITICAL ERROR initializing builtins: ' + e.message + '\n' + e.stack + '\n');
-  } catch (logErr) {
-    // Can't even log
-  }
-  // Ensure builtins at least has echo and ls
-  builtins = {
-    echo: function(args) { console.log(args.slice(1).join(' ')); return 0; },
-    ls: function(args) { console.log('[FALLBACK LS]'); return 0; },
-    printf: function(args) { console.log('[FALLBACK PRINTF]'); return 0; },
-    cat: function(args) { 
-      if (args.length > 1) {
-        try {
-          console.log(fs.readFileSync(args[1], 'utf8'));
-        } catch (e) {
-          console.error(e.message);
-        }
-      }
-      return 0;
-    },
-    cd: function(args) { return 0; },
-    pwd: function(args) { console.log('/'); return 0; },
-    exit: function(args) { process.exit(0); },
-  };
 }
 
 // ---------------------- Job control helpers ----------------------
@@ -1249,12 +1915,31 @@ async function executePipeline(cmds) {
       // (including raw mode and alternate screen buffer).
       // Use 'detached: true' to create a new process group for the child
       // HOWEVER: sudo needs to stay attached to the TTY to read passwords from /dev/tty
-      const childProcess = spawn(exe, args, {
-        cwd: SHELL.cwd,
-        env: SHELL.env,
-        stdio: 'inherit', // *** CHANGED: Revert to 'inherit' for full TTY support ***
-        detached: command !== 'sudo',   // *** Don't detach sudo - it needs /dev/tty access ***
-      });
+      let childProcess;
+      let actualExe = exe;
+      let actualArgs = args;
+      
+      // Check if this is a script that needs an interpreter
+      const scriptExecutor = getScriptExecutor(exe);
+      if (scriptExecutor) {
+        actualExe = scriptExecutor.interpreter;
+        actualArgs = [...scriptExecutor.args, ...args];
+      }
+      
+      try {
+        childProcess = spawn(actualExe, actualArgs, {
+          cwd: getAccessibleCwd(),
+          env: SHELL.env,
+          stdio: 'inherit', // *** CHANGED: Revert to 'inherit' for full TTY support ***
+          detached: command !== 'sudo',   // *** Don't detach sudo - it needs /dev/tty access ***
+        });
+      } catch (spawnErr) {
+        // Resume readline if spawn fails
+        rl.resume();
+        console.error(`Error executing ${command}: ${spawnErr.message}`);
+        SHELL.lastExitCode = 127;
+        return;
+      }
 
       debug(`Child spawned PID: ${childProcess.pid}`);
 
@@ -1380,7 +2065,7 @@ async function executePipeline(cmds) {
       }
 
       const options = {
-        cwd: SHELL.cwd,
+        cwd: getAccessibleCwd(),
         env: SHELL.env,
         stdio: stdio,
         detached: false,
@@ -1392,7 +2077,18 @@ async function executePipeline(cmds) {
         SHELL.lastExitCode = 127;
         return;
       }
-      child = spawn(exe, args, options);
+      
+      try {
+        child = spawn(exe, args, options);
+      } catch (spawnErr) {
+        console.error(`Error executing ${command}: ${spawnErr.message}`);
+        SHELL.lastExitCode = 127;
+        if (isSingleCommand && rl.paused) {
+          rl.resume();
+        }
+        return;
+      }
+      
       if (!child) {
         console.error('Failed to spawn', exe);
         SHELL.lastExitCode = 1;
@@ -1494,6 +2190,38 @@ function resolveExecutable(cmd) {
   return null;
 }
 
+// Helper to detect if a file is a shell script and return the interpreter + args if needed
+function getScriptExecutor(exePath) {
+  try {
+    const fd = fs.openSync(exePath, 'r');
+    const buf = Buffer.alloc(256);
+    const bytesRead = fs.readSync(fd, buf, 0, 256);
+    fs.closeSync(fd);
+    
+    const content = buf.toString('utf8', 0, bytesRead);
+    const firstLine = content.split('\n')[0];
+    
+    // Check for shebang
+    if (firstLine.startsWith('#!')) {
+      const shebang = firstLine.substring(2).trim();
+      // Parse shebang line: can be like #!/bin/sh or #!/usr/bin/env python3
+      const parts = shebang.split(/\s+/);
+      const interpreter = parts[0];
+      const interpreterArgs = parts.slice(1);
+      
+      return {
+        interpreter: interpreter,
+        args: [...interpreterArgs, exePath]
+      };
+    }
+  } catch (e) {
+    // If we can't read the file, just try to execute it normally
+  }
+  
+  // No shebang detected or couldn't read file, return null to use direct execution
+  return null;
+}
+
 // ---------------------- Signal handling ----------------------
 process.on('SIGINT', () => {
   // forward SIGINT to foreground jobs (all jobs not background)
@@ -1588,21 +2316,42 @@ function renderFilePickerOverlay() {
   const displayFiles = files;
   const terminalCols = process.stdout.columns || 80;
 
+  // Clear previous overlay by moving cursor up and deleting lines
+  if (!filePickerState.firstRender && filePickerState.lastLineCount > 0) {
+    // Move up N lines and clear each
+    for (let i = 0; i < filePickerState.lastLineCount; i++) {
+      process.stdout.write('\x1b[A'); // Move cursor up
+      process.stdout.write('\x1b[K'); // Clear line
+    }
+  } else if (filePickerState.firstRender) {
+    filePickerState.firstRender = false;
+  }
+
+  // Build output
+  let output = '';
+  let lineCount = 0;
+
   const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
-  process.stdout.write(`\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`);
-  process.stdout.write(`(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`);
+  output += `\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`;
+  lineCount++;
+  
+  output += `(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`;
+  lineCount++;
   
   if (filterMode) {
-    process.stdout.write(`Filter: ${filterQuery}\n`);
+    output += `Filter: ${filterQuery}\n`;
+    lineCount++;
   }
   
-  process.stdout.write('-'.repeat(Math.min(80, terminalCols)) + '\n');
+  output += '-'.repeat(Math.min(80, terminalCols)) + '\n';
+  lineCount++;
 
   const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
   const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
 
   if (displayFiles.length === 0) {
-    process.stdout.write('(no files)\n');
+    output += '(no files)\n';
+    lineCount++;
   } else {
     for (let i = startIdx; i < endIdx; i++) {
       const item = displayFiles[i];
@@ -1617,9 +2366,14 @@ function renderFilePickerOverlay() {
       if (isSelected) {
         line = `\x1b[7m${line}\x1b[0m`;
       }
-      process.stdout.write(line + '\n');
+      output += line + '\n';
+      lineCount++;
     }
   }
+
+  // Write all at once and track line count
+  process.stdout.write(output);
+  filePickerState.lastLineCount = lineCount;
 }
 
 function clearFilePickerOverlay() {
@@ -1814,6 +2568,8 @@ async function showFilePicker() {
     maxVisible,
     filterMode: false,
     filterQuery: '',
+    firstRender: true,
+    lastLineCount: 0,
   };
 
   return new Promise((resolve) => {
@@ -1989,6 +2745,8 @@ if (process.stdin.isTTY) {
     }
 
     if (key && key.ctrl && key.name === 'n') {
+      // Prevent re-entrancy from multiple rapid key presses
+      if (isFilePickerActive) return;
       (async () => {
         try {
           const selectedFile = await showFilePicker();
@@ -2011,6 +2769,9 @@ if (process.stdin.isTTY) {
         }
       })();
     } else if (key && key.ctrl && key.name === 'r') {
+      // Prevent re-entrancy from multiple rapid key presses
+      if (isFilePickerActive) return;
+
       const savedLine = rl.line;
       const savedCursor = rl.cursor;
       
@@ -2052,8 +2813,21 @@ async function prompt() {
   const red = '\x1b[1;31m';
   const yellow = '\x1b[1;33m';
   const reset = '\x1b[0m';
-  const uname = os.userInfo().username;
+  let uname;
+  try {
+    uname = os.userInfo().username;
+  } catch (e) {
+    uname = SHELL.env.USER || SHELL.env.LOGNAME || 'user';
+  }
   const base = path.basename(SHELL.cwd);
+  
+  // Get hostname
+  let hostname;
+  try {
+    hostname = os.hostname();
+  } catch (e) {
+    hostname = SHELL.env.HOSTNAME || 'localhost';
+  }
   
   if (!ps1) {
     // Default prompt with colors if PS1 not set
@@ -2062,6 +2836,7 @@ async function prompt() {
     // Replace placeholders and expand variables
     ps1 = ps1
       .replace(/%user%/g, uname)
+      .replace(/%host%/g, hostname)
       .replace(/%pwd%/g, SHELL.cwd)
       .replace(/%dir%/g, base)
       .replace(/%cyan%/g, cyan)
@@ -2117,7 +2892,38 @@ function loadHistory() {
 }
 
 async function loadRcFile() {
-  const rcFile = path.join(os.homedir(), '.fgshrc');
+  let rcFile = path.join(SHELL.env.HOME || process.env.HOME || '/tmp', '.fgshrc');
+  
+  // If the rc file exists but is not readable, try looking in the user's actual home
+  // (this can happen when HOME is inherited from a different user)
+  try {
+    fs.accessSync(rcFile, fs.constants.R_OK);
+  } catch (e) {
+    // Try to find .fgshrc in the actual user's home directory
+    try {
+      const uid = process.getuid();
+      const passwdContent = fs.readFileSync('/etc/passwd', 'utf8');
+      const lines = passwdContent.split('\n');
+      for (const line of lines) {
+        const parts = line.split(':');
+        if (parseInt(parts[2]) === uid) {
+          const userHome = parts[5];
+          const userRcFile = path.join(userHome, '.fgshrc');
+          try {
+            fs.accessSync(userRcFile, fs.constants.R_OK);
+            rcFile = userRcFile;
+            break;
+          } catch (e2) {
+            // User's rc file also not readable, continue with original path
+          }
+          break;
+        }
+      }
+    } catch (e2) {
+      // Can't determine user home, continue with original path
+    }
+  }
+  
   if (fs.existsSync(rcFile)) {
     try {
       isLoadingRcFile = true;

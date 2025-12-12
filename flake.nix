@@ -16,7 +16,12 @@
           name = "fgshell";
           version = "0.1.0";
           
-          src = ./.;
+          src = builtins.filterSource
+            (path: type:
+              let baseName = builtins.baseNameOf path;
+              in !(builtins.elem baseName [".git" "result" "node_modules" "fgshell-pty.node" "pty-2zx5wcm5.node" "libptctl.so" "fgsh" "fgsh-backup" ".yarn" "dist"])
+            )
+            ./.;
           
           buildInputs = with pkgs; [
             bun
@@ -28,12 +33,15 @@
           
           phases = [ "unpackPhase" "buildPhase" "installPhase" ];
           
+          __impure = true;
+          impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [ "GIT_PROXY_COMMAND" "SOCKS_SERVER" ];
+          
           buildPhase = ''
             export HOME=$TMPDIR
             export BUN_INSTALL=$TMPDIR/.bun
             mkdir -p $BUN_INSTALL
             
-            # Install dependencies from lock file
+            # Install dependencies
             bun install
             
             # Build native job control library
