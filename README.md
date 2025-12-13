@@ -33,8 +33,14 @@ A shell that searches your command history with fuzzy matching, remembers which 
 - **Tab completion** for files and directories
 - **Interactive line editing** with readline
 - **Aliases**: `alias name=command` syntax
-- **Shell scripting** with if/while control flow
-- **Built-in commands**: `cd`, `pwd`, `echo`, `export`, `unset`, `env`, `history`, `alias`, `unalias`
+- **Shell scripting** with full control flow: if/else, while, for (C-style and for-in), case statements
+- **Shell functions** with parameter passing
+- **Arrays** with indexing and expansion (`${arr[@]}`, `${arr[i]}`)
+- **Logical operators**: `&&` and `||` for command chaining
+- **Subshells** with `()`
+- **Here-documents** with `<<EOF`
+- **Signal traps** with `trap` command
+- **Built-in commands**: `cd`, `pwd`, `echo`, `export`, `unset`, `env`, `history`, `alias`, `unalias`, `declare`
 
 ## Building
 
@@ -112,26 +118,28 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 
 ## Documentation
 
-- [FGSH.md](docs/FGSH.md) - Shell design and implementation details
+- [SCRIPTING.md](docs/SCRIPTING.md) - Complete scripting language guide with examples
+- [FGSH.md](docs/FGSH.md) - Shell design, architecture, and implementation details
 - [HISTORY.md](docs/HISTORY.md) - Command history system
-- [JAVASCRIPT.md](docs/JAVASCRIPT.md) - Why JavaScript was chosen (spoiler: bad reasons)
 - [PROMPT.md](docs/PROMPT.md) - Prompt customization
+- [JAVASCRIPT.md](docs/JAVASCRIPT.md) - Why JavaScript was chosen (spoiler: bad reasons)
 
 ## Known Limitations & Issues
 
 - **sudo TTY access**: `sudo` without the `-S` flag fails to read passwords interactively when run inside `fgshell`, regardless of whether `fgshell` is the default shell or a subshell. Workaround: use `sudo -S` to read password from stdin
 - **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
-- **Script features**: Limited to basic if/while blocks, no functions or advanced control flow
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
 - **Portability**: Requires Unix-like OS with proper terminal control (Linux, macOS)
 - **POSIX compliance**: Not fully POSIX-compliant; designed for interactive use
+- **Here-documents**: Parsed but content isn't yet passed to commands
 
 ## Roadmap
 
 - [ ] Proper Ctrl+Z terminal state handling
-- [ ] Shell functions and advanced scripting
+- [ ] Complete here-document support
 - [ ] Plugin system for extending commands
 - [ ] Better error messages and debugging output
+- [ ] Arithmetic operators in test conditions
 
 ## License
 
