@@ -24,6 +24,7 @@ const glob = require('glob');
 const minimist = require('minimist');
 const SHELL = require('./shell');
 const historyDB = require('./history-db');
+const outputFormatter = require('./output-formatter');
 let ptctl;
 try {
   ptctl = require('./ptctl.node');
@@ -735,7 +736,12 @@ try {
       console.log(help.ls);
       return 0;
     }
-    const argv = minimist(args.slice(1), {
+    
+    // Detect output format before parsing arguments
+    const outputFormat = outputFormatter.detectOutputFormat(args);
+    const filteredArgs = outputFormatter.removeOutputFormatFlags(args);
+    
+    const argv = minimist(filteredArgs.slice(1), {
       alias: {
         all: 'a',
         'almost-all': 'A',
@@ -767,13 +773,10 @@ try {
     const showInode = argv.i;
     const showSize = argv.s;
     
-    // Color support
-    let useColor = false;
-    if (argv.color === true || argv.color === 'always') {
-      useColor = true;
-    } else if (argv.color === 'auto' || (argv.color !== 'never' && process.stdout.isTTY)) {
-      useColor = true;
-    }
+    // Color support - disabled for JSON/YAML output
+    let useColor = !outputFormat && 
+      (argv.color === true || argv.color === 'always' || 
+       (argv.color !== 'never' && process.stdout.isTTY));
     
     const colorize = (name, stat) => {
       if (!useColor) return name;
@@ -795,11 +798,13 @@ try {
       return name;
     };
 
-
     let paths = argv._;
     if (paths.length === 0) {
       paths.push(SHELL.cwd);
     }
+    
+    // Collect results for JSON/YAML output
+    const allResults = [];
 
     const listPath = (targetPath) => {
       try {
@@ -812,16 +817,16 @@ try {
         }
 
         if (directory) {
-          printEntries([path.basename(targetPath)], path.dirname(targetPath));
+          printEntries([path.basename(targetPath)], path.dirname(targetPath), targetPath);
           return;
         }
 
         if (!stat.isDirectory()) {
-          printEntries([path.basename(targetPath)], path.dirname(targetPath));
+          printEntries([path.basename(targetPath)], path.dirname(targetPath), targetPath);
           return;
         }
 
-        if (paths.length > 1 || recursive) {
+        if (!outputFormat && (paths.length > 1 || recursive)) {
           console.log(`${targetPath}:`);
         }
 
@@ -841,14 +846,14 @@ try {
           filteredEntries = entries.filter(e => e !== '.' && e !== '..');
         }
 
-        printEntries(filteredEntries, targetPath);
+        printEntries(filteredEntries, targetPath, targetPath);
 
         if (recursive) {
           for (const entry of filteredEntries) {
             const fullPath = path.join(targetPath, entry);
             const entryStat = fs.statSync(fullPath);
             if (entryStat.isDirectory()) {
-              console.log('');
+              if (!outputFormat) console.log('');
               listPath(fullPath);
             }
           }
@@ -858,7 +863,7 @@ try {
       }
     };
 
-    const printEntries = (entries, basePath) => {
+    const printEntries = (entries, basePath, originalPath) => {
       let files = entries.map(entry => {
         const fullPath = path.join(basePath, entry);
         try {
@@ -879,6 +884,17 @@ try {
 
       if (reverse) {
         files.reverse();
+      }
+
+      // For JSON/YAML output, format structured data
+      if (outputFormat) {
+        const listing = outputFormatter.formatDirectoryListing(
+          originalPath, 
+          files, 
+          { showInode, humanReadable }
+        );
+        allResults.push(listing);
+        return;
       }
 
       const getIndicator = (stat) => {
@@ -984,10 +1000,18 @@ try {
     for (let i = 0; i < paths.length; i++) {
       const targetPath = path.resolve(SHELL.cwd, paths[i]);
       listPath(targetPath);
-      if (i < paths.length - 1) {
-        console.log('');
+    }
+    
+    // Output collected results in requested format
+    if (outputFormat) {
+      const output = allResults.length === 1 ? allResults[0] : allResults;
+      if (outputFormat === 'json') {
+        console.log(outputFormatter.toJSON(output));
+      } else if (outputFormat === 'yaml') {
+        console.log(outputFormatter.toYAML(output));
       }
     }
+    
     return 0;
   },
   printf: function(args) {
