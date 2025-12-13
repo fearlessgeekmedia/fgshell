@@ -588,8 +588,22 @@ try {
       console.log(help.env);
       return 0;
     }
-    for (const k of Object.keys(SHELL.env)) {
-      console.log(`${k}=${SHELL.env[k]}`);
+    
+    // Detect output format
+    const outputFormat = outputFormatter.detectOutputFormat(args);
+    const filteredArgs = outputFormatter.removeOutputFormatFlags(args);
+    
+    if (outputFormat) {
+      const envData = SHELL.env;
+      if (outputFormat === 'json') {
+        console.log(outputFormatter.toJSON(envData));
+      } else if (outputFormat === 'yaml') {
+        console.log(outputFormatter.toYAML(envData));
+      }
+    } else {
+      for (const k of Object.keys(SHELL.env)) {
+        console.log(`${k}=${SHELL.env[k]}`);
+      }
     }
     return 0;
   },
@@ -598,8 +612,28 @@ try {
       console.log(help.jobs);
       return 0;
     }
-    for (const j of SHELL.jobs) {
-      console.log(`[${j.id}] ${j.status}\t${j.cmdline}`);
+    
+    // Detect output format
+    const outputFormat = outputFormatter.detectOutputFormat(args);
+    const filteredArgs = outputFormatter.removeOutputFormatFlags(args);
+    
+    if (outputFormat) {
+      const jobsData = SHELL.jobs.map(j => ({
+        id: j.id,
+        status: j.status,
+        cmdline: j.cmdline,
+        pids: j.pids,
+        background: j.background || false
+      }));
+      if (outputFormat === 'json') {
+        console.log(outputFormatter.toJSON(jobsData));
+      } else if (outputFormat === 'yaml') {
+        console.log(outputFormatter.toYAML(jobsData));
+      }
+    } else {
+      for (const j of SHELL.jobs) {
+        console.log(`[${j.id}] ${j.status}\t${j.cmdline}`);
+      }
     }
     return 0;
   },
@@ -704,25 +738,40 @@ try {
       console.log(help.history);
       return 0;
     }
+    
+    // Detect output format
+    const outputFormat = outputFormatter.detectOutputFormat(args);
+    const filteredArgs = outputFormatter.removeOutputFormatFlags(args);
+    
+    let entries;
     // history [query] - search history, or list all if no query
-    if (args.length === 1) {
+    if (filteredArgs.length === 1) {
       // List all history
-      const entries = historyDB.getAll(1000);
-      for (let i = 0; i < entries.length; i++) {
-        const e = entries[i];
-        const timestamp = new Date(e.timestamp * 1000).toLocaleString();
-        const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
-        console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);
-      }
+      entries = historyDB.getAll(1000);
     } else {
       // Search history
-      const query = args.slice(1).join(' ');
-      const results = historyDB.search(query, 50);
-      if (results.length === 0) {
+      const query = filteredArgs.slice(1).join(' ');
+      entries = historyDB.search(query, 50);
+    }
+    
+    if (outputFormat) {
+      const historyData = entries.map(e => ({
+        id: e.id,
+        command: e.command,
+        timestamp: new Date(e.timestamp * 1000).toISOString(),
+        exit_code: e.exit_code
+      }));
+      if (outputFormat === 'json') {
+        console.log(outputFormatter.toJSON(historyData));
+      } else if (outputFormat === 'yaml') {
+        console.log(outputFormatter.toYAML(historyData));
+      }
+    } else {
+      if (entries.length === 0) {
         console.log('No matching commands found');
       } else {
-        for (let i = 0; i < results.length; i++) {
-          const e = results[i];
+        for (let i = 0; i < entries.length; i++) {
+          const e = entries[i];
           const timestamp = new Date(e.timestamp * 1000).toLocaleString();
           const exitCode = e.exit_code !== null ? ` [${e.exit_code}]` : '';
           console.log(`${e.id}\t${timestamp}${exitCode}\t${e.command}`);

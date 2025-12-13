@@ -1,7 +1,11 @@
 # FGShell Feature Roadmap
 
 ## Completed
-- [x] JSON/YAML output options for commands (ls --json, ls --yaml)
+- [x] JSON/YAML output options for commands
+  - [x] ls --json / ls --yaml
+  - [x] history --json / history --yaml
+  - [x] jobs --json / jobs --yaml
+  - [x] env --json / env --yaml
 
 ## In Progress
 - [ ] Async pipelines - leverage Node.js event loop for better performance
