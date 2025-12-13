@@ -6,7 +6,7 @@
  * - Parse commands with quotes and escapes
  * - Pipes, redirection: >, >>, <
  * - Background jobs with &
- * - Builtins: cd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf
+ * - Builtins: cd, mkcd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf
  * - Environment variable expansion: $VAR
  * - Tab completion for files/dirs
  * - Basic job control and signal forwarding (SIGINT only after removal of SIGTSTP)
@@ -73,6 +73,15 @@ const help = {
 
   Exit status:
   Returns 0 on successful change, non-zero if the directory cannot be accessed.
+  `,
+  mkcd: `mkcd [DIR]
+  Create a directory and change into it.
+
+  Creates DIR (and any missing parent directories) then changes the
+  current working directory to DIR. Equivalent to mkdir -p DIR && cd DIR.
+
+  Exit status:
+  Returns 0 on success, non-zero if creation or directory change fails.
   `,
   pwd: `pwd [-LP]
   Print the current working directory.
@@ -502,6 +511,28 @@ try {
       process.chdir(SHELL.cwd); // align node process cwd
     } catch (e) {
       console.error('cd: ' + e.message);
+      return 1;
+    }
+    return 0;
+  },
+  mkcd: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.mkcd);
+      return 0;
+    }
+    const target = args[1];
+    if (!target) {
+      console.error('mkcd: missing directory argument');
+      return 1;
+    }
+    try {
+      const newdir = path.resolve(SHELL.cwd, target);
+      fs.mkdirSync(newdir, { recursive: true });
+      fs.accessSync(newdir);
+      SHELL.cwd = newdir;
+      process.chdir(SHELL.cwd); // align node process cwd
+    } catch (e) {
+      console.error('mkcd: ' + e.message);
       return 1;
     }
     return 0;
