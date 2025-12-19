@@ -1285,22 +1285,35 @@ try {
       const contextValues = Object.values(context);
       
       // Wrap in async IIFE to support both statements and expressions
-      // Try to evaluate as expression first, fall back to statement
-      const fn = new Function(
-        ...contextKeys,
-        `return (async () => { return ${code} })()`
-      );
+      // Detect if code contains newlines or multiple statements
+      const hasMultipleStatements = code.includes('\n') || (code.match(/;/g) || []).length > 1 || code.trim().endsWith(';');
       
       let result;
-      try {
-        result = await fn(...contextValues);
-      } catch (e) {
-        // If it fails (e.g., statements), try without the return
-        const fn2 = new Function(
+      let fn;
+      
+      if (hasMultipleStatements) {
+        // For multi-statement blocks, use statement mode directly
+        fn = new Function(
           ...contextKeys,
           `return (async () => { ${code} })()`
         );
-        result = await fn2(...contextValues);
+        result = await fn(...contextValues);
+      } else {
+        // For single expressions, try expression mode first
+        try {
+          fn = new Function(
+            ...contextKeys,
+            `return (async () => { return ${code} })()`
+          );
+          result = await fn(...contextValues);
+        } catch (e) {
+          // Fall back to statement mode if expression fails
+          fn = new Function(
+            ...contextKeys,
+            `return (async () => { ${code} })()`
+          );
+          result = await fn(...contextValues);
+        }
       }
       
       // Only output if result is explicitly returned/awaited
@@ -3579,16 +3592,50 @@ async function prompt() {
 }
 
 // Only set up interactive handlers if we're in interactive mode
+// Helper to detect if a string has unclosed quotes
+function hasUnclosedQuotes(str) {
+  let inSingle = false;
+  let inDouble = false;
+  let i = 0;
+  while (i < str.length) {
+    const ch = str[i];
+    if (ch === '\\') {
+      i += 2;  // Skip escaped character
+      continue;
+    }
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    i++;
+  }
+  return inSingle || inDouble;
+}
+
 // (not running a script or -c command)
 const isScriptMode = process.argv[2] && process.argv[2] !== '-c';
 const isCommandMode = process.argv[2] === '-c' && process.argv[3];
 
+let accumulatedInput = '';  // For multi-line input with unclosed quotes
+
 if (!isScriptMode && !isCommandMode) {
   rl.on('line', async (line) => {
     rl.pause();
-    await runLine(line);
-    rl.resume();
-    await prompt();
+    
+    // Accumulate input if we have unclosed quotes
+    accumulatedInput += (accumulatedInput ? '\n' : '') + line;
+    
+    if (hasUnclosedQuotes(accumulatedInput)) {
+      // Still have unclosed quotes, wait for more input
+      rl.setPrompt('> ');  // Show continuation prompt
+      rl.prompt();
+      rl.resume();
+    } else {
+      // Quotes are closed, execute the accumulated input
+      await runLine(accumulatedInput);
+      accumulatedInput = '';  // Reset for next command
+      rl.setPrompt(SHELL.prompt);
+      rl.resume();
+      await prompt();
+    }
   });
 
   rl.on('SIGINT', () => {
