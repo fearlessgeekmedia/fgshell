@@ -167,33 +167,23 @@ js "nonexistentFunction()"
 
 ## Multi-line JavaScript
 
-For complex logic, wrap your code in an IIFE (Immediately Invoked Function Expression):
+Write multi-line JavaScript directly with proper quoting:
 
 ```bash
-js "(() => { 
-  let x = [1, 2, 3];
-  let doubled = x.map(n => n * 2);
-  console.log(doubled);
-})()"
+js 'console.log("hello");
+console.log("world");'
 ```
 
-When using `js` in shell scripts, use heredocs to avoid quote escaping issues:
+The shell will show a `>` continuation prompt while waiting for the closing quote. Just close the quote on the final line to execute.
 
-```bash
-./fgsh << 'EOF'
-js "(() => { let nums = [1,2,3]; console.log(nums.reduce((a,b) => a+b, 0)); })()"
-EOF
-```
-
-For a complete example with various multi-line patterns, see [example-multiline-js.sh](../example-multiline-js.sh).
+For more complex examples, see [example-multiline-js.sh](../example-multiline-js.sh).
 
 ## Tips
 
 - Use `console.log()` for output, not bare expressions (though simple values will print)
 - Leverage JavaScript's array methods: `.map()`, `.filter()`, `.reduce()`
 - Remember `js` commands run in their own scope—variables don't persist between calls
-- Wrap multi-line code in an IIFE `(() => { ... })()` to execute it as a block
-- In shell scripts, use heredocs with `./fgsh << 'EOF'` to safely pass complex JavaScript
+- Use single or double quotes for multi-line code; the shell shows `>` as a continuation prompt
 
 ## Integration with Other Tools
 
