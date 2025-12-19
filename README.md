@@ -15,6 +15,16 @@ A Unix shell with modern features like fuzzy history search and interactive file
 
 A shell that searches your command history with fuzzy matching, remembers which directory you ran commands in, and lets you visually browse files without leaving the shell—all without installing 50 plugins. It's a shell designed for the 2020s, not the 1970s.
 
+### Design Philosophy
+
+**fgshell is intentionally not POSIX-compliant.** It prioritizes:
+- **Interactive usability** over compatibility with 50-year-old standards
+- **Modern JavaScript integration** for logic and data manipulation
+- **Developer experience** with fuzzy search, visual file picking, and a better history system
+- **Fast iteration** and experimentation (written in JavaScript, not C)
+
+If you need POSIX compliance, use bash or sh. fgshell is for developers who want a better interactive shell for the modern era.
+
 ## Features
 
 ### The Cool Stuff
@@ -44,23 +54,24 @@ A shell that searches your command history with fuzzy matching, remembers which 
 
 ## Building
 
+### Platform Support
+
+**fgshell currently only works on Linux and macOS.** It requires:
+- POSIX-compliant system with proper terminal control (Linux, macOS)
+- [Bun](https://bun.sh) runtime, which is available for Linux and macOS only
+- Not available on Windows or BSD systems (except macOS)
+
 ### Requirements
 
-- [Bun](https://bun.sh) (JavaScript runtime)
+- [Bun](https://bun.sh) (JavaScript runtime) - Linux x64, Linux ARM64, macOS (x64 and ARM64)
 - `make` and `gcc` (for compiling job control FFI bindings)
-- Node.js or Bun (for npm/bun package manager)
+- Node.js 18+ or Bun (for package management)
 
-### Dependencies
+### Installation & Setup
 
-The project depends on:
-- **bun-pty** - PTY handling for interactive shells
-- **enquirer** - Terminal UI for prompts
-- **fuse.js** - Fuzzy search for file picker
-- **glob** - File pattern matching
+#### Option 1: NixOS with Flakes (Recommended)
 
-### Setup
-
-#### Using Nix
+If you're using NixOS with flakes enabled:
 
 ```bash
 # Build with NixOS/Nix
@@ -70,17 +81,40 @@ nix build . --no-sandbox
 # nix.settings.sandbox = false;
 ```
 
-#### Manual Setup
+#### Option 2: Using Nix on Non-NixOS Systems
+
+If you have Nix installed on Linux or macOS (but not using NixOS):
 
 ```bash
-# Install dependencies
+# Enter a development environment with all dependencies
+nix develop
+
+# Then follow manual setup below
+npm install
+./build-ptctl.sh
+bun run build
+```
+
+#### Option 3: Manual Setup (Linux/macOS)
+
+If you don't have Nix, ensure you have the dependencies installed:
+
+**Prerequisites:**
+- Bun: Install from https://bun.sh
+- gcc and make: `apt-get install build-essential` (Ubuntu/Debian) or `brew install gcc make` (macOS)
+- Node.js 18+ or Bun (for npm/bun)
+
+**Build:**
+
+```bash
+# Install JavaScript dependencies
 npm install  # or: bun install
 
 # Compile the native process group control library
 ./build-ptctl.sh
 
-# Build the shell
-bun build-fgsh.js
+# Build the shell binary
+bun run build
 ```
 
 ### Running
@@ -126,10 +160,10 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 
 ## Known Limitations & Issues
 
+- **Platform support**: Linux and macOS only. Bun is not available on other Unix systems (BSD, etc.)
 - **sudo TTY access**: `sudo` without the `-S` flag fails to read passwords interactively when run inside `fgshell`, regardless of whether `fgshell` is the default shell or a subshell. Workaround: use `sudo -S` to read password from stdin
 - **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
-- **Portability**: Requires Unix-like OS with proper terminal control (Linux, macOS)
 - **POSIX compliance**: Not fully POSIX-compliant; designed for interactive use
 - **Here-documents**: Parsed but content isn't yet passed to commands
 
