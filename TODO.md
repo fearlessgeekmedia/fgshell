@@ -114,6 +114,7 @@
 - [ ] Module/package system
 - [ ] Async/await syntax support
 - [ ] Native Promise integration
+- [ ] GTK via FFI for GUI scripting (dialogs, dashboards, interactive widgets)
 
 ## Known Issues to Fix
 
