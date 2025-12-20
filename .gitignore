@@ -13,6 +13,7 @@ flake.lock
 *.a
 fgsh
 result/
+result
 
 # Backup and temporary files
 fgsh-backup
