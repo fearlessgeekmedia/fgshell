@@ -470,6 +470,35 @@ function writeOutput(text) {
 // Shell arrays storage
 const SHELL_ARRAYS = {};
 
+// Error formatting utility for better error messages with line numbers
+function formatError(message, context, sourceSnippet, includeStack) {
+  // context: { startLine, endLine, filename, content }
+  if (!context || !context.filename) {
+    return message;
+  }
+  
+  const basename = path.basename(context.filename);
+  let formatted = `${basename}:${context.startLine}`;
+  if (context.startLine !== context.endLine) {
+    formatted += `-${context.endLine}`;
+  }
+  formatted += `: error: ${message}`;
+  
+  // Add source snippet if available and context is provided
+  if (sourceSnippet && context.content) {
+    // Show just the first line of the content for inline errors
+    const firstLine = context.content.split('\n')[0];
+    formatted += `\n  ${firstLine}`;
+  }
+  
+  // Add call stack if requested
+  if (includeStack && CALL_STACK.length > 0) {
+    formatted += formatCallStack();
+  }
+  
+  return formatted;
+}
+
 let builtins;
 try {
   builtins = {
@@ -2074,25 +2103,53 @@ const SHELL_FUNCTIONS = {};
 // Trap handlers
 const SHELL_TRAPS = {};
 
+// Call stack for error reporting
+const CALL_STACK = [];
+function pushCallFrame(funcName, context) {
+  CALL_STACK.push({
+    type: 'function',
+    name: funcName,
+    context: context || {}
+  });
+}
+function popCallFrame() {
+  CALL_STACK.pop();
+}
+function formatCallStack() {
+  if (CALL_STACK.length === 0) return '';
+  let stack = '\nCall stack:\n';
+  for (let i = CALL_STACK.length - 1; i >= 0; i--) {
+    const frame = CALL_STACK[i];
+    const ctx = frame.context;
+    if (ctx && ctx.filename) {
+      stack += `  at ${frame.name}() (${ctx.filename}:${ctx.startLine})\n`;
+    } else {
+      stack += `  at ${frame.name}()\n`;
+    }
+  }
+  return stack;
+}
+
 // Execute control flow (handles if, while, for, &&, ||, case, etc.)
-async function executeControlFlow(line) {
+async function executeControlFlow(line, context) {
+  // context: { startLine, endLine, filename, content }
   const trimmed = line.trim();
   
   // Check for multi-line control structures first
   if (trimmed.startsWith('if ')) {
-    await executeIf(line);
+    await executeIf(line, context);
     return;
   } else if (trimmed.startsWith('while ')) {
-    await executeWhile(line);
+    await executeWhile(line, context);
     return;
   } else if (trimmed.startsWith('for ')) {
-    await executeFor(line);
+    await executeFor(line, context);
     return;
   } else if (trimmed.startsWith('case ')) {
-    await executeCase(line);
+    await executeCase(line, context);
     return;
   } else if (trimmed.startsWith('function ') || trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/)) {
-    await defineFunctionLine(line);
+    await defineFunctionLine(line, context);
     return;
   }
   
@@ -2102,7 +2159,7 @@ async function executeControlFlow(line) {
     for (let i = 0; i < logicalChain.length; i++) {
       const { command, operator } = logicalChain[i];
       // Recursively call executeControlFlow to handle nested control structures
-      await executeControlFlow(command);
+      await executeControlFlow(command, context);
       
       if (operator === '&&' && SHELL.lastExitCode !== 0) {
         // Stop execution chain
@@ -2125,7 +2182,7 @@ async function executeControlFlow(line) {
       // Skip braces (handled in block parsing)
       continue;
     } else {
-      await runSingle(seqTrimmed);
+      await runSingle(seqTrimmed, context);
     }
   }
 }
@@ -2175,10 +2232,11 @@ function parseLogicalChain(line) {
 }
 
 // Execute if statement
-async function executeIf(line) {
+async function executeIf(line, context) {
   const ifMatch = line.match(/^if\s+(.*?)\s*[;]?\s*then\s*([\s\S]*)/i);
   if (!ifMatch) {
-    console.error('if: syntax error');
+    const errMsg = formatError('if: syntax error - expected "then"', context, true);
+    console.error(errMsg || 'if: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2204,26 +2262,27 @@ async function executeIf(line) {
   }
   
   // Evaluate condition
-  await runSingle(condition);
+  await runSingle(condition, context);
   
   if (SHELL.lastExitCode === 0) {
     const statements = thenBody.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   } else if (elseBody.trim()) {
     const statements = elseBody.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   }
 }
 
 // Execute while loop
-async function executeWhile(line) {
+async function executeWhile(line, context) {
   const whileMatch = line.match(/^while\s+(.*?)\s*[;]?\s*do\s*([\s\S]*)/i);
   if (!whileMatch) {
-    console.error('while: syntax error');
+    const errMsg = formatError('while: syntax error - expected "do"', context, true);
+    console.error(errMsg || 'while: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2241,25 +2300,25 @@ async function executeWhile(line) {
   
   // Execute loop
   while (true) {
-    await runSingle(condition);
+    await runSingle(condition, context);
     if (SHELL.lastExitCode !== 0) break;
     
     const statements = body.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   }
 }
 
 // Execute for loop (for var in list or for ((init; cond; incr)))
-async function executeFor(line) {
+async function executeFor(line, context) {
   // C-style for loop: for ((i=0; i<10; i++))
   const cStyleMatch = line.match(/^for\s*\(\s*(.+?);(.+?);(.+?)\s*\)\s*do\s*([\s\S]*)/i);
   if (cStyleMatch) {
     const [, init, cond, incr, rest] = cStyleMatch;
     
     // Execute init
-    await runSingle(init.trim());
+    await runSingle(init.trim(), context);
     
     let body = '';
     const lines = rest.split('\n');
@@ -2272,16 +2331,16 @@ async function executeFor(line) {
     // Execute loop
     while (true) {
       // Evaluate condition
-      await runSingle(`[ ${cond.trim()} ]`);
+      await runSingle(`[ ${cond.trim()} ]`, context);
       if (SHELL.lastExitCode !== 0) break;
       
       const statements = body.split('\n').filter(l => l.trim());
       for (const stmt of statements) {
-        await executeControlFlow(stmt);
+        await executeControlFlow(stmt, context);
       }
       
       // Execute increment
-      await runSingle(incr.trim());
+      await runSingle(incr.trim(), context);
     }
     return;
   }
@@ -2289,7 +2348,8 @@ async function executeFor(line) {
   // Traditional for-in loop: for var in list
   const forMatch = line.match(/^for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+(.*?)\s*[;]?\s*do\s*([\s\S]*)/i);
   if (!forMatch) {
-    console.error('for: syntax error');
+    const errMsg = formatError('for: syntax error - expected "in" and "do"', context, true);
+    console.error(errMsg || 'for: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2327,7 +2387,7 @@ async function executeFor(line) {
     
     const statements = body.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   }
   
@@ -2335,10 +2395,11 @@ async function executeFor(line) {
 }
 
 // Execute case statement
-async function executeCase(line) {
+async function executeCase(line, context) {
   const caseMatch = line.match(/^case\s+(.+?)\s+in\s*([\s\S]*?)esac/i);
   if (!caseMatch) {
-    console.error('case: syntax error');
+    const errMsg = formatError('case: syntax error - expected "in" and "esac"', context, true);
+    console.error(errMsg || 'case: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2376,7 +2437,7 @@ async function executeCase(line) {
     if (matchPattern(expr, p.pattern)) {
       const statements = p.body.split('\n').filter(l => l.trim());
       for (const stmt of statements) {
-        await executeControlFlow(stmt);
+        await executeControlFlow(stmt, context);
       }
       break;
     }
@@ -2404,11 +2465,12 @@ function matchPattern(str, pattern) {
 }
 
 // Define a function
-async function defineFunctionLine(line) {
+async function defineFunctionLine(line, context) {
   // Parse function definition: function name { ... } or name() { ... }
   const funcMatch = line.match(/^(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\)\s*{/);
   if (!funcMatch) {
-    console.error('function: syntax error');
+    const errMsg = formatError('function: syntax error - expected "{ ... }"', context, true);
+    console.error(errMsg || 'function: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2444,37 +2506,44 @@ async function defineFunctionLine(line) {
 }
 
 // Call a function
-async function callFunction(funcName, args) {
+async function callFunction(funcName, args, context) {
   if (!(funcName in SHELL_FUNCTIONS)) {
     return null; // Not a function
   }
   
   const func = SHELL_FUNCTIONS[funcName];
   
-  // Set up positional parameters ($1, $2, ...)
-  const savedParams = {};
-  for (let i = 1; i <= 9; i++) {
-    savedParams[`${i}`] = SHELL.env[i];
-  }
+  // Push call frame for stack traces
+  pushCallFrame(funcName, context);
   
-  // Set new parameters
-  for (let i = 0; i < args.length; i++) {
-    SHELL.env[`${i + 1}`] = args[i];
-  }
-  
-  // Execute function body
-  await executeControlFlow(func.body);
-  
-  // Restore parameters
-  for (let i = 1; i <= 9; i++) {
-    if (savedParams[`${i}`] !== undefined) {
-      SHELL.env[`${i}`] = savedParams[`${i}`];
-    } else {
-      delete SHELL.env[`${i}`];
+  try {
+    // Set up positional parameters ($1, $2, ...)
+    const savedParams = {};
+    for (let i = 1; i <= 9; i++) {
+      savedParams[`${i}`] = SHELL.env[i];
     }
+    
+    // Set new parameters
+    for (let i = 0; i < args.length; i++) {
+      SHELL.env[`${i + 1}`] = args[i];
+    }
+    
+    // Execute function body
+    await executeControlFlow(func.body, context);
+    
+    // Restore parameters
+    for (let i = 1; i <= 9; i++) {
+      if (savedParams[`${i}`] !== undefined) {
+        SHELL.env[`${i}`] = savedParams[`${i}`];
+      } else {
+        delete SHELL.env[`${i}`];
+      }
+    }
+    
+    return SHELL.lastExitCode;
+  } finally {
+    popCallFrame();
   }
-  
-  return SHELL.lastExitCode;
 }
 
 // Parse and execute here-documents
@@ -2524,7 +2593,8 @@ async function executeSubshell(cmd) {
   }
 }
 
-async function runSingle(line) {
+async function runSingle(line, context) {
+  // context: { startLine, endLine, filename, content } - optional, used for error reporting
   try {
     // Check for array assignment (arr=(values))
     const arrayMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\((.*)\)$/);
@@ -2559,7 +2629,7 @@ async function runSingle(line) {
     if (tokens[0] in SHELL_FUNCTIONS) {
       const funcName = tokens[0];
       const funcArgs = tokens.slice(1);
-      const code = await callFunction(funcName, funcArgs);
+      const code = await callFunction(funcName, funcArgs, context);
       if (code !== null) {
         SHELL.lastExitCode = code;
         return;
@@ -3742,6 +3812,7 @@ if (process.argv[2] === '-c' && process.argv[3]) {
     rl.pause();
     
     // Parse script into blocks (handles multi-line control structures)
+    // Returns blocks with line number metadata
     function parseScriptBlocks(lines) {
       const blocks = [];
       let idx = 0;
@@ -3760,16 +3831,31 @@ if (process.argv[2] === '-c' && process.argv[3]) {
         if (trimmed.startsWith('if ') || trimmed.startsWith('while ') || 
             trimmed.startsWith('for ') || trimmed.startsWith('case ')) {
           const block = collectBlock(lines, idx);
-          blocks.push(block.content);
+          blocks.push({
+            content: block.content,
+            startLine: idx + 1,  // 1-indexed line numbers
+            endLine: block.endIdx + 1,
+            filename: scriptPath
+          });
           idx = block.endIdx + 1;
         } else if (trimmed.startsWith('function ') || trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/)) {
           // Function definition block
           const block = collectBlock(lines, idx);
-          blocks.push(block.content);
+          blocks.push({
+            content: block.content,
+            startLine: idx + 1,
+            endLine: block.endIdx + 1,
+            filename: scriptPath
+          });
           idx = block.endIdx + 1;
         } else {
           // Single-line command
-          blocks.push(line);
+          blocks.push({
+            content: line,
+            startLine: idx + 1,
+            endLine: idx + 1,
+            filename: scriptPath
+          });
           idx++;
         }
       }
@@ -3835,8 +3921,8 @@ if (process.argv[2] === '-c' && process.argv[3]) {
       try {
         const blocks = parseScriptBlocks(lines);
         for (const block of blocks) {
-          if (block.trim()) {
-            await executeControlFlow(block);
+          if (block.content && block.content.trim()) {
+            await executeControlFlow(block.content, block);
           }
         }
       } catch (e) {

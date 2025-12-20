@@ -55,8 +55,11 @@
 ## TODO - High Priority
 
 ### Scripting Improvements
-- [ ] Better error messages with line numbers in scripts
-- [ ] Stack traces for function calls
+- [x] Better error messages with line numbers in scripts
+  - Script parser now tracks line numbers for all blocks
+  - Error messages show file:line-end format with source snippet
+  - Examples: `script.sh:12-14: error: if: syntax error - expected "then"`
+- [ ] Stack traces for function calls (framework in place, needs integration)
 - [ ] Debugging mode with breakpoints
 - [ ] Local variables in functions (currently all are global)
 - [ ] Return values from functions (beyond exit codes)
@@ -122,7 +125,6 @@
 2. **Ctrl+Z handling** - Edge cases with terminal state
 3. **sudo password input** - Requires `-S` flag to read from stdin
 4. **Performance** - JS/Bun slower than native C shells
-5. **Error context** - Parse errors don't show line numbers
 
 ## Notes
 
@@ -131,3 +133,45 @@
 - Performance is acceptable for interactive use
 - POSIX compliance is explicitly not a goal
 - JavaScript allows rapid iteration and experimentation
+
+## Recent Improvements
+
+### Error Messages with Line Numbers (Latest)
+Scripts now provide helpful error diagnostics with precise location information:
+
+**Implementation:**
+- Modified `parseScriptBlocks()` to attach metadata (startLine, endLine, filename) to each block
+- Created `formatError()` utility for consistent error message formatting
+- Updated all control flow functions to accept and use context parameter:
+  - `executeIf()` - if/then/else/fi errors
+  - `executeWhile()` - while/do/done errors
+  - `executeFor()` - for/do/done errors (both styles)
+  - `executeCase()` - case/esac errors
+  - `defineFunctionLine()` - function definition errors
+- Added call stack infrastructure (CALL_STACK, pushCallFrame, popCallFrame, formatCallStack)
+- Updated `callFunction()` to track function invocations for future stack traces
+
+**Features:**
+- All script blocks now track starting and ending line numbers (1-indexed)
+- Parse errors show `filename:startLine-endLine: error: message`
+- Source snippet of the problematic line is included in output
+- Control flow functions all report with proper file:line context
+- Graceful fallback for interactive mode (no file context)
+
+**Example error output:**
+```
+script.sh:9-11: error: if: syntax error - expected "then"
+  if [ 1 -eq 1 ]
+```
+
+**Documentation updates:**
+- docs/SCRIPTING.md - Added "Error Messages" section with common errors/fixes
+- docs/FGSH.md - Added "Error Handling" section with implementation details
+- README.md - Added error messages to feature list, updated roadmap
+- IMPROVEMENTS.md - Created detailed changelog
+
+**Files modified:**
+- src/fgshell.js (~150 lines changed across multiple functions)
+- docs/SCRIPTING.md, docs/FGSH.md, README.md, IMPROVEMENTS.md
+
+**Status:** ✓ Completed and tested

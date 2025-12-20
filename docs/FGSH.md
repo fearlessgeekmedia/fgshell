@@ -310,13 +310,51 @@ This logs:
 - Process spawning
 - Signal handling
 
+## Error Handling
+
+fgsh provides detailed error messages with line numbers and source context for script debugging:
+
+### Error Reporting System
+
+- **Line number tracking**: All script blocks track start/end line numbers
+- **Error format**: `filename:startLine-endLine: error: description`
+- **Source snippets**: First line of problematic code shown for context
+- **Call stack framework**: Infrastructure in place for function trace support (future)
+
+### Implementation Details
+
+```javascript
+// Error context structure
+{
+  startLine: 12,           // 1-indexed line number
+  endLine: 14,             // Range for multi-line blocks
+  filename: 'script.sh',   // Full path to script
+  content: 'if ...'        // Source code text
+}
+
+// formatError() generates user-friendly messages
+formatError('if: syntax error - expected "then"', context, showSnippet)
+// Output: script.sh:12-14: error: if: syntax error - expected "then"
+//           if [ 1 -eq 1 ]
+```
+
+### Current Coverage
+
+- ✓ if/then/else/fi statements
+- ✓ while/do/done loops  
+- ✓ for/do/done loops (both C-style and for-in)
+- ✓ case/esac statements
+- ✓ function definitions
+- ○ Redirection operator parsing (future)
+- ○ Command substitution errors (future)
+
 ## Future Improvements
 
 1. **Complete here-document support** - Pass content to commands
 2. **Process substitution** - `<(cmd)` and `>(cmd)` syntax
 3. **Arithmetic conditionals** - `((expr))` syntax
 4. **More builtins** - grep, sed, awk as builtins
-5. **Better error messages** - Line numbers, context in parse errors
+5. **Stack traces for function calls** - Show call chain in errors
 6. **Performance** - Consider Rust for parsing layer
 
 ## Related Documentation

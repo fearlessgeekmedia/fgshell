@@ -576,8 +576,90 @@ count_lines "data.txt"
 - **Command substitution**: Use `$(command)` instead of backticks
 - **Exit codes**: Commands naturally set exit codes; use them for control flow
 
+## Error Messages
+
+When running scripts, fgsh provides helpful error messages with line numbers and source code context. This makes it easy to identify and fix syntax errors.
+
+### Error Message Format
+
+Parse errors are reported as:
+```
+filename:startLine-endLine: error: description
+  source code line
+```
+
+### Common Errors and Fixes
+
+**Missing `then` in if statement:**
+```bash
+# ❌ Error: if: syntax error - expected "then"
+if [ $x -eq 5 ]
+  echo "value is 5"
+fi
+
+# ✓ Fixed
+if [ $x -eq 5 ]
+then
+  echo "value is 5"
+fi
+```
+
+**Missing `do` in while loop:**
+```bash
+# ❌ Error: while: syntax error - expected "do"
+while [ $i -lt 10 ]
+  echo "i=$i"
+  i=$((i + 1))
+done
+
+# ✓ Fixed
+while [ $i -lt 10 ]
+do
+  echo "i=$i"
+  i=$((i + 1))
+done
+```
+
+**Missing `in` or `do` in for loop:**
+```bash
+# ❌ Error: for: syntax error - expected "in" and "do"
+for item list
+do
+  echo "$item"
+done
+
+# ✓ Fixed
+for item in list
+do
+  echo "$item"
+done
+```
+
+**Missing `esac` in case statement:**
+```bash
+# ❌ Error: case: syntax error - expected "in" and "esac"
+case "$1" in
+  start)
+    echo "Starting"
+    ;;
+  stop)
+    echo "Stopping"
+```
+
+### Example Error Output
+
+Running a script with syntax errors:
+```bash
+$ ./fgsh script.sh
+script.sh:8-10: error: if: syntax error - expected "then"
+  if [ 1 -eq 1 ]
+script.sh:15-17: error: for: syntax error - expected "in" and "do"
+  for x in list
+```
+
 ## Limitations
 
 - Here-documents (`<<EOF`) are parsed but content isn't yet passed to commands
 - Pattern matching in case statements is basic (no full regex support)
 - Some advanced bash features aren't implemented (process substitution, etc.)
+- Stack traces for function calls are not yet displayed in error messages

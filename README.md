@@ -51,6 +51,7 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 - **Here-documents** with `<<EOF`
 - **Signal traps** with `trap` command
 - **Built-in commands**: `cd`, `pwd`, `echo`, `export`, `unset`, `env`, `history`, `alias`, `unalias`, `declare`
+- **Helpful error messages** with file:line references and source code snippets in scripts
 
 ## Building
 
@@ -172,7 +173,9 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 - [ ] Proper Ctrl+Z terminal state handling
 - [ ] Complete here-document support
 - [ ] Plugin system for extending commands
-- [ ] Better error messages and debugging output
+- [x] Better error messages with line numbers (completed)
+- [ ] Stack traces for function calls
+- [ ] Debugging mode with breakpoints
 - [ ] Arithmetic operators in test conditions
 
 ## License
