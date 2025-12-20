@@ -32,25 +32,10 @@ try {
   ptctl = { available: false };
 }
 
-// Load version from package.json at runtime
+// Version is injected at build time by build script
 let VERSION;
 try {
-  // Try multiple locations for package.json
-  const tryPaths = [
-    require('path').join(__dirname, 'package.json'),           // Same dir as this file
-    require('path').join(__dirname, '..', 'package.json'),     // Parent dir
-    require('path').join(__dirname, '..', '..', 'package.json') // Two levels up
-  ];
-  
-  let pkg = null;
-  for (const pkgPath of tryPaths) {
-    try {
-      pkg = JSON.parse(require('fs').readFileSync(pkgPath, 'utf8'));
-      break;
-    } catch (e) {}
-  }
-  
-  VERSION = pkg && pkg.version ? pkg.version : 'unknown';
+  VERSION = "0.0.2a"; // This is set by the build script
 } catch (e) {
   VERSION = 'unknown';
 }
