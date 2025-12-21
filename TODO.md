@@ -59,6 +59,11 @@
   - Script parser now tracks line numbers for all blocks
   - Error messages show file:line-end format with source snippet
   - Examples: `script.sh:12-14: error: if: syntax error - expected "then"`
+- [ ] Improve quote escaping for `js` command and other builtins
+  - Currently requires manual escape sequences for nested quotes
+  - Consider context-aware quote handling for JavaScript code blocks
+  - Could automatically handle quote detection and escaping
+  - Investigate whether shell preprocessor can help or if parser needs changes
 - [ ] Stack traces for function calls (framework in place, needs integration)
 - [ ] Debugging mode with breakpoints
 - [ ] Local variables in functions (currently all are global)
