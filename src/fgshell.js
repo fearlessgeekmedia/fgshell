@@ -116,6 +116,12 @@ const help = {
   Exit status:
   Always successful (0) unless an error occurs reading the directory.
   `,
+  clear: `clear
+  Clear the terminal screen.
+
+  Exit status:
+  Always successful (0).
+  `,
   exit: `exit [n]
   Exit the shell with status n.
 
@@ -155,10 +161,15 @@ const help = {
   With no arguments, prints all environment variables.
   With NAME=VALUE, sets variables in the environment for a command.
 
+  Options:
+  --json               output as JSON
+  --yaml, --yml        output as YAML
+
   Examples:
   env                  # print all variables
   env PATH=/bin        # print current environment with modified PATH
   env -i TERM=xterm    # clear environment and set only TERM
+  env --json           # print as JSON
   `,
   jobs: `jobs [-lnprs] [JOBSPEC ...]
   Display the status of background jobs.
@@ -169,6 +180,8 @@ const help = {
   -p     list only process group IDs
   -r     show only running jobs
   -s     show only stopped jobs
+  --json               output as JSON
+  --yaml, --yml        output as YAML
 
   Exit status:
   Returns 0 unless an invalid option is supplied or JOBSPEC not found.
@@ -215,6 +228,8 @@ const help = {
   -w     write history to FILENAME (or ~/.bash_history)
   -r     read history from FILENAME (or ~/.bash_history)
   -n N   display the last N commands
+  --json               output as JSON
+  --yaml, --yml        output as YAML
 
   Exit status:
   Returns 0 unless an invalid option is supplied or file cannot be accessed.
@@ -240,6 +255,8 @@ const help = {
   --color[=WHEN]            colorize the output (auto, always, never)
   -G, --no-group            in long listing, don't print group names
   --full-time               show full date and time
+  --json                    output as JSON
+  --yaml, --yml             output as YAML
   --help                    display this help and exit
   --version                 output version information and exit
   `,
@@ -598,6 +615,14 @@ try {
       return 0;
     }
     console.log(SHELL.cwd);
+    return 0;
+  },
+  clear: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.clear);
+      return 0;
+    }
+    console.clear();
     return 0;
   },
   exit: function(args) {
