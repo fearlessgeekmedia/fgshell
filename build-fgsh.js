@@ -1,51 +1,38 @@
-import { build } from "bun";
-import { renameSync, chmodSync, writeFileSync, readFileSync, unlinkSync } from "fs";
-import path from "path";
+import { spawnSync } from "child_process";
+import { chmodSync } from "fs";
 
-// Read version from package.json
-const packageData = JSON.parse(readFileSync('./package.json', 'utf8'));
-const version = packageData.version;
-
-// Create a temporary file with the version injected directly
-let srcCode = readFileSync('./src/fgshell.js', 'utf8');
-// Replace the INJECTED_VERSION constant with the actual version
-srcCode = srcCode.replace(
-  /let VERSION;\s*try\s*\{\s*VERSION\s*=\s*INJECTED_VERSION;/,
-  `let VERSION;\ntry {\n  VERSION = "${version}";`
-);
-writeFileSync('./src/fgshell.js.tmp', srcCode);
-console.log("Temp file created with version:", version);
-
-const result = await build({
-  entrypoints: ["./src/fgshell.js.tmp"],
-  outdir: ".",
-  target: "bun",
-  minify: false,
-  compile: true,
+// Use bun CLI to compile the source directly
+const result = spawnSync('bun', [
+  'build',
+  '--compile',
+  './src/fgshell.js',
+  '--outfile',
+  'fgsh'
+], {
+  cwd: process.cwd(),
+  stdio: ['pipe', 'pipe', 'pipe']
 });
 
-console.log("Build logs:", result.logs);
-
-const compiledBinaryName = result.outputs[0]?.path;
-if (!compiledBinaryName) {
-  console.error("No output file generated");
+if (result.error) {
+  console.error('Build failed:', result.error.message);
   process.exit(1);
 }
 
-const finalBinaryName = "fgsh";
+const stdout = result.stdout?.toString();
+const stderr = result.stderr?.toString();
+
+if (stdout) console.log(stdout);
+if (stderr && result.status !== 0) console.error(stderr);
+
+if (result.status !== 0) {
+  console.error(`Build failed with status ${result.status}`);
+  process.exit(1);
+}
 
 try {
-  renameSync(compiledBinaryName, finalBinaryName);
-  chmodSync(finalBinaryName, 0o755);
-  console.log(`✓ Built ${finalBinaryName} successfully`);
+  chmodSync('fgsh', 0o755);
+  console.log(`✓ Built fgsh successfully`);
 } catch (e) {
-  console.error(`Failed to rename or chmod ${compiledBinaryName}:`, e.message);
+  console.error(`Failed to chmod fgsh:`, e.message);
   process.exit(1);
-} finally {
-  // Clean up temporary file
-  try {
-    unlinkSync('./src/fgshell.js.tmp');
-  } catch (e) {
-    // Ignore cleanup errors
-  }
 }

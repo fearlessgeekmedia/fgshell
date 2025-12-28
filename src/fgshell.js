@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * fgshell - a simple interactive shell in Node.js
  *
