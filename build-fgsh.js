@@ -1,7 +1,85 @@
 import { spawnSync } from "child_process";
-import { chmodSync } from "fs";
+import { chmodSync, existsSync, statSync } from "fs";
+import { execSync } from "child_process";
 
-// Use bun CLI to compile the source directly
+// Detect libc type (glibc or musl)
+function detectLibc() {
+  try {
+    const output = execSync('ldd /bin/ls 2>&1 || file /bin/ls', { encoding: 'utf-8' });
+    if (output.includes('musl')) {
+      return 'musl';
+    }
+    return 'glibc';
+  } catch (e) {
+    console.warn('Could not detect libc, assuming glibc');
+    return 'glibc';
+  }
+}
+
+// Check if ptctl needs to be built
+function needsBuildPtctl() {
+  // Build if libptctl.so doesn't exist
+  if (!existsSync('libptctl.so')) {
+    return true;
+  }
+  
+  // Also rebuild if src/ptctl.c is newer than libptctl.so
+  try {
+    const ptctlStat = statSync('libptctl.so');
+    const srcStat = statSync('src/ptctl.c');
+    return srcStat.mtime > ptctlStat.mtime;
+  } catch (e) {
+    return true;
+  }
+}
+
+// Build ptctl.so if needed
+function buildPtctl() {
+  const libc = detectLibc();
+  console.log(`Detected libc: ${libc}`);
+  
+  if (!needsBuildPtctl()) {
+    console.log('✓ libptctl.so is up to date');
+    return true;
+  }
+  
+  console.log('Building libptctl.so...');
+  
+  const result = spawnSync('gcc', [
+    '-shared',
+    '-fPIC',
+    '-o', 'libptctl.so',
+    'src/ptctl.c'
+  ], {
+    cwd: process.cwd(),
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  
+  if (result.error || result.status !== 0) {
+    const stderr = result.stderr?.toString();
+    if (stderr) console.error(stderr);
+    console.error('Failed to build libptctl.so. Make sure gcc is installed.');
+    return false;
+  }
+  
+  try {
+    chmodSync('libptctl.so', 0o755);
+    console.log('✓ Built libptctl.so successfully');
+    return true;
+  } catch (e) {
+    console.error(`Failed to chmod libptctl.so:`, e.message);
+    return false;
+  }
+}
+
+// Build ptctl first if needed
+if (!buildPtctl()) {
+  console.error('Aborting fgsh build due to ptctl build failure');
+  process.exit(1);
+}
+
+// Use bun CLI to compile fgsh
+console.log('Building fgsh...');
 const result = spawnSync('bun', [
   'build',
   '--compile',

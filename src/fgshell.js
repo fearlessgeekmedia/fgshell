@@ -8,7 +8,8 @@
  * - Builtins: cd, mkcd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf
  * - Environment variable expansion: $VAR
  * - Tab completion for files/dirs
- * - Basic job control and signal forwarding (SIGINT only after removal of SIGTSTP)
+ * - Job control with signal forwarding (SIGINT, SIGTSTP)
+ * - Ctrl+Z to suspend shell at prompt, foreground jobs receive SIGTSTP naturally
  * - Ctrl+N file picker: Navigate and select files/directories
  *
  * Save as file, chmod +x, run: ./fgsh
@@ -26,8 +27,16 @@ const historyDB = require('./history-db');
 const outputFormatter = require('./output-formatter');
 let ptctl;
 try {
-  ptctl = require('./ptctl.node');
+  ptctl = require('./ptctl');
+  if (process.env.FGSH_DEBUG) {
+    if (!ptctl.available) {
+      console.error(`[DEBUG] ptctl unavailable: ${ptctl.error?.message || 'unknown error'}`);
+    } else {
+      console.error(`[DEBUG] ptctl loaded successfully`);
+    }
+  }
 } catch (e) {
+  console.error(`[DEBUG] Failed to load ptctl module: ${e.message}`);
   ptctl = { available: false };
 }
 
@@ -728,7 +737,22 @@ try {
     
     console.log(job.cmdline);
     job.background = false;
+    job.suspended = false;
     job.status = 'running';
+
+    // Give terminal control to the job's process group if ptctl is available
+    if (ptctl.available && job.pids && job.pids.length > 0) {
+      try {
+        // Get the process group of the first PID in the job
+        const jobPgid = ptctl.getpgid(job.pids[0]);
+        debug(`fg: Setting terminal to job PGID ${jobPgid}`);
+        ptctl.tcsetpgrp(0, jobPgid);
+        const termFgpg = ptctl.tcgetpgrp(1);
+        debug(`Terminal foreground process group: ${termFgpg}`);
+      } catch (e) {
+        debug('fg: ptctl error setting terminal:', e.message);
+      }
+    }
 
     // If job was started with pty, re-attach it
     if (job.pty) {
@@ -772,22 +796,65 @@ try {
         }, 100);
       });
       
-      // After job is done, resume shell
+      // After job is done, restore shell terminal control
+      if (ptctl.available) {
+        try {
+          debug(`fg: Restoring terminal to shell PGID ${shellPgid}`);
+          ptctl.tcsetpgrp(0, shellPgid);
+        } catch (e) {
+          debug('fg: ptctl error restoring terminal:', e.message);
+        }
+      }
+      
+      // Resume shell
       if (rl.paused) {
         rl.resume();
         prompt().catch(() => {});
       }
     } else {
-      // For non-pty jobs (background tasks), just bring them to foreground and wait
+      // For non-pty jobs (background/suspended tasks), resume and wait
       try {
         for (const pid of job.pids) {
+          debug(`fg: Sending SIGCONT to PID ${pid}`);
           process.kill(pid, 'SIGCONT');
         }
       } catch(e) {
         console.error('fg:', e.message);
+        
+        // Restore terminal before returning
+        if (ptctl.available) {
+          try {
+            ptctl.tcsetpgrp(0, shellPgid);
+          } catch(e) {}
+        }
+        
         return 1;
       }
+      
+      // Pause readline while job runs
+      if (!rl.paused) {
+        rl.pause();
+      }
+      
+      // Wait for job to complete
       await waitForJob(job);
+      
+      // Restore terminal and resume shell
+      if (ptctl.available) {
+        try {
+          debug(`fg: Restoring terminal to shell PGID ${shellPgid}`);
+          ptctl.tcsetpgrp(0, shellPgid);
+        } catch (e) {
+          debug('fg: ptctl error restoring terminal:', e.message);
+        }
+      }
+      
+      if (rl.paused) {
+        rl.resume();
+        rl.line = '';
+        rl.cursor = 0;
+        prompt().catch(() => {});
+      }
     }
     return 0;
   },
@@ -2809,8 +2876,13 @@ async function executePipeline(cmds) {
           debug(`Child process group: ${childPgid}`);
           
           // Give terminal control to the child process group
-          ptctl.tcsetpgrp(1, childPgid); // fd 1 = stdout
-          const termFgpg = ptctl.tcgetpgrp(1);
+          const setResult = ptctl.tcsetpgrp(0, childPgid); // fd 0 = stdin (controlling terminal)
+          debug(`tcsetpgrp(0, ${childPgid}) returned: ${setResult}`);
+          if (setResult === -1) {
+            const errno = ptctl.get_errno();
+            debug(`tcsetpgrp failed with errno: ${errno}`);
+          }
+          const termFgpg = ptctl.tcgetpgrp(0);
           debug(`Terminal foreground process group: ${termFgpg}`);
         } catch (e) {
           debug('ptctl job control setup error:', e.message);
@@ -2838,8 +2910,8 @@ async function executePipeline(cmds) {
           if (ptctl.available && command !== 'sudo') {
             try {
               debug(`Restoring terminal to shell PGID: ${shellPgid}`);
-              ptctl.tcsetpgrp(1, shellPgid); // Restore shell's process group to terminal
-              const termFgpg = ptctl.tcgetpgrp(1);
+              ptctl.tcsetpgrp(0, shellPgid); // Restore shell's process group to terminal
+              const termFgpg = ptctl.tcgetpgrp(0);
               debug(`Terminal foreground process group after restore: ${termFgpg}`);
             } catch (e) {
               debug('ptctl restore error:', e.message);
@@ -3091,6 +3163,29 @@ process.on('SIGINT', () => {
     prompt().catch(() => {});
   });
 });
+
+// Handle CTRL+Z (SIGTSTP) to suspend the shell when at prompt
+// Requires ptctl to transfer terminal control to child processes
+if (ptctl.available) {
+  process.on('SIGTSTP', () => {
+    debug('SIGTSTP received');
+    
+    // If at prompt (readline not paused), suspend the shell itself
+    if (rl && !rl.paused) {
+      debug('Shell at prompt, suspending shell');
+      // Send SIGSTOP to this process so it can be resumed with fg
+      process.kill(process.pid, 'SIGSTOP');
+    }
+    // If readline IS paused, we're running a child - the child should have gotten SIGTSTP
+    // (not the shell) because we transferred terminal control via tcsetpgrp
+  });
+} else {
+  // ptctl not available - CTRL+Z won't work properly
+  // (would suspend the shell instead of the child)
+  if (process.env.FGSH_DEBUG) {
+    console.error('[DEBUG] SIGTSTP handler disabled - ptctl not available. Ctrl+Z will not suspend jobs properly.');
+  }
+}
 
 // reap children to update job table even if not foreground
 process.on('exit', () => {
