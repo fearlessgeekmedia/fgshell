@@ -43,6 +43,14 @@ int ptctl_getpgid(int pid) {
 }
 
 /**
+ * Create a new session (session leader)
+ * Returns the new session ID on success, -1 on error
+ */
+pid_t ptctl_setsid(void) {
+  return setsid();
+}
+
+/**
  * Get errno value (needed because FFI can't easily access errno directly)
  */
 int ptctl_get_errno(void) {

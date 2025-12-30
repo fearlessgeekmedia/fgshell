@@ -38,17 +38,20 @@ function buildPtctl() {
   const libc = detectLibc();
   console.log(`Detected libc: ${libc}`);
   
+  // Determine output filename based on platform
+  const libName = process.platform === 'darwin' ? 'libptctl.dylib' : 'libptctl.so';
+  
   if (!needsBuildPtctl()) {
-    console.log('✓ libptctl.so is up to date');
+    console.log(`✓ ${libName} is up to date`);
     return true;
   }
   
-  console.log('Building libptctl.so...');
+  console.log(`Building ${libName}...`);
   
   const result = spawnSync('gcc', [
     '-shared',
     '-fPIC',
-    '-o', 'libptctl.so',
+    '-o', libName,
     'src/ptctl.c'
   ], {
     cwd: process.cwd(),
@@ -58,16 +61,16 @@ function buildPtctl() {
   if (result.error || result.status !== 0) {
     const stderr = result.stderr?.toString();
     if (stderr) console.error(stderr);
-    console.error('Failed to build libptctl.so. Make sure gcc is installed.');
+    console.error(`Failed to build ${libName}. Make sure gcc is installed.`);
     return false;
   }
   
   try {
-    chmodSync('libptctl.so', 0o755);
-    console.log('✓ Built libptctl.so successfully');
+    chmodSync(libName, 0o755);
+    console.log(`✓ Built ${libName} successfully`);
     return true;
   } catch (e) {
-    console.error(`Failed to chmod libptctl.so:`, e.message);
+    console.error(`Failed to chmod ${libName}:`, e.message);
     return false;
   }
 }

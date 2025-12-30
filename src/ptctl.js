@@ -6,7 +6,15 @@ let ptctl = null;
 let error = null;
 
 try {
-  const libPath = path.join(__dirname, '..', 'libptctl.so');
+  let libPath = path.join(__dirname, '..', 'libptctl.so');
+  // On macOS, also try .dylib
+  if (process.platform === 'darwin') {
+    const dylib = path.join(__dirname, '..', 'libptctl.dylib');
+    try {
+      require('fs').accessSync(dylib);
+      libPath = dylib;
+    } catch {}
+  }
   ptctl = dlopen(libPath, {
     ptctl_tcsetpgrp: {
       args: ['i32', 'i32'],
@@ -26,6 +34,10 @@ try {
     },
     ptctl_getpgid: {
       args: ['i32'],
+      returns: 'i32',
+    },
+    ptctl_setsid: {
+      args: [],
       returns: 'i32',
     },
     ptctl_get_errno: {
@@ -91,6 +103,15 @@ module.exports = {
   getpgid(pid) {
     if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
     return ptctl.symbols.ptctl_getpgid(pid);
+  },
+  
+  /**
+   * Create a new session (make this process a session leader)
+   * @returns {number} Session ID on success, -1 on error
+   */
+  setsid() {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_setsid();
   },
   
   /**

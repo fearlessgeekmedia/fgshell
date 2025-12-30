@@ -1783,9 +1783,14 @@ let commandStartTime = 0; // Track when command started for duration calculation
 let shellPgid = process.pid;
 if (ptctl.available) {
   try {
+    // Make shell a session leader so we can use tcsetpgrp later
+    const sid = ptctl.setsid();
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] setsid() returned ${sid}`);
+    
     // Make shell its own process group leader (pgid = 0 means use own PID)
     ptctl.setpgid(0, 0);
     shellPgid = ptctl.getpgrp();
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Shell PGID: ${shellPgid}`);
   } catch (e) {
     debug('Failed to set shell process group:', e.message);
     shellPgid = process.pid;
@@ -1802,6 +1807,7 @@ let rl = readline.createInterface({
   completer: completer,
   terminal: isLoginShell && (!process.argv[2] || process.argv[2] === '-c'),  // Only terminal mode in interactive TTY
   historySize: 1000,
+  handleSIGTSTP: false,  // Handle SIGTSTP ourselves for job control
 });
 
 function isPickerNavKey(key) {
@@ -2791,6 +2797,8 @@ async function executePipeline(cmds) {
   const n = cmds.length;
   const procs = [];
   let pids = [];
+  
+  if (process.env.FGSH_DEVEL) console.error(`[DEBUG] executePipeline called with ${n} command(s)`);
 
   for (let i = 0; i < n; i++) {
     const c = cmds[i];
@@ -2801,6 +2809,7 @@ async function executePipeline(cmds) {
     const args = argv.slice(1);
 
     const isInteractive = !c.stdin && !c.stdout && !c.background && n === 1 && !isLoadingRcFile;
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Command: ${command}, isInteractive=${isInteractive}`);
 
     let child;
     
@@ -2826,7 +2835,7 @@ async function executePipeline(cmds) {
       
       // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
       
-      // 1. Pause readline to yield control of the TTY
+      // Pause readline so child gets exclusive control of stdin
       rl.pause();
       
       debug(`Shell PGID: ${shellPgid}, spawning: ${command}`);
@@ -2848,15 +2857,15 @@ async function executePipeline(cmds) {
       }
       
       try {
+        if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Spawning: ${actualExe} ${actualArgs.join(' ')}`);
         childProcess = spawn(actualExe, actualArgs, {
           cwd: getAccessibleCwd(),
           env: SHELL.env,
-          stdio: 'inherit', // *** CHANGED: Revert to 'inherit' for full TTY support ***
-          detached: command !== 'sudo',   // *** Don't detach sudo - it needs /dev/tty access ***
+          stdio: 'inherit'
+          // Don't detach - keep child in same process group so it gets SIGTSTP naturally
         });
+        if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child PID: ${childProcess.pid}`);
       } catch (spawnErr) {
-        // Resume readline if spawn fails
-        rl.resume();
         console.error(`Error executing ${command}: ${spawnErr.message}`);
         SHELL.lastExitCode = 127;
         return;
@@ -2866,68 +2875,44 @@ async function executePipeline(cmds) {
 
       // REMOVED: Manual raw mode setting and keypress handler that broke TUI apps.
       
-      // 3. Set up proper job control if ptctl is available and process is detached
-      //    This allows Ctrl+Z to properly suspend the child without corrupting terminal state
-      //    (Note: sudo is not detached so it can access /dev/tty for password prompts)
-      if (ptctl.available && command !== 'sudo') {
-        try {
-          // Get the child's actual process group (created by detached: true)
-          const childPgid = ptctl.getpgid(childProcess.pid);
-          debug(`Child process group: ${childPgid}`);
-          
-          // Give terminal control to the child process group
-          const setResult = ptctl.tcsetpgrp(0, childPgid); // fd 0 = stdin (controlling terminal)
-          debug(`tcsetpgrp(0, ${childPgid}) returned: ${setResult}`);
-          if (setResult === -1) {
-            const errno = ptctl.get_errno();
-            debug(`tcsetpgrp failed with errno: ${errno}`);
-          }
-          const termFgpg = ptctl.tcgetpgrp(0);
-          debug(`Terminal foreground process group: ${termFgpg}`);
-        } catch (e) {
-          debug('ptctl job control setup error:', e.message);
-          // Continue anyway - TTY will still work without proper job control
-        }
-      }
+      // Child is in its own process group (detached: true).
+      // SIGTSTP will go to the child process group naturally since both are in same session.
       
       // Register job before waiting
       const cmdline = args.length ? [command, ...args].join(' ') : command;
       const job = addJob([childProcess.pid], cmdline, false);
       pids.push(childProcess.pid);
+      
+      // Track for SIGTSTP forwarding
+      currentChild = childProcess;
+      
+
 
       // Wait for process to exit
       await new Promise((resolve) => {
+        
         childProcess.on('exit', (code, signal) => {
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child exit event: code=${code}, signal=${signal}`);
           debug(`Child exited with code ${code}, signal ${signal}`);
           SHELL.lastExitCode = code || 0;
+          
+          // Clear current child tracking
+          currentChild = null;
           
           const job = findJobByPid(childProcess.pid);
           if (job) {
             markJobDone(job);
           }
           
-          // 4. Restore terminal control to the shell if ptctl is available and we transferred it
-          if (ptctl.available && command !== 'sudo') {
-            try {
-              debug(`Restoring terminal to shell PGID: ${shellPgid}`);
-              ptctl.tcsetpgrp(0, shellPgid); // Restore shell's process group to terminal
-              const termFgpg = ptctl.tcgetpgrp(0);
-              debug(`Terminal foreground process group after restore: ${termFgpg}`);
-            } catch (e) {
-              debug('ptctl restore error:', e.message);
-            }
-          }
-          
-          // 5. Resume readline after process exits
+          // Resume readline
           if (rl.paused) {
-            debug('Resuming readline');
             rl.resume();
             rl.line = '';
             rl.cursor = 0;
           }
           
           resolve();
-        });
+          });
 
         childProcess.on('error', (err) => {
           console.error(`Error executing ${command}:`, err.message);
@@ -3164,28 +3149,24 @@ process.on('SIGINT', () => {
   });
 });
 
-// Handle CTRL+Z (SIGTSTP) to suspend the shell when at prompt
-// Requires ptctl to transfer terminal control to child processes
-if (ptctl.available) {
-  process.on('SIGTSTP', () => {
-    debug('SIGTSTP received');
-    
-    // If at prompt (readline not paused), suspend the shell itself
-    if (rl && !rl.paused) {
-      debug('Shell at prompt, suspending shell');
-      // Send SIGSTOP to this process so it can be resumed with fg
-      process.kill(process.pid, 'SIGSTOP');
+// Track current child process
+let currentChild = null;
+
+// Handle SIGTSTP: forward to child and let it suspend
+process.on('SIGTSTP', () => {
+  if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Shell received SIGTSTP`);
+  
+  if (currentChild && !currentChild.killed) {
+    // Forward SIGTSTP to the child process directly
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Forwarding SIGTSTP to child PID ${currentChild.pid}`);
+    try {
+      process.kill(currentChild.pid, 'SIGTSTP');
+    } catch (e) {
+      if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to forward SIGTSTP: ${e.message}`);
     }
-    // If readline IS paused, we're running a child - the child should have gotten SIGTSTP
-    // (not the shell) because we transferred terminal control via tcsetpgrp
-  });
-} else {
-  // ptctl not available - CTRL+Z won't work properly
-  // (would suspend the shell instead of the child)
-  if (process.env.FGSH_DEBUG) {
-    console.error('[DEBUG] SIGTSTP handler disabled - ptctl not available. Ctrl+Z will not suspend jobs properly.');
   }
-}
+  // Don't suspend the shell - let the child handle it
+});
 
 // reap children to update job table even if not foreground
 process.on('exit', () => {
