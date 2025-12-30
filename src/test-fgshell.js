@@ -3124,71 +3124,122 @@ async function getFilePreview(filePath, maxLines = 20) {
   }
 }
 
-function renderFilePickerOverlay() {
-  if (!isFilePickerActive || !filePickerState) return;
+let isPickerRendering = false;
+async function renderFilePickerOverlay() {
+  if (!isFilePickerActive || !filePickerState || isPickerRendering) return;
+  isPickerRendering = true;
 
-  const { files, selectedIndex, maxVisible, filterMode, filterQuery } = filePickerState;
-  const displayFiles = files;
-  const terminalCols = process.stdout.columns || 80;
+  try {
+    const { files, selectedIndex, filterMode, filterQuery } = filePickerState;
+    const displayFiles = files;
+    const terminalCols = process.stdout.columns || 80;
+    const terminalRows = process.stdout.rows || 24;
+    
+    // Recalculate maxVisible based on current terminal size
+    const maxVisible = Math.min(Math.floor(terminalRows * 0.6), terminalRows - 5);
 
-  // Clear previous overlay by moving cursor up and deleting lines
-  if (!filePickerState.firstRender && filePickerState.lastLineCount > 0) {
-    // Move up N lines and clear each
-    for (let i = 0; i < filePickerState.lastLineCount; i++) {
-      process.stdout.write('\x1b[A'); // Move cursor up
-      process.stdout.write('\x1b[K'); // Clear line
+    // Clear previous overlay by moving cursor up and deleting lines
+    if (!filePickerState.firstRender && filePickerState.lastLineCount > 0) {
+      // Move up N lines and clear each
+      for (let i = 0; i < filePickerState.lastLineCount; i++) {
+        process.stdout.write('\x1b[A'); // Move cursor up
+        process.stdout.write('\x1b[K'); // Clear line
+      }
+    } else if (filePickerState.firstRender) {
+      filePickerState.firstRender = false;
     }
-  } else if (filePickerState.firstRender) {
-    filePickerState.firstRender = false;
-  }
 
-  // Build output
-  let output = '';
-  let lineCount = 0;
-
-  const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
-  output += `\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`;
-  lineCount++;
-  
-  output += `(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`;
-  lineCount++;
-  
-  if (filterMode) {
-    output += `Filter: ${filterQuery}\n`;
-    lineCount++;
-  }
-  
-  output += '-'.repeat(Math.min(80, terminalCols)) + '\n';
-  lineCount++;
-
-  const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
-  const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
-
-  if (displayFiles.length === 0) {
-    output += '(no files)\n';
-    lineCount++;
-  } else {
-    for (let i = startIdx; i < endIdx; i++) {
-      const item = displayFiles[i];
-      const isSelected = i === selectedIndex;
-      const prefix = isSelected ? '> ' : '  ';
-      const icon = item.isDirectory ? '[D] ' : '[F] ';
-      let line = `${prefix}${icon} ${item.name}`;
-
-      if (line.length > terminalCols) {
-        line = line.slice(0, terminalCols - 1) + '...';
+    // Get preview for selected item
+    let previewLines = [];
+    const selected = displayFiles[selectedIndex];
+    if (selected) {
+      if (selected.isDirectory) {
+        previewLines = ['[Directory]'];
+      } else {
+        const previewText = await getFilePreview(path.join(SHELL.cwd, selected.name), maxVisible);
+        previewLines = previewText.split('\n').map(l => l.replace(/\t/g, '    '));
       }
-      if (isSelected) {
-        line = `\x1b[7m${line}\x1b[0m`;
-      }
-      output += line + '\n';
+    }
+
+    // Build output
+    let output = '';
+    let lineCount = 0;
+
+    const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
+    output += `\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`;
+    lineCount++;
+    
+    output += `(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`;
+    lineCount++;
+    
+    if (filterMode) {
+      output += `Filter: ${filterQuery}\n`;
       lineCount++;
     }
-  }
+    
+    output += '-'.repeat(Math.min(80, terminalCols)) + '\n';
+    lineCount++;
 
-  // Write all at once and track line count
-  process.stdout.write(output);
-  filePickerState.lastLineCount = lineCount;
+    const listWidth = Math.floor(terminalCols * 0.4);
+    const previewWidth = terminalCols - listWidth - 4; // 4 for margin/separator
+
+    const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
+    const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
+
+    if (displayFiles.length === 0) {
+      output += '(no files)\n';
+      lineCount++;
+    } else {
+      for (let i = 0; i < maxVisible; i++) {
+        let line = '';
+        const fileIdx = startIdx + i;
+        
+        // List part
+        if (fileIdx < endIdx) {
+          const item = displayFiles[fileIdx];
+          const isSelected = fileIdx === selectedIndex;
+          const prefix = isSelected ? '> ' : '  ';
+          const icon = item.isDirectory ? '[D] ' : '[F] ';
+          let fileName = item.name;
+          
+          let fileLine = `${prefix}${icon}${fileName}`;
+          if (fileLine.length > listWidth) {
+            fileLine = fileLine.slice(0, listWidth - 3) + '...';
+          } else {
+            fileLine = fileLine.padEnd(listWidth);
+          }
+          
+          if (isSelected) {
+            line += `\x1b[7m${fileLine}\x1b[0m`;
+          } else {
+            line += fileLine;
+          }
+        } else {
+          line += ' '.repeat(listWidth);
+        }
+
+        line += ' \x1b[90m│\x1b[0m '; // Separator
+
+        // Preview part
+        if (i < previewLines.length) {
+          let previewLine = previewLines[i];
+          if (previewLine.length > previewWidth) {
+            previewLine = previewLine.slice(0, previewWidth - 3) + '...';
+          }
+          line += previewLine;
+        }
+
+        output += line + '\n';
+        lineCount++;
+      }
+    }
+
+    // Write all at once and track line count
+    process.stdout.write(output);
+    filePickerState.lastLineCount = lineCount;
+  } finally {
+    isPickerRendering = false;
+  }
 }
 
 function clearFilePickerOverlay() {
