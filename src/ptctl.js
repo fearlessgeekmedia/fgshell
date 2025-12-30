@@ -44,6 +44,14 @@ try {
       args: [],
       returns: 'i32',
     },
+    ptctl_enable_signals: {
+      args: ['i32'],
+      returns: 'i32',
+    },
+    ptctl_acquire_tty: {
+      args: ['i32'],
+      returns: 'i32',
+    },
   });
 } catch (e) {
   error = e;
@@ -54,6 +62,26 @@ module.exports = {
   available: ptctl !== null && error === null,
   error,
   
+  /**
+   * Acquire the terminal as the controlling terminal for the session
+   * @param {number} fd - File descriptor (usually 0 for stdin)
+   * @returns {number} 0 on success, -1 on error
+   */
+  acquire_tty(fd) {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_acquire_tty(fd);
+  },
+
+  /**
+   * Enable signal generation (ISIG), canonical mode (ICANON), and echo on the terminal
+   * @param {number} fd - File descriptor (usually 0 for stdin)
+   * @returns {number} 0 on success, -1 on error
+   */
+  enable_signals(fd) {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_enable_signals(fd);
+  },
+
   /**
    * Set the process group associated with terminal fd
    * @param {number} fd - File descriptor (usually 1 for stdout)

@@ -25,6 +25,7 @@ const minimist = require('minimist');
 const SHELL = require('./shell');
 const historyDB = require('./history-db');
 const outputFormatter = require('./output-formatter');
+
 let ptctl;
 try {
   ptctl = require('./ptctl');
@@ -740,20 +741,6 @@ try {
     job.suspended = false;
     job.status = 'running';
 
-    // Give terminal control to the job's process group if ptctl is available
-    if (ptctl.available && job.pids && job.pids.length > 0) {
-      try {
-        // Get the process group of the first PID in the job
-        const jobPgid = ptctl.getpgid(job.pids[0]);
-        debug(`fg: Setting terminal to job PGID ${jobPgid}`);
-        ptctl.tcsetpgrp(0, jobPgid);
-        const termFgpg = ptctl.tcgetpgrp(1);
-        debug(`Terminal foreground process group: ${termFgpg}`);
-      } catch (e) {
-        debug('fg: ptctl error setting terminal:', e.message);
-      }
-    }
-
     // If job was started with pty, re-attach it
     if (job.pty) {
       rl.pause();
@@ -814,6 +801,36 @@ try {
     } else {
       // For non-pty jobs (background/suspended tasks), resume and wait
       try {
+        // Pause readline first
+        rl.pause();
+        
+        // Give terminal control to the job's process group
+        if (ptctl.available && job.pids && job.pids.length > 0) {
+          try {
+            const jobPgid = ptctl.getpgid(job.pids[0]);
+            debug(`fg: Setting terminal to job PGID ${jobPgid}`);
+            
+            // Retry a few times to handle potential race condition
+            let retries = 0;
+            while (retries < 10) {
+              try {
+                ptctl.tcsetpgrp(0, jobPgid);
+                break;
+              } catch (e) {
+                retries++;
+                const start = Date.now(); while(Date.now() - start < 1);
+              }
+            }
+          } catch (e) {
+            debug('fg: ptctl error setting terminal:', e.message);
+          }
+        }
+
+        // Ensure terminal settings are correct for signals
+        if (ptctl.available) {
+          try { ptctl.enable_signals(0); } catch(e) {}
+        }
+
         for (const pid of job.pids) {
           debug(`fg: Sending SIGCONT to PID ${pid}`);
           process.kill(pid, 'SIGCONT');
@@ -827,34 +844,76 @@ try {
             ptctl.tcsetpgrp(0, shellPgid);
           } catch(e) {}
         }
-        
+        if (rl.paused) rl.resume();
         return 1;
       }
       
-      // Pause readline while job runs
-      if (!rl.paused) {
-        rl.pause();
-      }
+      // Wait for job to complete or stop again
+      await new Promise((resolve) => {
+        let isDone = false;
+        
+        const cleanup = () => {
+          if (isDone) return;
+          isDone = true;
+          clearInterval(checkStatus);
+          
+          // Restore terminal to shell
+          if (ptctl.available) {
+            try {
+              ptctl.tcsetpgrp(0, shellPgid);
+            } catch (e) {}
+          }
+          
+          // Resume readline
+          if (rl.paused) {
+            rl.resume();
+            rl.line = '';
+            rl.cursor = 0;
+          }
+          resolve();
+        };
+
+        // Polling loop to detect if child stopped (SIGTSTP) or finished
+        const checkStatus = setInterval(() => {
+          if (isDone) return;
+          
+          // Check if job still exists in SHELL.jobs
+          const currentJob = SHELL.jobs.find(j => j.id === job.id);
+          if (!currentJob) {
+            cleanup();
+            return;
+          }
+
+          try {
+            // Check process state via /proc
+            const pid = job.pids[0];
+            const statFile = `/proc/${pid}/stat`;
+            if (fs.existsSync(statFile)) {
+              const stat = fs.readFileSync(statFile, 'utf8');
+              const parts = stat.split(' ');
+              const state = parts[2];
+              
+              if (state === 'T') {
+                if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Detected job ${job.id} stopped (state T)`);
+                job.status = 'stopped';
+                job.suspended = true;
+                console.log(`\n[${job.id}]+ Stopped\t${job.cmdline}`);
+                cleanup();
+              }
+            } else {
+              // Process gone
+              markJobDone(job);
+              cleanup();
+            }
+          } catch (e) {
+            // Might have exited between checks
+            markJobDone(job);
+            cleanup();
+          }
+        }, 100);
+      });
       
-      // Wait for job to complete
-      await waitForJob(job);
-      
-      // Restore terminal and resume shell
-      if (ptctl.available) {
-        try {
-          debug(`fg: Restoring terminal to shell PGID ${shellPgid}`);
-          ptctl.tcsetpgrp(0, shellPgid);
-        } catch (e) {
-          debug('fg: ptctl error restoring terminal:', e.message);
-        }
-      }
-      
-      if (rl.paused) {
-        rl.resume();
-        rl.line = '';
-        rl.cursor = 0;
-        prompt().catch(() => {});
-      }
+      await prompt();
     }
     return 0;
   },
@@ -1783,9 +1842,8 @@ let commandStartTime = 0; // Track when command started for duration calculation
 let shellPgid = process.pid;
 if (ptctl.available) {
   try {
-    // Make shell a session leader so we can use tcsetpgrp later
-    const sid = ptctl.setsid();
-    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] setsid() returned ${sid}`);
+    // Do NOT call setsid() - we want to stay in the current session (which owns the TTY)
+    // Just make ourselves a process group leader
     
     // Make shell its own process group leader (pgid = 0 means use own PID)
     ptctl.setpgid(0, 0);
@@ -2793,6 +2851,10 @@ function spawnCommand(cmd, args, options) {
   }
 }
 
+// Ignore SIGTTOU to allow background process group (the shell) to change terminal ownership
+process.on('SIGTTOU', () => {});
+process.on('SIGTTIN', () => {});
+
 async function executePipeline(cmds) {
   const n = cmds.length;
   const procs = [];
@@ -2835,6 +2897,11 @@ async function executePipeline(cmds) {
       
       // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
       
+      // Disable raw mode so ctrl+z can be processed as a signal by the kernel
+      if (process.stdin.isTTY && process.stdin.isRaw) {
+        process.stdin.setRawMode(false);
+      }
+      
       // Pause readline so child gets exclusive control of stdin
       rl.pause();
       
@@ -2846,14 +2913,37 @@ async function executePipeline(cmds) {
       // Use 'detached: true' to create a new process group for the child
       // HOWEVER: sudo needs to stay attached to the TTY to read passwords from /dev/tty
       let childProcess;
-      let actualExe = exe;
-      let actualArgs = args;
       
       // Check if this is a script that needs an interpreter
       const scriptExecutor = getScriptExecutor(exe);
+      let actualExe = exe;
+      let actualArgs = args;
       if (scriptExecutor) {
         actualExe = scriptExecutor.interpreter;
         actualArgs = [...scriptExecutor.args, ...args];
+      }
+      
+      // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
+      
+      // Pause readline first to stop it from reading input
+      rl.pause();
+      
+      debug(`Shell PGID: ${shellPgid}, spawning: ${command}`);
+      
+      // Explicitly enable signals using native C function (termios)
+      // This ensures ISIG is set so the kernel generates SIGTSTP on Ctrl+Z
+      if (ptctl.available) {
+        try {
+          ptctl.enable_signals(0); // 0 = stdin
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Enabled signals (ISIG) on stdin via ptctl`);
+        } catch (e) {
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to enable signals via ptctl: ${e.message}`);
+        }
+      } else if (process.stdin.isTTY) {
+        // Fallback for when ptctl is not available (though it should be)
+        try {
+          if (process.stdin.setRawMode) process.stdin.setRawMode(false);
+        } catch (e) {}
       }
       
       try {
@@ -2861,8 +2951,8 @@ async function executePipeline(cmds) {
         childProcess = spawn(actualExe, actualArgs, {
           cwd: getAccessibleCwd(),
           env: SHELL.env,
-          stdio: 'inherit'
-          // Don't detach - keep child in same process group so it gets SIGTSTP naturally
+          stdio: 'inherit',
+          detached: false
         });
         if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child PID: ${childProcess.pid}`);
       } catch (spawnErr) {
@@ -2872,11 +2962,6 @@ async function executePipeline(cmds) {
       }
 
       debug(`Child spawned PID: ${childProcess.pid}`);
-
-      // REMOVED: Manual raw mode setting and keypress handler that broke TUI apps.
-      
-      // Child is in its own process group (detached: true).
-      // SIGTSTP will go to the child process group naturally since both are in same session.
       
       // Register job before waiting
       const cmdline = args.length ? [command, ...args].join(' ') : command;
@@ -2885,23 +2970,21 @@ async function executePipeline(cmds) {
       
       // Track for SIGTSTP forwarding
       currentChild = childProcess;
-      
 
-
-      // Wait for process to exit
+      // Wait for process to exit or stop
       await new Promise((resolve) => {
+        let isDone = false;
         
-        childProcess.on('exit', (code, signal) => {
-          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child exit event: code=${code}, signal=${signal}`);
-          debug(`Child exited with code ${code}, signal ${signal}`);
-          SHELL.lastExitCode = code || 0;
+        const cleanup = () => {
+          if (isDone) return;
+          isDone = true;
+          clearInterval(checkStatus);
           
-          // Clear current child tracking
-          currentChild = null;
-          
-          const job = findJobByPid(childProcess.pid);
-          if (job) {
-            markJobDone(job);
+          // Restore terminal to shell
+          if (ptctl.available) {
+            try {
+              ptctl.tcsetpgrp(0, shellPgid);
+            } catch (e) {}
           }
           
           // Resume readline
@@ -2911,10 +2994,26 @@ async function executePipeline(cmds) {
             rl.cursor = 0;
           }
           
+          currentChild = null;
           resolve();
-          });
+        };
+
+        childProcess.on('exit', (code, signal) => {
+          if (isDone) return;
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child exit event: code=${code}, signal=${signal}`);
+          debug(`Child exited with code ${code}, signal ${signal}`);
+          SHELL.lastExitCode = code || 0;
+          
+          const job = findJobByPid(childProcess.pid);
+          if (job) {
+            markJobDone(job);
+          }
+          
+          cleanup();
+        });
 
         childProcess.on('error', (err) => {
+          if (isDone) return;
           console.error(`Error executing ${command}:`, err.message);
           SHELL.lastExitCode = 1;
           
@@ -2923,12 +3022,36 @@ async function executePipeline(cmds) {
             markJobDone(job);
           }
           
-          if (rl.paused) {
-            rl.resume();
-          }
-          
-          resolve();
+          cleanup();
         });
+
+        // Polling loop to detect if child stopped (SIGTSTP)
+        const checkStatus = setInterval(() => {
+          if (isDone) return;
+          try {
+            const statFile = `/proc/${childProcess.pid}/stat`;
+            if (fs.existsSync(statFile)) {
+              const stat = fs.readFileSync(statFile, 'utf8');
+              const parts = stat.split(' ');
+              const state = parts[2];
+              
+              if (state === 'T') {
+                if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Detected child PID ${childProcess.pid} stopped (state T)`);
+                
+                const job = findJobByPid(childProcess.pid);
+                if (job) {
+                  job.status = 'stopped';
+                  job.suspended = true;
+                  console.log(`\n[${job.id}]+ Stopped\t${job.cmdline}`);
+                }
+                
+                cleanup();
+              }
+            }
+          } catch (e) {
+            // Process might have exited already
+          }
+        }, 100);
       });
       
       await prompt();
@@ -3157,10 +3280,45 @@ process.on('SIGTSTP', () => {
   if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Shell received SIGTSTP`);
   
   if (currentChild && !currentChild.killed) {
+    const child = currentChild;
     // Forward SIGTSTP to the child process directly
-    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Forwarding SIGTSTP to child PID ${currentChild.pid}`);
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Forwarding SIGTSTP to child PID ${child.pid}`);
     try {
-      process.kill(currentChild.pid, 'SIGTSTP');
+      // Mark as suspended BEFORE sending signal to avoid race conditions with exit handler
+      child.suspended = true;
+      
+      process.kill(child.pid, 'SIGTSTP');
+      
+      const job = findJobByPid(child.pid);
+      if (job) {
+        job.status = 'stopped';
+        job.suspended = true;
+        // Move cursor to new line if we're in a terminal
+        if (process.stdout.isTTY) process.stdout.write('\n');
+        console.log(`[${job.id}]+ Stopped\t${job.cmdline}`);
+      }
+      
+      // Restore terminal to shell if ptctl is available
+      if (ptctl.available) {
+        try {
+          ptctl.tcsetpgrp(0, shellPgid);
+        } catch (e) {}
+      }
+      
+      // Resume readline so the shell can take input again
+      if (rl.paused) {
+        rl.resume();
+        rl.line = '';
+        rl.cursor = 0;
+      }
+      
+      // Clear current child tracking
+      currentChild = null;
+      
+      // Trigger resolution of the wait in executePipeline
+      if (child._resolve) {
+        child._resolve();
+      }
     } catch (e) {
       if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to forward SIGTSTP: ${e.message}`);
     }
