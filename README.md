@@ -6,7 +6,7 @@ A Unix shell with modern features like fuzzy history search and interactive file
 
 `fgshell` is a functional Unix shell implementation written mostly in JavaScript/Bun, with a tiny bit of C. It has many things you expect from a shell (pipes, redirections, job control, scripting) plus some genuinely useful features that bash/zsh don't have out of the box:
 
-- **Interactive file picker** (Ctrl+N) with live preview
+- **Interactive file picker** (Ctrl+N) with live preview and Kitty image support
 - **Fuzzy history search** (Ctrl+R) with Fuse.js
 - **SQLite history database** with timestamps, exit codes, and command duration
 - **Customizable prompts** with color support
@@ -28,7 +28,7 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 ## Features
 
 ### The Cool Stuff
-- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories with live preview
+- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories with live preview (includes high-quality image previews in Kitty terminals)
 - **🔍 Fuzzy history search** (Ctrl+R) — search commands by any part of the command, powered by Fuse.js
 - **💾 SQLite history database** — persistent history with timestamps, exit codes, and execution duration
 - **🎨 Customizable prompts** — full color support and variable expansion
@@ -132,6 +132,7 @@ bun run build
 |---------|---------|------|-----|
 | Fuzzy history search (Ctrl+R) | ✓ | ✗ | ✓ (with plugins) |
 | Interactive file picker (Ctrl+N) | ✓ | ✗ | ✗ (with plugins) |
+| Kitty terminal image support | ✓ | ✗ | ✗ (with plugins) |
 | SQLite history database | ✓ | ✗ | ✗ |
 | Command duration tracking | ✓ | ✗ | ✓ (with plugins) |
 | Exit code in history | ✓ | ✗ | ✗ |

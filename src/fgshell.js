@@ -3348,52 +3348,72 @@ function readDirAsync(dirPath) {
     });
 }
 
+function getImageSupport() {
+  // Check SHELL.env first as it's the source of truth for the shell session
+  const term = (SHELL.env.TERM || process.env.TERM || '').toLowerCase();
+  const kittyId = SHELL.env.KITTY_WINDOW_ID || process.env.KITTY_WINDOW_ID;
+  
+  if (term.includes('kitty') || kittyId) return 'kitty';
+  return 'none';
+}
+
 // Helper to get preview text for a file (text or fallback)
 async function getFilePreview(filePath, maxLines = 20) {
   try {
-    const stat = await fs.promises.stat(filePath);
+    const resolvedPath = path.resolve(SHELL.cwd, filePath);
+    const stat = await fs.promises.stat(resolvedPath);
     if (stat.isDirectory()) {
-      return '[Directory]';
+      return { type: 'text', content: '[Directory]' };
     }
     
     const sizeStr = (stat.size / 1024).toFixed(1) + ' KB';
     
+    // Check for image
+    const ext = path.extname(resolvedPath).toLowerCase();
+    const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.ico'];
+    if (imageExts.includes(ext)) {
+      const support = getImageSupport();
+      if (support === 'kitty') {
+        // For Kitty, we'll read the file in renderFilePickerOverlay to send as data
+        return { type: 'image', protocol: 'kitty', path: resolvedPath, sizeStr };
+      }
+      return { type: 'text', content: '[Image: ' + sizeStr + ']' };
+    }
+    
     // Skip preview for very large files
     if (stat.size > 50000) {
-      return '[File: ' + sizeStr + ']';
+      return { type: 'text', content: '[File: ' + sizeStr + ']' };
     }
     
     // Skip known binary file extensions
-    const ext = path.extname(filePath).toLowerCase();
-    const binaryExts = ['.db', '.sqlite', '.sqlite3', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.pdf', '.zip', '.gz', '.tar', '.exe', '.bin', '.so', '.dylib', '.o', '.a', '.node'];
+    const binaryExts = ['.db', '.sqlite', '.sqlite3', '.pdf', '.zip', '.gz', '.tar', '.exe', '.bin', '.so', '.dylib', '.o', '.a', '.node'];
     if (binaryExts.includes(ext)) {
-      return '[Binary: ' + sizeStr + ']';
+      return { type: 'text', content: '[Binary: ' + sizeStr + ']' };
     }
     
     // Skip files that look like databases or binary
-    const baseName = path.basename(filePath);
+    const baseName = path.basename(resolvedPath);
     if (baseName.startsWith('.') && baseName.includes('history')) {
-      return '[Database: ' + sizeStr + ']';
+      return { type: 'text', content: '[Database: ' + sizeStr + ']' };
     }
     
     // Try to read as text
     try {
-      const content = await fs.promises.readFile(filePath, 'utf8');
+      const content = await fs.promises.readFile(resolvedPath, 'utf8');
       
       // Check if content looks binary (contains null bytes or control chars)
       if (content.indexOf('\0') !== -1 || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(content.slice(0, 1000))) {
-        return '[Binary: ' + sizeStr + ']';
+        return { type: 'text', content: '[Binary: ' + sizeStr + ']' };
       }
       
-      // It's text, show preview - strip any remaining escape sequences
+      // It's text
       const lines = content.split('\n').slice(0, maxLines);
-      return lines.map(l => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join('\n');
+      return { type: 'text', content: lines.map(l => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join('\n') };
     } catch (readErr) {
-      // Failed to read as text, likely binary
-      return '[Binary: ' + sizeStr + ']';
+      return { type: 'text', content: '[Binary: ' + sizeStr + ']' };
     }
   } catch (e) {
-    return '[Cannot read file]';
+    return { type: 'text', content: '[Cannot read file]' };
   }
 }
 
@@ -3424,13 +3444,26 @@ async function renderFilePickerOverlay() {
 
     // Get preview for selected item
     let previewLines = [];
+    let previewImage = null;
     const selected = displayFiles[selectedIndex];
     if (selected) {
       if (selected.isDirectory) {
         previewLines = ['[Directory]'];
       } else {
-        const previewText = await getFilePreview(path.join(SHELL.cwd, selected.name), maxVisible);
-        previewLines = previewText.split('\n').map(l => l.replace(/\t/g, '    '));
+        const previewResult = await getFilePreview(selected.name, maxVisible);
+        if (previewResult.type === 'image') {
+          previewImage = previewResult;
+          previewLines = [`[Image: ${previewResult.sizeStr}]`];
+          // Fill remaining lines with empty strings to reserve space
+          while (previewLines.length < maxVisible) previewLines.push('');
+        } else {
+          const content = previewResult.content || previewResult;
+          if (typeof content === 'string') {
+            previewLines = content.split('\n').map(l => l.replace(/\t/g, '    '));
+          } else {
+             previewLines = ['[Error]'];
+          }
+        }
       }
     }
 
@@ -3509,6 +3542,66 @@ async function renderFilePickerOverlay() {
 
     // Write all at once and track line count
     process.stdout.write(output);
+    
+    // Draw Image Overlays
+    if (previewImage) {
+      const headerHeight = 3 + (filterMode ? 1 : 0);
+      const moveUp = lineCount;
+      const moveDown = headerHeight;
+      const moveRight = listWidth + 3;
+      
+      // Save cursor
+      process.stdout.write('\x1b7');
+      
+      // Move to position
+      process.stdout.write(`\x1b[${moveUp}A`); // Go up to top
+      process.stdout.write(`\x1b[${moveDown}B`); // Go down past header
+      process.stdout.write(`\x1b[${moveRight}C`); // Go right
+      
+      if (previewImage.protocol === 'kitty') {
+        try {
+          // Read file and send as base64 inline data (t=d) to avoid path issues
+          const data = await fs.promises.readFile(previewImage.path);
+          const base64 = data.toString('base64');
+          const chunkSize = 4096;
+          let offset = 0;
+          let isFirstChunk = true;
+          
+          // Determine format
+          const ext = path.extname(previewImage.path).toLowerCase();
+          let formatParam = '';
+          if (ext === '.png') {
+            formatParam = ',f=100'; // f=100 is PNG
+          }
+          // JPG doesn't have a standard code in 't=d' mode usually, relying on raw data or other means,
+          // but for now we'll send without 'f' for others and hope Kitty auto-detects or handles it.
+          
+          while (offset < base64.length) {
+            const remaining = base64.length - offset;
+            const currentChunkSize = Math.min(remaining, chunkSize);
+            const chunk = base64.slice(offset, offset + currentChunkSize);
+            offset += currentChunkSize;
+            
+            const m = offset < base64.length ? 1 : 0;
+            
+            if (isFirstChunk) {
+               // a=T (transmit and display), t=d (direct), c/r (scale to cells)
+               // q=2 (quiet - suppress response)
+               process.stdout.write(`\x1b_Ga=T,t=d${formatParam},m=${m},c=${previewWidth},r=${maxVisible},q=2;${chunk}\x1b\\`);
+               isFirstChunk = false;
+            } else {
+               process.stdout.write(`\x1b_Gm=${m};${chunk}\x1b\\`);
+            }
+          }
+        } catch (e) {
+          // Failed to read or send, ignore
+        }
+      }
+      
+      // Restore cursor
+      process.stdout.write('\x1b8');
+    }
+
     filePickerState.lastLineCount = lineCount;
   } finally {
     isPickerRendering = false;

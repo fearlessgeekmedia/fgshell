@@ -3258,7 +3258,7 @@ function clearFilePickerOverlay() {
   process.stdout.write('\x1b8'); // 4. Restore cursor (back to the prompt position)
 }
 
-function handleFilePickerKey(str, key) {
+async function handleFilePickerKey(str, key) {
   if (!filePickerState) return;
   const { files } = filePickerState;
 
@@ -3269,7 +3269,7 @@ function handleFilePickerKey(str, key) {
       filePickerState.filterQuery = '';
       filePickerState.files = [...filePickerState.allFiles];
       filePickerState.selectedIndex = 0;
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     
@@ -3298,7 +3298,7 @@ function handleFilePickerKey(str, key) {
         filePickerState.files = [...filePickerState.allFiles];
       }
       filePickerState.selectedIndex = 0;
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     
@@ -3307,14 +3307,17 @@ function handleFilePickerKey(str, key) {
       if (!selected) return;
       if (selected.isDirectory) {
         SHELL.cwd = path.resolve(SHELL.cwd, selected.name);
-        readDirAsync(SHELL.cwd).then(newFiles => {
+        try {
+          const newFiles = await readDirAsync(SHELL.cwd);
           filePickerState.files = newFiles;
           filePickerState.allFiles = newFiles;
           filePickerState.filterQuery = '';
           filePickerState.filterMode = false;
           filePickerState.selectedIndex = 0;
-          renderFilePickerOverlay();
-        });
+          await renderFilePickerOverlay();
+        } catch (e) {
+          // Handle error
+        }
       } else {
         if (filePickerResolve) filePickerResolve(selected.name);
       }
@@ -3345,7 +3348,7 @@ function handleFilePickerKey(str, key) {
         filePickerState.files = [...filePickerState.allFiles];
       }
       filePickerState.selectedIndex = 0;
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     
@@ -3353,9 +3356,9 @@ function handleFilePickerKey(str, key) {
       if (key.name === 'up') {
         filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
       } else {
-        filePickerState.selectedIndex = Math.min(files.length - 1, filePickerState.selectedIndex + 1);
+        filePickerState.selectedIndex = Math.min(files.length - 1, files.length + 1);
       }
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     return;
@@ -3371,39 +3374,45 @@ function handleFilePickerKey(str, key) {
     filePickerState.filterMode = true;
     filePickerState.filterQuery = '';
     filePickerState.allFiles = [...files];
-    renderFilePickerOverlay();
+    await renderFilePickerOverlay();
     return;
   }
 
   if (key.name === 'up') {
     filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
-    renderFilePickerOverlay();
+    await renderFilePickerOverlay();
   } else if (key.name === 'down') {
     filePickerState.selectedIndex = Math.min(filePickerState.files.length - 1, filePickerState.selectedIndex + 1);
-    renderFilePickerOverlay();
+    await renderFilePickerOverlay();
   } else if (key.name === 'left') {
     const parentDir = path.dirname(SHELL.cwd);
     if (parentDir !== SHELL.cwd) {
       SHELL.cwd = parentDir;
-      readDirAsync(SHELL.cwd).then(newFiles => {
+      try {
+        const newFiles = await readDirAsync(SHELL.cwd);
         filePickerState.files = newFiles;
         filePickerState.allFiles = newFiles;
         filePickerState.selectedIndex = 0;
-        renderFilePickerOverlay();
-      });
+        await renderFilePickerOverlay();
+      } catch (e) {
+        // Handle error
+      }
     }
   } else if (key.name === 'right' || key.name === 'return') {
     const selected = filePickerState.files[filePickerState.selectedIndex];
     if (!selected) return;
     if (selected.isDirectory) {
       SHELL.cwd = path.resolve(SHELL.cwd, selected.name);
-      readDirAsync(SHELL.cwd).then(newFiles => {
+      try {
+        const newFiles = await readDirAsync(SHELL.cwd);
         filePickerState.files = newFiles;
         filePickerState.allFiles = newFiles;
         filePickerState.filterQuery = '';
         filePickerState.selectedIndex = 0;
-        renderFilePickerOverlay();
-      });
+        await renderFilePickerOverlay();
+      } catch (e) {
+        // Handle error
+      }
     } else {
       if (filePickerResolve) filePickerResolve(selected.name);
     }
