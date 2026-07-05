@@ -1921,7 +1921,7 @@ function completer(line) {
 }
 
 // ---------------------- Parsing ----------------------
-function tokenize(input) {
+function tokenize(input, preserveQuotes) {
   // returns array of tokens (not handling pipes/redir specially here)
   const tokens = [];
   let i = 0;
@@ -1932,11 +1932,16 @@ function tokenize(input) {
     const ch = input[i];
     // Handle quote modes first (they disable escape processing)
     if (state === 'single') {
-      if (ch === "'") state = 'normal';
+      if (ch === "'") {
+        if (preserveQuotes) cur += ch;
+        state = 'normal';
+      }
       else cur += ch;
     } else if (state === 'double') {
-      if (ch === '"') state = 'normal';
-      else if (ch === '$') {
+      if (ch === '"') {
+        if (preserveQuotes) cur += ch;
+        state = 'normal';
+      } else if (ch === '$') {
         // leave $ as is for expansion phase
         cur += ch;
       } else cur += ch;
@@ -1947,8 +1952,10 @@ function tokenize(input) {
       // Escape character (only in normal or double-quote mode)
       state = 'esc';
     } else if (ch === "'") {
+      if (preserveQuotes) cur += ch;
       state = 'single';
     } else if (ch === '"') {
+      if (preserveQuotes) cur += ch;
       state = 'double';
     } else if (/\s/.test(ch)) {
       if (cur !== '') {
@@ -2200,6 +2207,98 @@ function waitForJob(job) {
   }).then(() => 0);
 }
 
+// ---------------------- History Expansion ----------------------
+function resolveHistoryExpansion(input) {
+  if (!input.includes('!')) return input;
+  const lines = [];
+  let i = 0;
+  let state = null;
+  let cur = '';
+  while (i < input.length) {
+    const ch = input[i];
+    if (state === 'single') {
+      cur += ch;
+      if (ch === "'") state = null;
+    } else if (state === 'double') {
+      cur += ch;
+      if (ch === '"') state = null;
+    } else if (ch === "'") {
+      cur += ch;
+      state = 'single';
+    } else if (ch === '"') {
+      cur += ch;
+      state = 'double';
+    } else if (ch === '\\') {
+      cur += ch;
+      i++;
+      if (i < input.length) cur += input[i];
+    } else if (ch === '!') {
+      const start = cur.length;
+      i++;
+      if (i < input.length && input[i] === '!') {
+        const last = SHELL.history.length > 0 ? SHELL.history[SHELL.history.length - 1] : '';
+        cur += last;
+        i++;
+      } else if (i < input.length && input[i] === '$') {
+        const last = SHELL.history.length > 0 ? SHELL.history[SHELL.history.length - 1] : '';
+        const parts = last.trim().split(/\s+/);
+        const arg = parts.length > 1 ? parts[parts.length - 1] : last;
+        cur += arg;
+        i++;
+      } else if (i < input.length && input[i] === '^') {
+        const last = SHELL.history.length > 0 ? SHELL.history[SHELL.history.length - 1] : '';
+        const parts = last.trim().split(/\s+/);
+        const arg = parts.length > 1 ? parts[1] : last;
+        cur += arg;
+        i++;
+      } else {
+        let num = '';
+        let neg = false;
+        if (i < input.length && input[i] === '-') { neg = true; i++; }
+        while (i < input.length && /[0-9]/.test(input[i])) {
+          num += input[i];
+          i++;
+        }
+        if (num) {
+          const idx = neg ? SHELL.history.length - parseInt(num, 10) : parseInt(num, 10) - 1;
+          cur += (SHELL.history[idx] || '');
+        } else {
+          let prefix = '';
+          let contains = false;
+          if (i < input.length && input[i] === '?') {
+            contains = true;
+            i++;
+            while (i < input.length && input[i] !== '?') {
+              prefix += input[i];
+              i++;
+            }
+            if (i < input.length) i++;
+          } else {
+            while (i < input.length && /[A-Za-z0-9_\-]/.test(input[i])) {
+              prefix += input[i];
+              i++;
+            }
+          }
+          const match = SHELL.history.slice().reverse().find(cmd => {
+            if (contains) return cmd.includes(prefix);
+            return cmd.startsWith(prefix);
+          });
+          cur += match || '';
+        }
+      }
+    } else {
+      cur += ch;
+    }
+    i++;
+    if (ch === ';' && !state) {
+      lines.push(cur);
+      cur = '';
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.join(';');
+}
+
 // ---------------------- Execution ----------------------
 async function runLine(line) {
   line = line.trim();
@@ -2207,19 +2306,12 @@ async function runLine(line) {
     return;
   }
   
-  const isBuiltinCommand = !line.startsWith('history') && !line.startsWith('exit');
-  if (isBuiltinCommand) {
-    SHELL.history.push(line);
-    if (rl.history) {
-      rl.history.push(line);
-    }
-  }
-  
   commandStartTime = Date.now();
   
   // Parse line for control flow structures and execute
   await executeControlFlow(line);
   
+  const isBuiltinCommand = !line.startsWith('history') && !line.startsWith('exit');
   // Record to history DB (but not commands from .fgshrc)
   if (isBuiltinCommand && !isLoadingRcFile) {
     const duration = Date.now() - commandStartTime;
@@ -2312,6 +2404,7 @@ function formatCallStack() {
 async function executeControlFlow(line, context) {
   // context: { startLine, endLine, filename, content }
   const trimmed = line.trim();
+  if (!trimmed) return;
   
   // Check for multi-line control structures first
   if (trimmed.startsWith('if ')) {
@@ -2773,6 +2866,22 @@ async function executeSubshell(cmd) {
 
 async function runSingle(line, context) {
   // context: { startLine, endLine, filename, content } - optional, used for error reporting
+  
+  // Expand history shortcuts before tokenization so sequences like "a; !!" 
+  // see the history populated by earlier commands in the same line.
+  line = resolveHistoryExpansion(line);
+  
+  const trimmedLine = line.trim();
+  
+  // Track in history for history expansion (skip history/exit)
+  const isBuiltinCommand = !trimmedLine.startsWith('history') && !trimmedLine.startsWith('exit');
+  if (isBuiltinCommand && trimmedLine) {
+    if (rl && rl.history) {
+      rl.history.push(trimmedLine);
+    }
+    SHELL.history.push(trimmedLine);
+  }
+  
   try {
     // Check for array assignment (arr=(values))
     const arrayMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\((.*)\)$/);
@@ -2812,6 +2921,12 @@ async function runSingle(line, context) {
         SHELL.lastExitCode = code;
         return;
       }
+    }
+    
+    // Re-tokenize with preserved quotes for js builtin so string literals
+    // inside code like console.log("hi") keep their quotes
+    if (tokens[0] === 'js') {
+      tokens = tokenize(line, true);
     }
     
     tokens = expandAliases(tokens);
