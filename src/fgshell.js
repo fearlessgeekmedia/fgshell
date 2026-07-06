@@ -793,14 +793,21 @@ try {
       
       // Resume shell
       if (rl.paused) {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(true);
+        }
         rl.resume();
-        prompt().catch(() => {});
       }
     } else {
       // For non-pty jobs (background/suspended tasks), resume and wait
       try {
         // Pause readline first
         rl.pause();
+        
+        // Disable raw mode so the resumed job can receive signals normally
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(false);
+        }
         
         // Give terminal control to the job's process group
         if (ptctl.available && job.pids && job.pids.length > 0) {
@@ -842,7 +849,12 @@ try {
             ptctl.tcsetpgrp(0, shellPgid);
           } catch(e) {}
         }
-        if (rl.paused) rl.resume();
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return 1;
       }
       
@@ -860,20 +872,19 @@ try {
             try {
               ptctl.tcsetpgrp(0, shellPgid);
             } catch (e) {}
-          }
-          
-              // Resume readline
-              if (rl.paused) {
-                rl.resume();
-                if (process.stdin.isTTY && process.stdin.setRawMode) {
-                  process.stdin.setRawMode(true);
-                }
-                prompt().catch(() => {});
-                rl.line = '';
-                rl.cursor = 0;
+           }
+           
+               // Resume readline
+            if (rl.paused) {
+              if (process.stdin.isTTY && process.stdin.setRawMode) {
+                process.stdin.setRawMode(true);
               }
-          resolve();
-        };
+              rl.resume();
+              rl.line = '';
+              rl.cursor = 0;
+            }
+            resolve();
+         };
 
         // Polling loop to detect if child stopped (SIGTSTP) or finished
         const checkStatus = setInterval(() => {
@@ -915,7 +926,7 @@ try {
         }, 100);
       });
       
-      await prompt();
+      return 0;
     }
     return 0;
   },
@@ -1841,12 +1852,9 @@ let filePickerResolve = null; // Promise resolver for file picker
 let commandStartTime = 0; // Track when command started for duration calculation
 
 // Shell process group control (for job control with Ctrl+Z)
-let shellPgid = process.pid;
+ let shellPgid = process.pid;
 if (ptctl.available) {
   try {
-    // Do NOT call setsid() - we want to stay in the current session (which owns the TTY)
-    // Just make ourselves a process group leader
-    
     // Make shell its own process group leader (pgid = 0 means use own PID)
     ptctl.setpgid(0, 0);
     shellPgid = ptctl.getpgrp();
@@ -1854,6 +1862,14 @@ if (ptctl.available) {
   } catch (e) {
     debug('Failed to set shell process group:', e.message);
     shellPgid = process.pid;
+  }
+  
+  try {
+    ptctl.tcsetpgrp(0, shellPgid);
+    ptctl.enable_signals(0);
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Claimed terminal for shell PGID ${shellPgid}`);
+  } catch (e) {
+    debug('Failed to claim terminal:', e.message);
   }
 }
 
@@ -3029,14 +3045,19 @@ async function executePipeline(cmds) {
       if (!exe) {
         console.error(`${command}: command not found`);
         SHELL.lastExitCode = 127;
-        if (rl.paused) rl.resume();
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return;
       }
       
       // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
       
       // Disable raw mode so ctrl+z can be processed as a signal by the kernel
-      if (process.stdin.isTTY && process.stdin.isRaw) {
+      if (process.stdin.isTTY && process.stdin.setRawMode) {
         process.stdin.setRawMode(false);
       }
       
@@ -3077,18 +3098,46 @@ async function executePipeline(cmds) {
          } catch (e) {}
        }
       
-      try {
-        if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Spawning: ${actualExe} ${actualArgs.join(' ')}`);
-        childProcess = spawn(actualExe, actualArgs, {
-          cwd: getAccessibleCwd(),
-          env: SHELL.env,
-          stdio: 'inherit',
-          detached: false
-        });
-        if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child PID: ${childProcess.pid}`);
+        try {
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Spawning: ${actualExe} ${actualArgs.join(' ')}`);
+          childProcess = spawn(actualExe, actualArgs, {
+            cwd: getAccessibleCwd(),
+            env: SHELL.env,
+            stdio: 'inherit',
+          });
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child PID: ${childProcess.pid}`);
+
+          if (ptctl.available) {
+            try {
+              ptctl.setpgid(childProcess.pid, childProcess.pid);
+            } catch (e) {
+              debug('Error moving child to new process group:', e.message);
+            }
+            try {
+              const childPgid = ptctl.getpgid(childProcess.pid);
+              debug(`Setting terminal to child PGID ${childPgid}`);
+              ptctl.tcsetpgrp(0, childPgid);
+              ptctl.enable_signals(0);
+            } catch (e) {
+              debug('ptctl error setting terminal to child:', e.message);
+            }
+          }
       } catch (spawnErr) {
         console.error(`Error executing ${command}: ${spawnErr.message}`);
         SHELL.lastExitCode = 127;
+        
+        // Restore terminal to shell and resume readline
+        if (ptctl.available) {
+          try {
+            ptctl.tcsetpgrp(0, shellPgid);
+          } catch (e) {}
+        }
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return;
       }
 
@@ -3107,32 +3156,30 @@ async function executePipeline(cmds) {
         let isDone = false;
         
         const cleanup = () => {
-          if (isDone) return;
-          isDone = true;
-          clearInterval(checkStatus);
-          
-            // Restore terminal to shell
-            if (ptctl.available) {
-              try {
-                ptctl.tcsetpgrp(0, shellPgid);
-                ptctl.enable_signals(0);
-              } catch (e) {}
-            }
+           if (isDone) return;
+           isDone = true;
+            clearInterval(checkStatus);
             
-              // Resume readline
-              if (rl.paused) {
-                rl.resume();
-                if (process.stdin.isTTY && process.stdin.setRawMode) {
-                  process.stdin.setRawMode(true);
+                // Restore terminal to shell
+                if (ptctl.available) {
+                  try {
+                    ptctl.tcsetpgrp(0, shellPgid);
+                  } catch (e) {}
                 }
-                prompt().catch(() => {});
-                rl.line = '';
-                rl.cursor = 0;
-              }
-          
-          currentChild = null;
-          resolve();
-        };
+                
+                // Resume readline
+                if (rl.paused) {
+                  if (process.stdin.isTTY && process.stdin.setRawMode) {
+                    process.stdin.setRawMode(true);
+                  }
+                  rl.resume();
+                  rl.line = '';
+                  rl.cursor = 0;
+                }
+            
+             currentChild = null;
+             resolve();
+          };
 
         childProcess.on('exit', (code, signal) => {
           if (isDone) return;
@@ -3190,7 +3237,6 @@ async function executePipeline(cmds) {
         }, 100);
       });
       
-      await prompt();
       return;
       // *** END FIX ***
 
@@ -3245,6 +3291,12 @@ async function executePipeline(cmds) {
       if (!exe) {
         console.error(`${command}: command not found`);
         SHELL.lastExitCode = 127;
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return;
       }
       
@@ -3254,6 +3306,9 @@ async function executePipeline(cmds) {
         console.error(`Error executing ${command}: ${spawnErr.message}`);
         SHELL.lastExitCode = 127;
         if (isSingleCommand && rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
           rl.resume();
         }
         return;
@@ -3310,8 +3365,10 @@ async function executePipeline(cmds) {
     
     // handle child exit
     child.on('exit', (code, signal) => {
-      // Resume readline for single commands
       if (child._resumeRl && rl.paused) {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(true);
+        }
         rl.resume();
       }
       const job = findJobByPid(child.pid);
@@ -3438,23 +3495,29 @@ process.on('SIGTSTP', () => {
       if (ptctl.available) {
         try {
           ptctl.tcsetpgrp(0, shellPgid);
-        } catch (e) {}
+          if (process.env.FGSH_DEBUG) console.error('[DEBUG] tcsetpgrp to shell ok');
+        } catch (e) {
+          if (process.env.FGSH_DEBUG) console.error('[DEBUG] tcsetpgrp to shell failed:', e.message);
+        }
       }
       
       // Resume readline so the shell can take input again
       if (rl.paused) {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(true);
+        }
         rl.resume();
         rl.line = '';
         rl.cursor = 0;
       }
       
-      // Clear current child tracking
-      currentChild = null;
-      
-      // Trigger resolution of the wait in executePipeline
-      if (child._resolve) {
-        child._resolve();
-      }
+       // Clear current child tracking
+       currentChild = null;
+       
+       // Trigger resolution of the wait in executePipeline
+       if (child._resolve) {
+         child._resolve();
+       }
     } catch (e) {
       if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to forward SIGTSTP: ${e.message}`);
     }
@@ -3464,6 +3527,11 @@ process.on('SIGTSTP', () => {
 
 // reap children to update job table even if not foreground
 process.on('exit', () => {
+  if (process.stdin.isTTY && process.stdin.setRawMode) {
+    try {
+      process.stdin.setRawMode(false);
+    } catch (e) {}
+  }
   historyDB.closeDB();
   // Clean up any remaining heredoc temp files
   try {
@@ -3474,6 +3542,20 @@ process.on('exit', () => {
       }
     }
   } catch (e) {}
+});
+
+// Clean up terminal raw mode on termination signals
+const terminationSignals = ['SIGTERM', 'SIGHUP', 'SIGQUIT'];
+terminationSignals.forEach(sig => {
+  process.on(sig, () => {
+    if (process.stdin.isTTY && process.stdin.setRawMode) {
+      try {
+        process.stdin.setRawMode(false);
+      } catch (e) {}
+    }
+    process.removeAllListeners(sig);
+    process.kill(process.pid, sig);
+  });
 });
 
 // Helper to read directory asynchronously without blocking
