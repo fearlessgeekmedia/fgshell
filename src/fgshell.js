@@ -228,21 +228,19 @@ const help = {
   Exit status:
   Returns 0 unless an invalid JOBSPEC is given.
   `,
-  history: `history [-c] [-w] [-r] [FILENAME] or history [-n] [COUNT]
+  history: `history [QUERY]
   Display the command history.
 
-  With no options, displays the entire history with line numbers.
+  With no arguments, displays the entire history with line numbers.
+  With a QUERY, searches history using fuzzy matching.
 
   Options:
-  -c     clear the history list
-  -w     write history to FILENAME (or ~/.bash_history)
-  -r     read history from FILENAME (or ~/.bash_history)
-  -n N   display the last N commands
   --json               output as JSON
   --yaml, --yml        output as YAML
+  --help               show this help message
 
   Exit status:
-  Returns 0 unless an invalid option is supplied or file cannot be accessed.
+  Returns 0 unless an invalid option is supplied.
   `,
   ls: `ls [OPTION]... [FILE]...
   List information about files and directories.
@@ -2038,19 +2036,32 @@ function expandVars(str) {
   }
   
   // handle $((arithmetic)) expansion
-  str = str.replace(/\$\(\(([^)]+)\)\)/g, (_, expr) => {
-    try {
-      // Replace variable references with their values
-      const expandedExpr = expr.replace(/([A-Za-z_]\w*)/g, (match) => {
-        return (match in SHELL.env) ? SHELL.env[match] : '0';
-      });
-      // Evaluate the expression
-      const result = Function('"use strict"; return (' + expandedExpr + ')')();
-      return result.toString();
-    } catch (e) {
-      return '0';
+  let arithMatch;
+  while ((arithMatch = str.match(/\$\(\(/)) !== null) {
+    if (process.env.FGSH_DEBUG) console.error('[DEBUG ARITH] match at', arithMatch.index);
+    const start = arithMatch.index + 3;
+    let depth = 0;
+    let i = start;
+    while (i < str.length) {
+      if (str[i] === '(') depth++;
+      else if (str[i] === ')') {
+        if (depth === 0 && i + 1 < str.length && str[i + 1] === ')') {
+          const expr = str.slice(start, i);
+          try {
+            const expandedExpr = expr.replace(/([A-Za-z_]\w*)/g, (m) => (m in SHELL.env) ? SHELL.env[m] : '0');
+            const result = Function('"use strict"; return (' + expandedExpr + ')')();
+            str = str.slice(0, arithMatch.index) + result.toString() + str.slice(i + 2);
+          } catch (e) {
+            str = str.slice(0, arithMatch.index) + '0' + str.slice(i + 2);
+          }
+          break;
+        }
+        depth--;
+      }
+      i++;
     }
-  });
+    if (i >= str.length) break;
+  }
   
   // handle ${VAR} and $VAR, including array access ${ARR[i]}, ${ARR[@]}, etc.
   return str.replace(/\$(\w+(?:\[[^\]]*\])?|\{([^}]+)\})/g, (match, a, b) => {
@@ -2087,17 +2098,15 @@ function expandVars(str) {
 
 // expand $(command) - command substitution
 async function expandCommandSubstitution(str) {
-  // Find all $(...) patterns
-  const regex = /\$\(([^)]+)\)/g;
-  let result = str;
-  let match;
-  
   const matches = [];
+  const regex = /\$\(([^(][^)]*)\)/g;
+  let match;
+  let result = str;
+  
   while ((match = regex.exec(str)) !== null) {
     matches.push({ full: match[0], cmd: match[1], index: match.index });
   }
   
-  // Execute each command and replace from right to left to preserve indices
   for (let i = matches.length - 1; i >= 0; i--) {
     const m = matches[i];
     const output = await executeSubshellCommand(m.cmd);
@@ -2822,6 +2831,9 @@ async function callFunction(funcName, args, context) {
 }
 
 // Parse and execute here-documents
+const HEREDOC_TMP_PREFIX = 'fgsh-herodc-';
+let heredocCounter = 0;
+
 async function parseHereDocument(lines, startIdx) {
   // Look for <<EOF or <<'EOF' or <<-EOF patterns
   const line = lines[startIdx];
@@ -2839,10 +2851,14 @@ async function parseHereDocument(lines, startIdx) {
   while (i < lines.length) {
     const currentLine = lines[i];
     if (currentLine.trim() === delimiter) {
+      // Create a temp file with the heredoc content
+      const tmpFile = path.join(os.tmpdir(), HEREDOC_TMP_PREFIX + (++heredocCounter) + '.txt');
+      fs.writeFileSync(tmpFile, content, 'utf8');
       return {
         delimiter,
         content,
-        endIdx: i
+        endIdx: i,
+        tmpFile
       };
     }
     content += currentLine + '\n';
@@ -2912,6 +2928,9 @@ async function runSingle(line, context) {
     
     // First expand command substitutions
     line = await expandCommandSubstitution(line);
+    
+    // Expand variables before tokenization so $((...)) stays together
+    line = expandVars(line);
     
     let tokens = tokenize(line);
     if (tokens.length === 0) return;
@@ -3006,11 +3025,11 @@ async function executePipeline(cmds) {
     }
     
     if (isInteractive) {
-      // Check if executable exists first
       const exe = resolveExecutable(command);
       if (!exe) {
         console.error(`${command}: command not found`);
         SHELL.lastExitCode = 127;
+        if (rl.paused) rl.resume();
         return;
       }
       
@@ -3033,37 +3052,30 @@ async function executePipeline(cmds) {
       // HOWEVER: sudo needs to stay attached to the TTY to read passwords from /dev/tty
       let childProcess;
       
-      // Check if this is a script that needs an interpreter
-      const scriptExecutor = getScriptExecutor(exe);
-      let actualExe = exe;
-      let actualArgs = args;
-      if (scriptExecutor) {
-        actualExe = scriptExecutor.interpreter;
-        actualArgs = [...scriptExecutor.args, ...args];
-      }
-      
-      // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
-      
-      // Pause readline first to stop it from reading input
-      rl.pause();
-      
-      debug(`Shell PGID: ${shellPgid}, spawning: ${command}`);
-      
-      // Explicitly enable signals using native C function (termios)
-      // This ensures ISIG is set so the kernel generates SIGTSTP on Ctrl+Z
-      if (ptctl.available) {
-        try {
-          ptctl.enable_signals(0); // 0 = stdin
-          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Enabled signals (ISIG) on stdin via ptctl`);
-        } catch (e) {
-          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to enable signals via ptctl: ${e.message}`);
-        }
-      } else if (process.stdin.isTTY) {
-        // Fallback for when ptctl is not available (though it should be)
-        try {
-          if (process.stdin.setRawMode) process.stdin.setRawMode(false);
-        } catch (e) {}
-      }
+       // Check if this is a script that needs an interpreter
+       const scriptExecutor = getScriptExecutor(exe);
+       let actualExe = exe;
+       let actualArgs = args;
+       if (scriptExecutor) {
+         actualExe = scriptExecutor.interpreter;
+         actualArgs = [...scriptExecutor.args, ...args];
+       }
+       
+       // Explicitly enable signals using native C function (termios)
+       // This ensures ISIG is set so the kernel generates SIGTSTP on Ctrl+Z
+       if (ptctl.available) {
+         try {
+           ptctl.enable_signals(0); // 0 = stdin
+           if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Enabled signals (ISIG) on stdin via ptctl`);
+         } catch (e) {
+           if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to enable signals via ptctl: ${e.message}`);
+         }
+       } else if (process.stdin.isTTY) {
+         // Fallback for when ptctl is not available (though it should be)
+         try {
+           if (process.stdin.setRawMode) process.stdin.setRawMode(false);
+         } catch (e) {}
+       }
       
       try {
         if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Spawning: ${actualExe} ${actualArgs.join(' ')}`);
@@ -3453,6 +3465,15 @@ process.on('SIGTSTP', () => {
 // reap children to update job table even if not foreground
 process.on('exit', () => {
   historyDB.closeDB();
+  // Clean up any remaining heredoc temp files
+  try {
+    const files = fs.readdirSync(os.tmpdir());
+    for (const file of files) {
+      if (file.startsWith(HEREDOC_TMP_PREFIX)) {
+        try { fs.unlinkSync(path.join(os.tmpdir(), file)); } catch (e) {}
+      }
+    }
+  } catch (e) {}
 });
 
 // Helper to read directory asynchronously without blocking
@@ -4392,7 +4413,7 @@ if (process.argv[2] === '-c' && process.argv[3]) {
     
     // Parse script into blocks (handles multi-line control structures)
     // Returns blocks with line number metadata
-    function parseScriptBlocks(lines) {
+    async function parseScriptBlocks(lines) {
       const blocks = [];
       let idx = 0;
       
@@ -4428,14 +4449,39 @@ if (process.argv[2] === '-c' && process.argv[3]) {
           });
           idx = block.endIdx + 1;
         } else {
-          // Single-line command
-          blocks.push({
-            content: line,
-            startLine: idx + 1,
-            endLine: idx + 1,
-            filename: scriptPath
-          });
-          idx++;
+          // Check for here-document
+          const heredocMatch = line.match(/<<\s*-?\s*([A-Za-z_][A-Za-z0-9_]*)/);
+          if (heredocMatch) {
+            const heredoc = await parseHereDocument(lines, idx);
+            if (heredoc) {
+              const commandLine = line.replace(/<<\s*-?\s*[A-Za-z_][A-Za-z0-9_]*/, heredoc.tmpFile);
+              blocks.push({
+                content: commandLine,
+                startLine: idx + 1,
+                endLine: heredoc.endIdx + 1,
+                filename: scriptPath,
+                _heredocTmpFile: heredoc.tmpFile
+              });
+              idx = heredoc.endIdx + 1;
+            } else {
+              blocks.push({
+                content: line,
+                startLine: idx + 1,
+                endLine: idx + 1,
+                filename: scriptPath
+              });
+              idx++;
+            }
+          } else {
+            // Single-line command
+            blocks.push({
+              content: line,
+              startLine: idx + 1,
+              endLine: idx + 1,
+              filename: scriptPath
+            });
+            idx++;
+          }
         }
       }
       
@@ -4498,10 +4544,14 @@ if (process.argv[2] === '-c' && process.argv[3]) {
     // Execute script
     (async () => {
       try {
-        const blocks = parseScriptBlocks(lines);
+        const blocks = await parseScriptBlocks(lines);
         for (const block of blocks) {
           if (block.content && block.content.trim()) {
             await executeControlFlow(block.content, block);
+          }
+          // Clean up heredoc temp files
+          if (block._heredocTmpFile) {
+            try { fs.unlinkSync(block._heredocTmpFile); } catch (e) {}
           }
         }
       } catch (e) {
