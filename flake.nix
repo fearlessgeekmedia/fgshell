@@ -14,7 +14,7 @@
       {
         packages.default = pkgs.stdenv.mkDerivation {
           name = "fgshell";
-          version = "0.1.0";
+          version = "0.0.2a";
           
           src = builtins.filterSource
             (path: type:
@@ -46,20 +46,30 @@
             
             # Build native job control library
             bash build-ptctl.sh
-            
-            # Build the shell
-            bun build-fgsh.js
           '';
           
           installPhase = ''
-            mkdir -p $out/bin
-            if [ -f fgsh ]; then
-              cp fgsh $out/bin/fgsh
-              chmod +x $out/bin/fgsh
-            else
-              echo "ERROR: fgsh binary not built"
-              exit 1
-            fi
+            mkdir -p $out/bin $out/lib
+            
+            # Copy the fgshell.js source and all dependencies
+            cp src/fgshell.js $out/lib/
+            cp -r src/*.js $out/lib/ 2>/dev/null || true
+            cp -r node_modules $out/lib/
+            cp -r fakehome $out/lib/ 2>/dev/null || true
+            cp *.node $out/lib/ 2>/dev/null || true
+            cp *.so $out/lib/ 2>/dev/null || true
+            
+            # Create bash wrapper script that uses bun to run fgshell.js
+            cat > $out/bin/fgsh << WRAPPER
+            #!${pkgs.bash}/bin/bash
+            LIBDIR="\$( dirname "\$(readlink -f "\$0")")/../lib"
+            cd "\$LIBDIR"
+            exec ${pkgs.bun}/bin/bun ./fgshell.js "\$@"
+            WRAPPER
+            chmod +x $out/bin/fgsh
+            
+            # Copy package.json to lib so version can be read
+            cp package.json $out/lib/
           '';
           
           meta = {

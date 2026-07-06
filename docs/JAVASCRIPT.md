@@ -178,6 +178,52 @@ The shell will show a `>` continuation prompt while waiting for the closing quot
 
 For more complex examples, see [example-multiline-js.sh](../example-multiline-js.sh).
 
+## Quoting and Escaping
+
+When passing JavaScript code to the `js` command, you need to be careful with quotes and escaping. Here are the common patterns:
+
+### Double-quoted strings (simplest for most cases)
+
+Use double quotes for the outer shell string. Inside the JavaScript code, use single quotes for strings, and escape any double quotes with backslashes:
+
+```bash
+js "console.log('Hello, world')"
+js "console.log('I\'m on the Mexican radio.')"
+js "console.log(\"quoted text\")"
+```
+
+### Single-quoted strings (for code with many double quotes)
+
+Use single quotes for the outer shell string. Inside the JavaScript code, use double quotes freely:
+
+```bash
+js 'console.log("Hello, world")'
+js 'console.log("I\'m on the Mexican radio.")'
+```
+
+Note: Single quotes in JavaScript strings still need to be escaped with a backslash when inside single-quoted shell strings.
+
+### When NOT to use backslash escapes
+
+Don't try to escape quotes using only backslashes in single-quoted shell strings:
+
+```bash
+# ✗ This doesn't work - the backslash is literal
+js 'console.log("I\'m fine")'  # Wrong!
+
+# ✓ Use this instead - double-quote the outer string
+js "console.log('I\'m fine')"  # Correct!
+```
+
+### Quick reference
+
+| Situation | Solution |
+|-----------|----------|
+| JavaScript with single quotes | `js "console.log('hello')"` |
+| JavaScript with double quotes | `js 'console.log("hello")'` |
+| JavaScript with apostrophes | `js "console.log('I\'m here')"` |
+| JavaScript with both quote types | Break it into separate lines or variables |
+
 ## Tips
 
 - Use `console.log()` for output, not bare expressions (though simple values will print)

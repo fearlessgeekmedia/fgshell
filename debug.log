@@ -1,0 +1,47 @@
+[DEBUG] Loaded 14 history entries from database
+ddddddddddddddc  ,cc:
+ddddddddddddddc  ,cc:
+ddddddddddddddd  ,cc:
+ddddddddddddl:'  ,cc:
+dddddddddl'    ..;cc:
+dddddddo.   ,:cccccc:
+ddddddl   ,ccc:'''''
+dddddo.  ;ccc.          ............
+        .ccc.           cccccccccccc
+......  .ccc.          .ccc'''''''''
+OOOOOk.  ;ccc.        .ccc;   ......
+OOOOOOd   'ccc:,....,:ccc'   coooooo
+OOOOOOOx.   ':cccccccc:'   .looooooo
+OOOOOOOOOd,     `'''`     .coooooooo
+OOOOOOOOOOOOdc,.    ..,coooooooooooo
+OOOOOOOOOOOOOOOO'  .oooooooooooooooo
+OOOOOOOOOOOOOOOO'  .oooooooooooooooo
+OOOOOOOOOOOOOOOO'  .oooooooooooooooo[1G[17A[40Cfearlessgeek@fearlesgeek
+[40C------------------------
+[40COS: Chimera Linux x86_64
+[40CHost: 82RK (IdeaPad 3 15IAU7)
+[40CKernel: Linux 6.18.2-0-generic
+[40CUptime: 16 hours, 9 mins
+[40CPackages: 837 (nix-user), 60 (nix-default), 2371 (apk), 17 (flatpak)
+[40CShell: fgsh
+[40CDisplay (AUO369F): 1920x1080 in 15", 60 Hz [Built-in]
+[40CWM: niri (Wayland)
+[40CTheme: adw-gtk3-dark [GTK2/3/4]
+[40CIcons: breeze-dark [GTK2/3/4]
+[40CFont: Noto Sans (10pt) [GTK2/3/4]
+[40CCursor: breeze (24px)
+[40CTerminal: kitty 0.44.0
+[40CTerminal Font: GohuFont11NFM (14pt)
+[40CCPU: 12th Gen Intel(R) Core(TM) i3-1215U (8) @ 4.40 GHz
+[40CGPU: Intel UHD Graphics @ 1.10 GHz [Integrated]
+[40CMemory: 1.82 GiB / 15.35 GiB (12%)
+[40CSwap: Disabled
+[40CDisk (/): 52.15 GiB / 435.90 GiB (12%) - ext4
+[40CLocal IP (wlp2s0): 10.105.12.69/23
+[40CBattery (L20C3PF0): 29% [Discharging]
+[40CLocale: C.UTF-8
+[40C
+[40C[40m   [41m   [42m   [43m   [44m   [45m   [46m   [47m   [m
+[40C[100m   [101m   [102m   [103m   [104m   [105m   [106m   [107m   [m
+[1;36mfearlessgeek[0m:[1;32mfgshell[0m > [DEBUG] Shell PGID: 10727, spawning: sleep
+[DEBUG] Child spawned PID: 10850

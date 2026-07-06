@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * fgshell - a simple interactive shell in Node.js
  *
@@ -9,7 +8,8 @@
  * - Builtins: cd, mkcd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf
  * - Environment variable expansion: $VAR
  * - Tab completion for files/dirs
- * - Basic job control and signal forwarding (SIGINT only after removal of SIGTSTP)
+ * - Job control with signal forwarding (SIGINT, SIGTSTP)
+ * - Ctrl+Z to suspend shell at prompt, foreground jobs receive SIGTSTP naturally
  * - Ctrl+N file picker: Navigate and select files/directories
  *
  * Save as file, chmod +x, run: ./fgsh
@@ -25,11 +25,43 @@ const minimist = require('minimist');
 const SHELL = require('./shell');
 const historyDB = require('./history-db');
 const outputFormatter = require('./output-formatter');
+
 let ptctl;
 try {
-  ptctl = require('./ptctl.node');
+  ptctl = require('./ptctl');
+  if (process.env.FGSH_DEBUG) {
+    if (!ptctl.available) {
+      console.error(`[DEBUG] ptctl unavailable: ${ptctl.error?.message || 'unknown error'}`);
+    } else {
+      console.error(`[DEBUG] ptctl loaded successfully`);
+    }
+  }
 } catch (e) {
+  console.error(`[DEBUG] Failed to load ptctl module: ${e.message}`);
   ptctl = { available: false };
+}
+
+// Load version from package.json at runtime
+let VERSION;
+try {
+  // Try multiple locations for package.json
+  const tryPaths = [
+    require('path').join(__dirname, 'package.json'),           // Same dir as this file
+    require('path').join(__dirname, '..', 'package.json'),     // Parent dir
+    require('path').join(__dirname, '..', '..', 'package.json') // Two levels up
+  ];
+  
+  let pkg = null;
+  for (const pkgPath of tryPaths) {
+    try {
+      pkg = JSON.parse(require('fs').readFileSync(pkgPath, 'utf8'));
+      break;
+    } catch (e) {}
+  }
+  
+  VERSION = pkg && pkg.version ? pkg.version : 'unknown';
+} catch (e) {
+  VERSION = 'unknown';
 }
 const help = {
   echo: `echo [-neE] [STRING]...
@@ -94,6 +126,12 @@ const help = {
   Exit status:
   Always successful (0) unless an error occurs reading the directory.
   `,
+  clear: `clear
+  Clear the terminal screen.
+
+  Exit status:
+  Always successful (0).
+  `,
   exit: `exit [n]
   Exit the shell with status n.
 
@@ -133,10 +171,15 @@ const help = {
   With no arguments, prints all environment variables.
   With NAME=VALUE, sets variables in the environment for a command.
 
+  Options:
+  --json               output as JSON
+  --yaml, --yml        output as YAML
+
   Examples:
   env                  # print all variables
   env PATH=/bin        # print current environment with modified PATH
   env -i TERM=xterm    # clear environment and set only TERM
+  env --json           # print as JSON
   `,
   jobs: `jobs [-lnprs] [JOBSPEC ...]
   Display the status of background jobs.
@@ -147,6 +190,8 @@ const help = {
   -p     list only process group IDs
   -r     show only running jobs
   -s     show only stopped jobs
+  --json               output as JSON
+  --yaml, --yml        output as YAML
 
   Exit status:
   Returns 0 unless an invalid option is supplied or JOBSPEC not found.
@@ -183,19 +228,19 @@ const help = {
   Exit status:
   Returns 0 unless an invalid JOBSPEC is given.
   `,
-  history: `history [-c] [-w] [-r] [FILENAME] or history [-n] [COUNT]
+  history: `history [QUERY]
   Display the command history.
 
-  With no options, displays the entire history with line numbers.
+  With no arguments, displays the entire history with line numbers.
+  With a QUERY, searches history using fuzzy matching.
 
   Options:
-  -c     clear the history list
-  -w     write history to FILENAME (or ~/.bash_history)
-  -r     read history from FILENAME (or ~/.bash_history)
-  -n N   display the last N commands
+  --json               output as JSON
+  --yaml, --yml        output as YAML
+  --help               show this help message
 
   Exit status:
-  Returns 0 unless an invalid option is supplied or file cannot be accessed.
+  Returns 0 unless an invalid option is supplied.
   `,
   ls: `ls [OPTION]... [FILE]...
   List information about files and directories.
@@ -218,6 +263,8 @@ const help = {
   --color[=WHEN]            colorize the output (auto, always, never)
   -G, --no-group            in long listing, don't print group names
   --full-time               show full date and time
+  --json                    output as JSON
+  --yaml, --yml             output as YAML
   --help                    display this help and exit
   --version                 output version information and exit
   `,
@@ -470,6 +517,35 @@ function writeOutput(text) {
 // Shell arrays storage
 const SHELL_ARRAYS = {};
 
+// Error formatting utility for better error messages with line numbers
+function formatError(message, context, sourceSnippet, includeStack) {
+  // context: { startLine, endLine, filename, content }
+  if (!context || !context.filename) {
+    return message;
+  }
+  
+  const basename = path.basename(context.filename);
+  let formatted = `${basename}:${context.startLine}`;
+  if (context.startLine !== context.endLine) {
+    formatted += `-${context.endLine}`;
+  }
+  formatted += `: error: ${message}`;
+  
+  // Add source snippet if available and context is provided
+  if (sourceSnippet && context.content) {
+    // Show just the first line of the content for inline errors
+    const firstLine = context.content.split('\n')[0];
+    formatted += `\n  ${firstLine}`;
+  }
+  
+  // Add call stack if requested
+  if (includeStack && CALL_STACK.length > 0) {
+    formatted += formatCallStack();
+  }
+  
+  return formatted;
+}
+
 let builtins;
 try {
   builtins = {
@@ -547,6 +623,14 @@ try {
       return 0;
     }
     console.log(SHELL.cwd);
+    return 0;
+  },
+  clear: function(args) {
+    if (args.includes('--help')) {
+      console.log(help.clear);
+      return 0;
+    }
+    console.clear();
     return 0;
   },
   exit: function(args) {
@@ -652,6 +736,7 @@ try {
     
     console.log(job.cmdline);
     job.background = false;
+    job.suspended = false;
     job.status = 'running';
 
     // If job was started with pty, re-attach it
@@ -696,22 +781,152 @@ try {
         }, 100);
       });
       
-      // After job is done, resume shell
+      // After job is done, restore shell terminal control
+      if (ptctl.available) {
+        try {
+          debug(`fg: Restoring terminal to shell PGID ${shellPgid}`);
+          ptctl.tcsetpgrp(0, shellPgid);
+        } catch (e) {
+          debug('fg: ptctl error restoring terminal:', e.message);
+        }
+      }
+      
+      // Resume shell
       if (rl.paused) {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(true);
+        }
         rl.resume();
-        prompt().catch(() => {});
       }
     } else {
-      // For non-pty jobs (background tasks), just bring them to foreground and wait
+      // For non-pty jobs (background/suspended tasks), resume and wait
       try {
+        // Pause readline first
+        rl.pause();
+        
+        // Disable raw mode so the resumed job can receive signals normally
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(false);
+        }
+        
+        // Give terminal control to the job's process group
+        if (ptctl.available && job.pids && job.pids.length > 0) {
+          try {
+            const jobPgid = ptctl.getpgid(job.pids[0]);
+            debug(`fg: Setting terminal to job PGID ${jobPgid}`);
+            
+            // Retry a few times to handle potential race condition
+            let retries = 0;
+            while (retries < 10) {
+              try {
+                ptctl.tcsetpgrp(0, jobPgid);
+                break;
+              } catch (e) {
+                retries++;
+                const start = Date.now(); while(Date.now() - start < 1);
+              }
+            }
+          } catch (e) {
+            debug('fg: ptctl error setting terminal:', e.message);
+          }
+        }
+
+        // Ensure terminal settings are correct for signals
+        if (ptctl.available) {
+          try { ptctl.enable_signals(0); } catch(e) {}
+        }
+
         for (const pid of job.pids) {
+          debug(`fg: Sending SIGCONT to PID ${pid}`);
           process.kill(pid, 'SIGCONT');
         }
       } catch(e) {
         console.error('fg:', e.message);
+        
+        // Restore terminal before returning
+        if (ptctl.available) {
+          try {
+            ptctl.tcsetpgrp(0, shellPgid);
+          } catch(e) {}
+        }
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return 1;
       }
-      await waitForJob(job);
+      
+      // Wait for job to complete or stop again
+      await new Promise((resolve) => {
+        let isDone = false;
+        
+        const cleanup = () => {
+          if (isDone) return;
+          isDone = true;
+          clearInterval(checkStatus);
+          
+          // Restore terminal to shell
+          if (ptctl.available) {
+            try {
+              ptctl.tcsetpgrp(0, shellPgid);
+            } catch (e) {}
+           }
+           
+               // Resume readline
+            if (rl.paused) {
+              if (process.stdin.isTTY && process.stdin.setRawMode) {
+                process.stdin.setRawMode(true);
+              }
+              rl.resume();
+              rl.line = '';
+              rl.cursor = 0;
+            }
+            resolve();
+         };
+
+        // Polling loop to detect if child stopped (SIGTSTP) or finished
+        const checkStatus = setInterval(() => {
+          if (isDone) return;
+          
+          // Check if job still exists in SHELL.jobs
+          const currentJob = SHELL.jobs.find(j => j.id === job.id);
+          if (!currentJob) {
+            cleanup();
+            return;
+          }
+
+          try {
+            // Check process state via /proc
+            const pid = job.pids[0];
+            const statFile = `/proc/${pid}/stat`;
+            if (fs.existsSync(statFile)) {
+              const stat = fs.readFileSync(statFile, 'utf8');
+              const parts = stat.split(' ');
+              const state = parts[2];
+              
+              if (state === 'T') {
+                if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Detected job ${job.id} stopped (state T)`);
+                job.status = 'stopped';
+                job.suspended = true;
+                console.log(`\n[${job.id}]+ Stopped\t${job.cmdline}`);
+                cleanup();
+              }
+            } else {
+              // Process gone
+              markJobDone(job);
+              cleanup();
+            }
+          } catch (e) {
+            // Might have exited between checks
+            markJobDone(job);
+            cleanup();
+          }
+        }, 100);
+      });
+      
+      return 0;
     }
     return 0;
   },
@@ -1637,15 +1852,24 @@ let filePickerResolve = null; // Promise resolver for file picker
 let commandStartTime = 0; // Track when command started for duration calculation
 
 // Shell process group control (for job control with Ctrl+Z)
-let shellPgid = process.pid;
+ let shellPgid = process.pid;
 if (ptctl.available) {
   try {
     // Make shell its own process group leader (pgid = 0 means use own PID)
     ptctl.setpgid(0, 0);
     shellPgid = ptctl.getpgrp();
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Shell PGID: ${shellPgid}`);
   } catch (e) {
     debug('Failed to set shell process group:', e.message);
     shellPgid = process.pid;
+  }
+  
+  try {
+    ptctl.tcsetpgrp(0, shellPgid);
+    ptctl.enable_signals(0);
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Claimed terminal for shell PGID ${shellPgid}`);
+  } catch (e) {
+    debug('Failed to claim terminal:', e.message);
   }
 }
 
@@ -1659,6 +1883,7 @@ let rl = readline.createInterface({
   completer: completer,
   terminal: isLoginShell && (!process.argv[2] || process.argv[2] === '-c'),  // Only terminal mode in interactive TTY
   historySize: 1000,
+  handleSIGTSTP: false,  // Handle SIGTSTP ourselves for job control
 });
 
 function isPickerNavKey(key) {
@@ -1714,7 +1939,7 @@ function completer(line) {
 }
 
 // ---------------------- Parsing ----------------------
-function tokenize(input) {
+function tokenize(input, preserveQuotes) {
   // returns array of tokens (not handling pipes/redir specially here)
   const tokens = [];
   let i = 0;
@@ -1725,11 +1950,16 @@ function tokenize(input) {
     const ch = input[i];
     // Handle quote modes first (they disable escape processing)
     if (state === 'single') {
-      if (ch === "'") state = 'normal';
+      if (ch === "'") {
+        if (preserveQuotes) cur += ch;
+        state = 'normal';
+      }
       else cur += ch;
     } else if (state === 'double') {
-      if (ch === '"') state = 'normal';
-      else if (ch === '$') {
+      if (ch === '"') {
+        if (preserveQuotes) cur += ch;
+        state = 'normal';
+      } else if (ch === '$') {
         // leave $ as is for expansion phase
         cur += ch;
       } else cur += ch;
@@ -1740,8 +1970,10 @@ function tokenize(input) {
       // Escape character (only in normal or double-quote mode)
       state = 'esc';
     } else if (ch === "'") {
+      if (preserveQuotes) cur += ch;
       state = 'single';
     } else if (ch === '"') {
+      if (preserveQuotes) cur += ch;
       state = 'double';
     } else if (/\s/.test(ch)) {
       if (cur !== '') {
@@ -1820,19 +2052,32 @@ function expandVars(str) {
   }
   
   // handle $((arithmetic)) expansion
-  str = str.replace(/\$\(\(([^)]+)\)\)/g, (_, expr) => {
-    try {
-      // Replace variable references with their values
-      const expandedExpr = expr.replace(/([A-Za-z_]\w*)/g, (match) => {
-        return (match in SHELL.env) ? SHELL.env[match] : '0';
-      });
-      // Evaluate the expression
-      const result = Function('"use strict"; return (' + expandedExpr + ')')();
-      return result.toString();
-    } catch (e) {
-      return '0';
+  let arithMatch;
+  while ((arithMatch = str.match(/\$\(\(/)) !== null) {
+    if (process.env.FGSH_DEBUG) console.error('[DEBUG ARITH] match at', arithMatch.index);
+    const start = arithMatch.index + 3;
+    let depth = 0;
+    let i = start;
+    while (i < str.length) {
+      if (str[i] === '(') depth++;
+      else if (str[i] === ')') {
+        if (depth === 0 && i + 1 < str.length && str[i + 1] === ')') {
+          const expr = str.slice(start, i);
+          try {
+            const expandedExpr = expr.replace(/([A-Za-z_]\w*)/g, (m) => (m in SHELL.env) ? SHELL.env[m] : '0');
+            const result = Function('"use strict"; return (' + expandedExpr + ')')();
+            str = str.slice(0, arithMatch.index) + result.toString() + str.slice(i + 2);
+          } catch (e) {
+            str = str.slice(0, arithMatch.index) + '0' + str.slice(i + 2);
+          }
+          break;
+        }
+        depth--;
+      }
+      i++;
     }
-  });
+    if (i >= str.length) break;
+  }
   
   // handle ${VAR} and $VAR, including array access ${ARR[i]}, ${ARR[@]}, etc.
   return str.replace(/\$(\w+(?:\[[^\]]*\])?|\{([^}]+)\})/g, (match, a, b) => {
@@ -1869,17 +2114,15 @@ function expandVars(str) {
 
 // expand $(command) - command substitution
 async function expandCommandSubstitution(str) {
-  // Find all $(...) patterns
-  const regex = /\$\(([^)]+)\)/g;
-  let result = str;
-  let match;
-  
   const matches = [];
+  const regex = /\$\(([^(][^)]*)\)/g;
+  let match;
+  let result = str;
+  
   while ((match = regex.exec(str)) !== null) {
     matches.push({ full: match[0], cmd: match[1], index: match.index });
   }
   
-  // Execute each command and replace from right to left to preserve indices
   for (let i = matches.length - 1; i >= 0; i--) {
     const m = matches[i];
     const output = await executeSubshellCommand(m.cmd);
@@ -1993,6 +2236,98 @@ function waitForJob(job) {
   }).then(() => 0);
 }
 
+// ---------------------- History Expansion ----------------------
+function resolveHistoryExpansion(input) {
+  if (!input.includes('!')) return input;
+  const lines = [];
+  let i = 0;
+  let state = null;
+  let cur = '';
+  while (i < input.length) {
+    const ch = input[i];
+    if (state === 'single') {
+      cur += ch;
+      if (ch === "'") state = null;
+    } else if (state === 'double') {
+      cur += ch;
+      if (ch === '"') state = null;
+    } else if (ch === "'") {
+      cur += ch;
+      state = 'single';
+    } else if (ch === '"') {
+      cur += ch;
+      state = 'double';
+    } else if (ch === '\\') {
+      cur += ch;
+      i++;
+      if (i < input.length) cur += input[i];
+    } else if (ch === '!') {
+      const start = cur.length;
+      i++;
+      if (i < input.length && input[i] === '!') {
+        const last = SHELL.history.length > 0 ? SHELL.history[SHELL.history.length - 1] : '';
+        cur += last;
+        i++;
+      } else if (i < input.length && input[i] === '$') {
+        const last = SHELL.history.length > 0 ? SHELL.history[SHELL.history.length - 1] : '';
+        const parts = last.trim().split(/\s+/);
+        const arg = parts.length > 1 ? parts[parts.length - 1] : last;
+        cur += arg;
+        i++;
+      } else if (i < input.length && input[i] === '^') {
+        const last = SHELL.history.length > 0 ? SHELL.history[SHELL.history.length - 1] : '';
+        const parts = last.trim().split(/\s+/);
+        const arg = parts.length > 1 ? parts[1] : last;
+        cur += arg;
+        i++;
+      } else {
+        let num = '';
+        let neg = false;
+        if (i < input.length && input[i] === '-') { neg = true; i++; }
+        while (i < input.length && /[0-9]/.test(input[i])) {
+          num += input[i];
+          i++;
+        }
+        if (num) {
+          const idx = neg ? SHELL.history.length - parseInt(num, 10) : parseInt(num, 10) - 1;
+          cur += (SHELL.history[idx] || '');
+        } else {
+          let prefix = '';
+          let contains = false;
+          if (i < input.length && input[i] === '?') {
+            contains = true;
+            i++;
+            while (i < input.length && input[i] !== '?') {
+              prefix += input[i];
+              i++;
+            }
+            if (i < input.length) i++;
+          } else {
+            while (i < input.length && /[A-Za-z0-9_\-]/.test(input[i])) {
+              prefix += input[i];
+              i++;
+            }
+          }
+          const match = SHELL.history.slice().reverse().find(cmd => {
+            if (contains) return cmd.includes(prefix);
+            return cmd.startsWith(prefix);
+          });
+          cur += match || '';
+        }
+      }
+    } else {
+      cur += ch;
+    }
+    i++;
+    if (ch === ';' && !state) {
+      lines.push(cur);
+      cur = '';
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.join(';');
+}
+
 // ---------------------- Execution ----------------------
 async function runLine(line) {
   line = line.trim();
@@ -2000,19 +2335,12 @@ async function runLine(line) {
     return;
   }
   
-  const isBuiltinCommand = !line.startsWith('history') && !line.startsWith('exit');
-  if (isBuiltinCommand) {
-    SHELL.history.push(line);
-    if (rl.history) {
-      rl.history.push(line);
-    }
-  }
-  
   commandStartTime = Date.now();
   
   // Parse line for control flow structures and execute
   await executeControlFlow(line);
   
+  const isBuiltinCommand = !line.startsWith('history') && !line.startsWith('exit');
   // Record to history DB (but not commands from .fgshrc)
   if (isBuiltinCommand && !isLoadingRcFile) {
     const duration = Date.now() - commandStartTime;
@@ -2074,25 +2402,54 @@ const SHELL_FUNCTIONS = {};
 // Trap handlers
 const SHELL_TRAPS = {};
 
+// Call stack for error reporting
+const CALL_STACK = [];
+function pushCallFrame(funcName, context) {
+  CALL_STACK.push({
+    type: 'function',
+    name: funcName,
+    context: context || {}
+  });
+}
+function popCallFrame() {
+  CALL_STACK.pop();
+}
+function formatCallStack() {
+  if (CALL_STACK.length === 0) return '';
+  let stack = '\nCall stack:\n';
+  for (let i = CALL_STACK.length - 1; i >= 0; i--) {
+    const frame = CALL_STACK[i];
+    const ctx = frame.context;
+    if (ctx && ctx.filename) {
+      stack += `  at ${frame.name}() (${ctx.filename}:${ctx.startLine})\n`;
+    } else {
+      stack += `  at ${frame.name}()\n`;
+    }
+  }
+  return stack;
+}
+
 // Execute control flow (handles if, while, for, &&, ||, case, etc.)
-async function executeControlFlow(line) {
+async function executeControlFlow(line, context) {
+  // context: { startLine, endLine, filename, content }
   const trimmed = line.trim();
+  if (!trimmed) return;
   
   // Check for multi-line control structures first
   if (trimmed.startsWith('if ')) {
-    await executeIf(line);
+    await executeIf(line, context);
     return;
   } else if (trimmed.startsWith('while ')) {
-    await executeWhile(line);
+    await executeWhile(line, context);
     return;
   } else if (trimmed.startsWith('for ')) {
-    await executeFor(line);
+    await executeFor(line, context);
     return;
   } else if (trimmed.startsWith('case ')) {
-    await executeCase(line);
+    await executeCase(line, context);
     return;
   } else if (trimmed.startsWith('function ') || trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/)) {
-    await defineFunctionLine(line);
+    await defineFunctionLine(line, context);
     return;
   }
   
@@ -2102,7 +2459,7 @@ async function executeControlFlow(line) {
     for (let i = 0; i < logicalChain.length; i++) {
       const { command, operator } = logicalChain[i];
       // Recursively call executeControlFlow to handle nested control structures
-      await executeControlFlow(command);
+      await executeControlFlow(command, context);
       
       if (operator === '&&' && SHELL.lastExitCode !== 0) {
         // Stop execution chain
@@ -2125,7 +2482,7 @@ async function executeControlFlow(line) {
       // Skip braces (handled in block parsing)
       continue;
     } else {
-      await runSingle(seqTrimmed);
+      await runSingle(seqTrimmed, context);
     }
   }
 }
@@ -2175,10 +2532,11 @@ function parseLogicalChain(line) {
 }
 
 // Execute if statement
-async function executeIf(line) {
+async function executeIf(line, context) {
   const ifMatch = line.match(/^if\s+(.*?)\s*[;]?\s*then\s*([\s\S]*)/i);
   if (!ifMatch) {
-    console.error('if: syntax error');
+    const errMsg = formatError('if: syntax error - expected "then"', context, true);
+    console.error(errMsg || 'if: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2204,26 +2562,27 @@ async function executeIf(line) {
   }
   
   // Evaluate condition
-  await runSingle(condition);
+  await runSingle(condition, context);
   
   if (SHELL.lastExitCode === 0) {
     const statements = thenBody.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   } else if (elseBody.trim()) {
     const statements = elseBody.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   }
 }
 
 // Execute while loop
-async function executeWhile(line) {
+async function executeWhile(line, context) {
   const whileMatch = line.match(/^while\s+(.*?)\s*[;]?\s*do\s*([\s\S]*)/i);
   if (!whileMatch) {
-    console.error('while: syntax error');
+    const errMsg = formatError('while: syntax error - expected "do"', context, true);
+    console.error(errMsg || 'while: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2241,25 +2600,25 @@ async function executeWhile(line) {
   
   // Execute loop
   while (true) {
-    await runSingle(condition);
+    await runSingle(condition, context);
     if (SHELL.lastExitCode !== 0) break;
     
     const statements = body.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   }
 }
 
 // Execute for loop (for var in list or for ((init; cond; incr)))
-async function executeFor(line) {
+async function executeFor(line, context) {
   // C-style for loop: for ((i=0; i<10; i++))
   const cStyleMatch = line.match(/^for\s*\(\s*(.+?);(.+?);(.+?)\s*\)\s*do\s*([\s\S]*)/i);
   if (cStyleMatch) {
     const [, init, cond, incr, rest] = cStyleMatch;
     
     // Execute init
-    await runSingle(init.trim());
+    await runSingle(init.trim(), context);
     
     let body = '';
     const lines = rest.split('\n');
@@ -2272,16 +2631,16 @@ async function executeFor(line) {
     // Execute loop
     while (true) {
       // Evaluate condition
-      await runSingle(`[ ${cond.trim()} ]`);
+      await runSingle(`[ ${cond.trim()} ]`, context);
       if (SHELL.lastExitCode !== 0) break;
       
       const statements = body.split('\n').filter(l => l.trim());
       for (const stmt of statements) {
-        await executeControlFlow(stmt);
+        await executeControlFlow(stmt, context);
       }
       
       // Execute increment
-      await runSingle(incr.trim());
+      await runSingle(incr.trim(), context);
     }
     return;
   }
@@ -2289,7 +2648,8 @@ async function executeFor(line) {
   // Traditional for-in loop: for var in list
   const forMatch = line.match(/^for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+(.*?)\s*[;]?\s*do\s*([\s\S]*)/i);
   if (!forMatch) {
-    console.error('for: syntax error');
+    const errMsg = formatError('for: syntax error - expected "in" and "do"', context, true);
+    console.error(errMsg || 'for: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2327,7 +2687,7 @@ async function executeFor(line) {
     
     const statements = body.split('\n').filter(l => l.trim());
     for (const stmt of statements) {
-      await executeControlFlow(stmt);
+      await executeControlFlow(stmt, context);
     }
   }
   
@@ -2335,10 +2695,11 @@ async function executeFor(line) {
 }
 
 // Execute case statement
-async function executeCase(line) {
+async function executeCase(line, context) {
   const caseMatch = line.match(/^case\s+(.+?)\s+in\s*([\s\S]*?)esac/i);
   if (!caseMatch) {
-    console.error('case: syntax error');
+    const errMsg = formatError('case: syntax error - expected "in" and "esac"', context, true);
+    console.error(errMsg || 'case: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2376,7 +2737,7 @@ async function executeCase(line) {
     if (matchPattern(expr, p.pattern)) {
       const statements = p.body.split('\n').filter(l => l.trim());
       for (const stmt of statements) {
-        await executeControlFlow(stmt);
+        await executeControlFlow(stmt, context);
       }
       break;
     }
@@ -2404,11 +2765,12 @@ function matchPattern(str, pattern) {
 }
 
 // Define a function
-async function defineFunctionLine(line) {
+async function defineFunctionLine(line, context) {
   // Parse function definition: function name { ... } or name() { ... }
   const funcMatch = line.match(/^(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\)\s*{/);
   if (!funcMatch) {
-    console.error('function: syntax error');
+    const errMsg = formatError('function: syntax error - expected "{ ... }"', context, true);
+    console.error(errMsg || 'function: syntax error');
     SHELL.lastExitCode = 1;
     return;
   }
@@ -2444,40 +2806,50 @@ async function defineFunctionLine(line) {
 }
 
 // Call a function
-async function callFunction(funcName, args) {
+async function callFunction(funcName, args, context) {
   if (!(funcName in SHELL_FUNCTIONS)) {
     return null; // Not a function
   }
   
   const func = SHELL_FUNCTIONS[funcName];
   
-  // Set up positional parameters ($1, $2, ...)
-  const savedParams = {};
-  for (let i = 1; i <= 9; i++) {
-    savedParams[`${i}`] = SHELL.env[i];
-  }
+  // Push call frame for stack traces
+  pushCallFrame(funcName, context);
   
-  // Set new parameters
-  for (let i = 0; i < args.length; i++) {
-    SHELL.env[`${i + 1}`] = args[i];
-  }
-  
-  // Execute function body
-  await executeControlFlow(func.body);
-  
-  // Restore parameters
-  for (let i = 1; i <= 9; i++) {
-    if (savedParams[`${i}`] !== undefined) {
-      SHELL.env[`${i}`] = savedParams[`${i}`];
-    } else {
-      delete SHELL.env[`${i}`];
+  try {
+    // Set up positional parameters ($1, $2, ...)
+    const savedParams = {};
+    for (let i = 1; i <= 9; i++) {
+      savedParams[`${i}`] = SHELL.env[i];
     }
+    
+    // Set new parameters
+    for (let i = 0; i < args.length; i++) {
+      SHELL.env[`${i + 1}`] = args[i];
+    }
+    
+    // Execute function body
+    await executeControlFlow(func.body, context);
+    
+    // Restore parameters
+    for (let i = 1; i <= 9; i++) {
+      if (savedParams[`${i}`] !== undefined) {
+        SHELL.env[`${i}`] = savedParams[`${i}`];
+      } else {
+        delete SHELL.env[`${i}`];
+      }
+    }
+    
+    return SHELL.lastExitCode;
+  } finally {
+    popCallFrame();
   }
-  
-  return SHELL.lastExitCode;
 }
 
 // Parse and execute here-documents
+const HEREDOC_TMP_PREFIX = 'fgsh-herodc-';
+let heredocCounter = 0;
+
 async function parseHereDocument(lines, startIdx) {
   // Look for <<EOF or <<'EOF' or <<-EOF patterns
   const line = lines[startIdx];
@@ -2495,10 +2867,14 @@ async function parseHereDocument(lines, startIdx) {
   while (i < lines.length) {
     const currentLine = lines[i];
     if (currentLine.trim() === delimiter) {
+      // Create a temp file with the heredoc content
+      const tmpFile = path.join(os.tmpdir(), HEREDOC_TMP_PREFIX + (++heredocCounter) + '.txt');
+      fs.writeFileSync(tmpFile, content, 'utf8');
       return {
         delimiter,
         content,
-        endIdx: i
+        endIdx: i,
+        tmpFile
       };
     }
     content += currentLine + '\n';
@@ -2524,7 +2900,24 @@ async function executeSubshell(cmd) {
   }
 }
 
-async function runSingle(line) {
+async function runSingle(line, context) {
+  // context: { startLine, endLine, filename, content } - optional, used for error reporting
+  
+  // Expand history shortcuts before tokenization so sequences like "a; !!" 
+  // see the history populated by earlier commands in the same line.
+  line = resolveHistoryExpansion(line);
+  
+  const trimmedLine = line.trim();
+  
+  // Track in history for history expansion (skip history/exit)
+  const isBuiltinCommand = !trimmedLine.startsWith('history') && !trimmedLine.startsWith('exit');
+  if (isBuiltinCommand && trimmedLine) {
+    if (rl && rl.history) {
+      rl.history.push(trimmedLine);
+    }
+    SHELL.history.push(trimmedLine);
+  }
+  
   try {
     // Check for array assignment (arr=(values))
     const arrayMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\((.*)\)$/);
@@ -2552,6 +2945,9 @@ async function runSingle(line) {
     // First expand command substitutions
     line = await expandCommandSubstitution(line);
     
+    // Expand variables before tokenization so $((...)) stays together
+    line = expandVars(line);
+    
     let tokens = tokenize(line);
     if (tokens.length === 0) return;
     
@@ -2559,11 +2955,17 @@ async function runSingle(line) {
     if (tokens[0] in SHELL_FUNCTIONS) {
       const funcName = tokens[0];
       const funcArgs = tokens.slice(1);
-      const code = await callFunction(funcName, funcArgs);
+      const code = await callFunction(funcName, funcArgs, context);
       if (code !== null) {
         SHELL.lastExitCode = code;
         return;
       }
+    }
+    
+    // Re-tokenize with preserved quotes for js builtin so string literals
+    // inside code like console.log("hi") keep their quotes
+    if (tokens[0] === 'js') {
+      tokens = tokenize(line, true);
     }
     
     tokens = expandAliases(tokens);
@@ -2603,10 +3005,16 @@ function spawnCommand(cmd, args, options) {
   }
 }
 
+// Ignore SIGTTOU to allow background process group (the shell) to change terminal ownership
+process.on('SIGTTOU', () => {});
+process.on('SIGTTIN', () => {});
+
 async function executePipeline(cmds) {
   const n = cmds.length;
   const procs = [];
   let pids = [];
+  
+  if (process.env.FGSH_DEVEL) console.error(`[DEBUG] executePipeline called with ${n} command(s)`);
 
   for (let i = 0; i < n; i++) {
     const c = cmds[i];
@@ -2617,6 +3025,7 @@ async function executePipeline(cmds) {
     const args = argv.slice(1);
 
     const isInteractive = !c.stdin && !c.stdout && !c.background && n === 1 && !isLoadingRcFile;
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Command: ${command}, isInteractive=${isInteractive}`);
 
     let child;
     
@@ -2632,17 +3041,27 @@ async function executePipeline(cmds) {
     }
     
     if (isInteractive) {
-      // Check if executable exists first
       const exe = resolveExecutable(command);
       if (!exe) {
         console.error(`${command}: command not found`);
         SHELL.lastExitCode = 127;
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return;
       }
       
       // *** FIX FOR BLANK SCREEN ISSUE WITH TUI APPS LIKE NEOVIM ***
       
-      // 1. Pause readline to yield control of the TTY
+      // Disable raw mode so ctrl+z can be processed as a signal by the kernel
+      if (process.stdin.isTTY && process.stdin.setRawMode) {
+        process.stdin.setRawMode(false);
+      }
+      
+      // Pause readline so child gets exclusive control of stdin
       rl.pause();
       
       debug(`Shell PGID: ${shellPgid}, spawning: ${command}`);
@@ -2653,62 +3072,118 @@ async function executePipeline(cmds) {
       // Use 'detached: true' to create a new process group for the child
       // HOWEVER: sudo needs to stay attached to the TTY to read passwords from /dev/tty
       let childProcess;
-      let actualExe = exe;
-      let actualArgs = args;
       
-      // Check if this is a script that needs an interpreter
-      const scriptExecutor = getScriptExecutor(exe);
-      if (scriptExecutor) {
-        actualExe = scriptExecutor.interpreter;
-        actualArgs = [...scriptExecutor.args, ...args];
-      }
+       // Check if this is a script that needs an interpreter
+       const scriptExecutor = getScriptExecutor(exe);
+       let actualExe = exe;
+       let actualArgs = args;
+       if (scriptExecutor) {
+         actualExe = scriptExecutor.interpreter;
+         actualArgs = [...scriptExecutor.args, ...args];
+       }
+       
+       // Explicitly enable signals using native C function (termios)
+       // This ensures ISIG is set so the kernel generates SIGTSTP on Ctrl+Z
+       if (ptctl.available) {
+         try {
+           ptctl.enable_signals(0); // 0 = stdin
+           if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Enabled signals (ISIG) on stdin via ptctl`);
+         } catch (e) {
+           if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to enable signals via ptctl: ${e.message}`);
+         }
+       } else if (process.stdin.isTTY) {
+         // Fallback for when ptctl is not available (though it should be)
+         try {
+           if (process.stdin.setRawMode) process.stdin.setRawMode(false);
+         } catch (e) {}
+       }
       
-      try {
-        childProcess = spawn(actualExe, actualArgs, {
-          cwd: getAccessibleCwd(),
-          env: SHELL.env,
-          stdio: 'inherit', // *** CHANGED: Revert to 'inherit' for full TTY support ***
-          detached: command !== 'sudo',   // *** Don't detach sudo - it needs /dev/tty access ***
-        });
+        try {
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Spawning: ${actualExe} ${actualArgs.join(' ')}`);
+          childProcess = spawn(actualExe, actualArgs, {
+            cwd: getAccessibleCwd(),
+            env: SHELL.env,
+            stdio: 'inherit',
+          });
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child PID: ${childProcess.pid}`);
+
+          if (ptctl.available) {
+            try {
+              ptctl.setpgid(childProcess.pid, childProcess.pid);
+            } catch (e) {
+              debug('Error moving child to new process group:', e.message);
+            }
+            try {
+              const childPgid = ptctl.getpgid(childProcess.pid);
+              debug(`Setting terminal to child PGID ${childPgid}`);
+              ptctl.tcsetpgrp(0, childPgid);
+              ptctl.enable_signals(0);
+            } catch (e) {
+              debug('ptctl error setting terminal to child:', e.message);
+            }
+          }
       } catch (spawnErr) {
-        // Resume readline if spawn fails
-        rl.resume();
         console.error(`Error executing ${command}: ${spawnErr.message}`);
         SHELL.lastExitCode = 127;
+        
+        // Restore terminal to shell and resume readline
+        if (ptctl.available) {
+          try {
+            ptctl.tcsetpgrp(0, shellPgid);
+          } catch (e) {}
+        }
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return;
       }
 
       debug(`Child spawned PID: ${childProcess.pid}`);
-
-      // REMOVED: Manual raw mode setting and keypress handler that broke TUI apps.
-      
-      // 3. Set up proper job control if ptctl is available and process is detached
-      //    This allows Ctrl+Z to properly suspend the child without corrupting terminal state
-      //    (Note: sudo is not detached so it can access /dev/tty for password prompts)
-      if (ptctl.available && command !== 'sudo') {
-        try {
-          // Get the child's actual process group (created by detached: true)
-          const childPgid = ptctl.getpgid(childProcess.pid);
-          debug(`Child process group: ${childPgid}`);
-          
-          // Give terminal control to the child process group
-          ptctl.tcsetpgrp(1, childPgid); // fd 1 = stdout
-          const termFgpg = ptctl.tcgetpgrp(1);
-          debug(`Terminal foreground process group: ${termFgpg}`);
-        } catch (e) {
-          debug('ptctl job control setup error:', e.message);
-          // Continue anyway - TTY will still work without proper job control
-        }
-      }
       
       // Register job before waiting
       const cmdline = args.length ? [command, ...args].join(' ') : command;
       const job = addJob([childProcess.pid], cmdline, false);
       pids.push(childProcess.pid);
+      
+      // Track for SIGTSTP forwarding
+      currentChild = childProcess;
 
-      // Wait for process to exit
+      // Wait for process to exit or stop
       await new Promise((resolve) => {
+        let isDone = false;
+        
+        const cleanup = () => {
+           if (isDone) return;
+           isDone = true;
+            clearInterval(checkStatus);
+            
+                // Restore terminal to shell
+                if (ptctl.available) {
+                  try {
+                    ptctl.tcsetpgrp(0, shellPgid);
+                  } catch (e) {}
+                }
+                
+                // Resume readline
+                if (rl.paused) {
+                  if (process.stdin.isTTY && process.stdin.setRawMode) {
+                    process.stdin.setRawMode(true);
+                  }
+                  rl.resume();
+                  rl.line = '';
+                  rl.cursor = 0;
+                }
+            
+             currentChild = null;
+             resolve();
+          };
+
         childProcess.on('exit', (code, signal) => {
+          if (isDone) return;
+          if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Child exit event: code=${code}, signal=${signal}`);
           debug(`Child exited with code ${code}, signal ${signal}`);
           SHELL.lastExitCode = code || 0;
           
@@ -2717,30 +3192,11 @@ async function executePipeline(cmds) {
             markJobDone(job);
           }
           
-          // 4. Restore terminal control to the shell if ptctl is available and we transferred it
-          if (ptctl.available && command !== 'sudo') {
-            try {
-              debug(`Restoring terminal to shell PGID: ${shellPgid}`);
-              ptctl.tcsetpgrp(1, shellPgid); // Restore shell's process group to terminal
-              const termFgpg = ptctl.tcgetpgrp(1);
-              debug(`Terminal foreground process group after restore: ${termFgpg}`);
-            } catch (e) {
-              debug('ptctl restore error:', e.message);
-            }
-          }
-          
-          // 5. Resume readline after process exits
-          if (rl.paused) {
-            debug('Resuming readline');
-            rl.resume();
-            rl.line = '';
-            rl.cursor = 0;
-          }
-          
-          resolve();
+          cleanup();
         });
 
         childProcess.on('error', (err) => {
+          if (isDone) return;
           console.error(`Error executing ${command}:`, err.message);
           SHELL.lastExitCode = 1;
           
@@ -2749,15 +3205,38 @@ async function executePipeline(cmds) {
             markJobDone(job);
           }
           
-          if (rl.paused) {
-            rl.resume();
-          }
-          
-          resolve();
+          cleanup();
         });
+
+        // Polling loop to detect if child stopped (SIGTSTP)
+        const checkStatus = setInterval(() => {
+          if (isDone) return;
+          try {
+            const statFile = `/proc/${childProcess.pid}/stat`;
+            if (fs.existsSync(statFile)) {
+              const stat = fs.readFileSync(statFile, 'utf8');
+              const parts = stat.split(' ');
+              const state = parts[2];
+              
+              if (state === 'T') {
+                if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Detected child PID ${childProcess.pid} stopped (state T)`);
+                
+                const job = findJobByPid(childProcess.pid);
+                if (job) {
+                  job.status = 'stopped';
+                  job.suspended = true;
+                  console.log(`\n[${job.id}]+ Stopped\t${job.cmdline}`);
+                }
+                
+                cleanup();
+              }
+            }
+          } catch (e) {
+            // Process might have exited already
+          }
+        }, 100);
       });
       
-      await prompt();
       return;
       // *** END FIX ***
 
@@ -2812,6 +3291,12 @@ async function executePipeline(cmds) {
       if (!exe) {
         console.error(`${command}: command not found`);
         SHELL.lastExitCode = 127;
+        if (rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
+          rl.resume();
+        }
         return;
       }
       
@@ -2821,6 +3306,9 @@ async function executePipeline(cmds) {
         console.error(`Error executing ${command}: ${spawnErr.message}`);
         SHELL.lastExitCode = 127;
         if (isSingleCommand && rl.paused) {
+          if (process.stdin.isTTY && process.stdin.setRawMode) {
+            process.stdin.setRawMode(true);
+          }
           rl.resume();
         }
         return;
@@ -2877,8 +3365,10 @@ async function executePipeline(cmds) {
     
     // handle child exit
     child.on('exit', (code, signal) => {
-      // Resume readline for single commands
       if (child._resumeRl && rl.paused) {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(true);
+        }
         rl.resume();
       }
       const job = findJobByPid(child.pid);
@@ -2975,9 +3465,97 @@ process.on('SIGINT', () => {
   });
 });
 
+// Track current child process
+let currentChild = null;
+
+// Handle SIGTSTP: forward to child and let it suspend
+process.on('SIGTSTP', () => {
+  if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Shell received SIGTSTP`);
+  
+  if (currentChild && !currentChild.killed) {
+    const child = currentChild;
+    // Forward SIGTSTP to the child process directly
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Forwarding SIGTSTP to child PID ${child.pid}`);
+    try {
+      // Mark as suspended BEFORE sending signal to avoid race conditions with exit handler
+      child.suspended = true;
+      
+      process.kill(child.pid, 'SIGTSTP');
+      
+      const job = findJobByPid(child.pid);
+      if (job) {
+        job.status = 'stopped';
+        job.suspended = true;
+        // Move cursor to new line if we're in a terminal
+        if (process.stdout.isTTY) process.stdout.write('\n');
+        console.log(`[${job.id}]+ Stopped\t${job.cmdline}`);
+      }
+      
+      // Restore terminal to shell if ptctl is available
+      if (ptctl.available) {
+        try {
+          ptctl.tcsetpgrp(0, shellPgid);
+          if (process.env.FGSH_DEBUG) console.error('[DEBUG] tcsetpgrp to shell ok');
+        } catch (e) {
+          if (process.env.FGSH_DEBUG) console.error('[DEBUG] tcsetpgrp to shell failed:', e.message);
+        }
+      }
+      
+      // Resume readline so the shell can take input again
+      if (rl.paused) {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(true);
+        }
+        rl.resume();
+        rl.line = '';
+        rl.cursor = 0;
+      }
+      
+       // Clear current child tracking
+       currentChild = null;
+       
+       // Trigger resolution of the wait in executePipeline
+       if (child._resolve) {
+         child._resolve();
+       }
+    } catch (e) {
+      if (process.env.FGSH_DEVEL) console.error(`[DEBUG] Failed to forward SIGTSTP: ${e.message}`);
+    }
+  }
+  // Don't suspend the shell - let the child handle it
+});
+
 // reap children to update job table even if not foreground
 process.on('exit', () => {
+  if (process.stdin.isTTY && process.stdin.setRawMode) {
+    try {
+      process.stdin.setRawMode(false);
+    } catch (e) {}
+  }
   historyDB.closeDB();
+  // Clean up any remaining heredoc temp files
+  try {
+    const files = fs.readdirSync(os.tmpdir());
+    for (const file of files) {
+      if (file.startsWith(HEREDOC_TMP_PREFIX)) {
+        try { fs.unlinkSync(path.join(os.tmpdir(), file)); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+});
+
+// Clean up terminal raw mode on termination signals
+const terminationSignals = ['SIGTERM', 'SIGHUP', 'SIGQUIT'];
+terminationSignals.forEach(sig => {
+  process.on(sig, () => {
+    if (process.stdin.isTTY && process.stdin.setRawMode) {
+      try {
+        process.stdin.setRawMode(false);
+      } catch (e) {}
+    }
+    process.removeAllListeners(sig);
+    process.kill(process.pid, sig);
+  });
 });
 
 // Helper to read directory asynchronously without blocking
@@ -2997,120 +3575,264 @@ function readDirAsync(dirPath) {
     });
 }
 
+function getImageSupport() {
+  // Check SHELL.env first as it's the source of truth for the shell session
+  const term = (SHELL.env.TERM || process.env.TERM || '').toLowerCase();
+  const kittyId = SHELL.env.KITTY_WINDOW_ID || process.env.KITTY_WINDOW_ID;
+  
+  if (term.includes('kitty') || kittyId) return 'kitty';
+  return 'none';
+}
+
 // Helper to get preview text for a file (text or fallback)
 async function getFilePreview(filePath, maxLines = 20) {
   try {
-    const stat = await fs.promises.stat(filePath);
+    const resolvedPath = path.resolve(SHELL.cwd, filePath);
+    const stat = await fs.promises.stat(resolvedPath);
     if (stat.isDirectory()) {
-      return '[Directory]';
+      return { type: 'text', content: '[Directory]' };
     }
     
     const sizeStr = (stat.size / 1024).toFixed(1) + ' KB';
     
+    // Check for image
+    const ext = path.extname(resolvedPath).toLowerCase();
+    const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.ico'];
+    if (imageExts.includes(ext)) {
+      const support = getImageSupport();
+      if (support === 'kitty') {
+        // For Kitty, we'll read the file in renderFilePickerOverlay to send as data
+        return { type: 'image', protocol: 'kitty', path: resolvedPath, sizeStr };
+      }
+      return { type: 'text', content: '[Image: ' + sizeStr + ']' };
+    }
+    
     // Skip preview for very large files
     if (stat.size > 50000) {
-      return '[File: ' + sizeStr + ']';
+      return { type: 'text', content: '[File: ' + sizeStr + ']' };
     }
     
     // Skip known binary file extensions
-    const ext = path.extname(filePath).toLowerCase();
-    const binaryExts = ['.db', '.sqlite', '.sqlite3', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.pdf', '.zip', '.gz', '.tar', '.exe', '.bin', '.so', '.dylib', '.o', '.a', '.node'];
+    const binaryExts = ['.db', '.sqlite', '.sqlite3', '.pdf', '.zip', '.gz', '.tar', '.exe', '.bin', '.so', '.dylib', '.o', '.a', '.node'];
     if (binaryExts.includes(ext)) {
-      return '[Binary: ' + sizeStr + ']';
+      return { type: 'text', content: '[Binary: ' + sizeStr + ']' };
     }
     
     // Skip files that look like databases or binary
-    const baseName = path.basename(filePath);
+    const baseName = path.basename(resolvedPath);
     if (baseName.startsWith('.') && baseName.includes('history')) {
-      return '[Database: ' + sizeStr + ']';
+      return { type: 'text', content: '[Database: ' + sizeStr + ']' };
     }
     
     // Try to read as text
     try {
-      const content = await fs.promises.readFile(filePath, 'utf8');
+      const content = await fs.promises.readFile(resolvedPath, 'utf8');
       
       // Check if content looks binary (contains null bytes or control chars)
       if (content.indexOf('\0') !== -1 || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(content.slice(0, 1000))) {
-        return '[Binary: ' + sizeStr + ']';
+        return { type: 'text', content: '[Binary: ' + sizeStr + ']' };
       }
       
-      // It's text, show preview - strip any remaining escape sequences
+      // It's text
       const lines = content.split('\n').slice(0, maxLines);
-      return lines.map(l => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join('\n');
+      return { type: 'text', content: lines.map(l => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join('\n') };
     } catch (readErr) {
-      // Failed to read as text, likely binary
-      return '[Binary: ' + sizeStr + ']';
+      return { type: 'text', content: '[Binary: ' + sizeStr + ']' };
     }
   } catch (e) {
-    return '[Cannot read file]';
+    return { type: 'text', content: '[Cannot read file]' };
   }
 }
 
-function renderFilePickerOverlay() {
-  if (!isFilePickerActive || !filePickerState) return;
+let isPickerRendering = false;
+async function renderFilePickerOverlay() {
+  if (!isFilePickerActive || !filePickerState || isPickerRendering) return;
+  isPickerRendering = true;
 
-  const { files, selectedIndex, maxVisible, filterMode, filterQuery } = filePickerState;
-  const displayFiles = files;
-  const terminalCols = process.stdout.columns || 80;
+  try {
+    const { files, selectedIndex, filterMode, filterQuery } = filePickerState;
+    const displayFiles = files;
+    const terminalCols = process.stdout.columns || 80;
+    const terminalRows = process.stdout.rows || 24;
+    
+    // Recalculate maxVisible based on current terminal size
+    const maxVisible = Math.min(Math.floor(terminalRows * 0.6), terminalRows - 5);
 
-  // Clear previous overlay by moving cursor up and deleting lines
-  if (!filePickerState.firstRender && filePickerState.lastLineCount > 0) {
-    // Move up N lines and clear each
-    for (let i = 0; i < filePickerState.lastLineCount; i++) {
-      process.stdout.write('\x1b[A'); // Move cursor up
-      process.stdout.write('\x1b[K'); // Clear line
+    // Clear previous overlay by moving cursor up and deleting lines
+    if (!filePickerState.firstRender && filePickerState.lastLineCount > 0) {
+      // Move up N lines and clear each
+      for (let i = 0; i < filePickerState.lastLineCount; i++) {
+        process.stdout.write('\x1b[A'); // Move cursor up
+        process.stdout.write('\x1b[K'); // Clear line
+      }
+    } else if (filePickerState.firstRender) {
+      filePickerState.firstRender = false;
     }
-  } else if (filePickerState.firstRender) {
-    filePickerState.firstRender = false;
-  }
 
-  // Build output
-  let output = '';
-  let lineCount = 0;
-
-  const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
-  output += `\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`;
-  lineCount++;
-  
-  output += `(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`;
-  lineCount++;
-  
-  if (filterMode) {
-    output += `Filter: ${filterQuery}\n`;
-    lineCount++;
-  }
-  
-  output += '-'.repeat(Math.min(80, terminalCols)) + '\n';
-  lineCount++;
-
-  const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
-  const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
-
-  if (displayFiles.length === 0) {
-    output += '(no files)\n';
-    lineCount++;
-  } else {
-    for (let i = startIdx; i < endIdx; i++) {
-      const item = displayFiles[i];
-      const isSelected = i === selectedIndex;
-      const prefix = isSelected ? '> ' : '  ';
-      const icon = item.isDirectory ? '[D] ' : '[F] ';
-      let line = `${prefix}${icon} ${item.name}`;
-
-      if (line.length > terminalCols) {
-        line = line.slice(0, terminalCols - 1) + '...';
+    // Get preview for selected item
+    let previewLines = [];
+    let previewImage = null;
+    const selected = displayFiles[selectedIndex];
+    if (selected) {
+      if (selected.isDirectory) {
+        previewLines = ['[Directory]'];
+      } else {
+        const previewResult = await getFilePreview(selected.name, maxVisible);
+        if (previewResult.type === 'image') {
+          previewImage = previewResult;
+          previewLines = [`[Image: ${previewResult.sizeStr}]`];
+          // Fill remaining lines with empty strings to reserve space
+          while (previewLines.length < maxVisible) previewLines.push('');
+        } else {
+          const content = previewResult.content || previewResult;
+          if (typeof content === 'string') {
+            previewLines = content.split('\n').map(l => l.replace(/\t/g, '    '));
+          } else {
+             previewLines = ['[Error]'];
+          }
+        }
       }
-      if (isSelected) {
-        line = `\x1b[7m${line}\x1b[0m`;
-      }
-      output += line + '\n';
+    }
+
+    // Build output
+    let output = '';
+    let lineCount = 0;
+
+    const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
+    output += `\x1b[1mSelect file from ${SHELL.cwd}\x1b[0m${modeIndicator}\n`;
+    lineCount++;
+    
+    output += `(Ctrl+F: filter, arrows: navigate, Enter: select, Esc: cancel)\n`;
+    lineCount++;
+    
+    if (filterMode) {
+      output += `Filter: ${filterQuery}\n`;
       lineCount++;
     }
-  }
+    
+    output += '-'.repeat(Math.min(80, terminalCols)) + '\n';
+    lineCount++;
 
-  // Write all at once and track line count
-  process.stdout.write(output);
-  filePickerState.lastLineCount = lineCount;
+    const listWidth = Math.floor(terminalCols * 0.4);
+    const previewWidth = terminalCols - listWidth - 4; // 4 for margin/separator
+
+    const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
+    const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
+
+    if (displayFiles.length === 0) {
+      output += '(no files)\n';
+      lineCount++;
+    } else {
+      for (let i = 0; i < maxVisible; i++) {
+        let line = '';
+        const fileIdx = startIdx + i;
+        
+        // List part
+        if (fileIdx < endIdx) {
+          const item = displayFiles[fileIdx];
+          const isSelected = fileIdx === selectedIndex;
+          const prefix = isSelected ? '> ' : '  ';
+          const icon = item.isDirectory ? '[D] ' : '[F] ';
+          let fileName = item.name;
+          
+          let fileLine = `${prefix}${icon}${fileName}`;
+          if (fileLine.length > listWidth) {
+            fileLine = fileLine.slice(0, listWidth - 3) + '...';
+          } else {
+            fileLine = fileLine.padEnd(listWidth);
+          }
+          
+          if (isSelected) {
+            line += `\x1b[7m${fileLine}\x1b[0m`;
+          } else {
+            line += fileLine;
+          }
+        } else {
+          line += ' '.repeat(listWidth);
+        }
+
+        line += ' \x1b[90m│\x1b[0m '; // Separator
+
+        // Preview part
+        if (i < previewLines.length) {
+          let previewLine = previewLines[i];
+          if (previewLine.length > previewWidth) {
+            previewLine = previewLine.slice(0, previewWidth - 3) + '...';
+          }
+          line += previewLine;
+        }
+
+        output += line + '\n';
+        lineCount++;
+      }
+    }
+
+    // Write all at once and track line count
+    process.stdout.write(output);
+    
+    // Draw Image Overlays
+    if (previewImage) {
+      const headerHeight = 3 + (filterMode ? 1 : 0);
+      const moveUp = lineCount;
+      const moveDown = headerHeight;
+      const moveRight = listWidth + 3;
+      
+      // Save cursor
+      process.stdout.write('\x1b7');
+      
+      // Move to position
+      process.stdout.write(`\x1b[${moveUp}A`); // Go up to top
+      process.stdout.write(`\x1b[${moveDown}B`); // Go down past header
+      process.stdout.write(`\x1b[${moveRight}C`); // Go right
+      
+      if (previewImage.protocol === 'kitty') {
+        try {
+          // Read file and send as base64 inline data (t=d) to avoid path issues
+          const data = await fs.promises.readFile(previewImage.path);
+          const base64 = data.toString('base64');
+          const chunkSize = 4096;
+          let offset = 0;
+          let isFirstChunk = true;
+          
+          // Determine format
+          const ext = path.extname(previewImage.path).toLowerCase();
+          let formatParam = '';
+          if (ext === '.png') {
+            formatParam = ',f=100'; // f=100 is PNG
+          }
+          // JPG doesn't have a standard code in 't=d' mode usually, relying on raw data or other means,
+          // but for now we'll send without 'f' for others and hope Kitty auto-detects or handles it.
+          
+          while (offset < base64.length) {
+            const remaining = base64.length - offset;
+            const currentChunkSize = Math.min(remaining, chunkSize);
+            const chunk = base64.slice(offset, offset + currentChunkSize);
+            offset += currentChunkSize;
+            
+            const m = offset < base64.length ? 1 : 0;
+            
+            if (isFirstChunk) {
+               // a=T (transmit and display), t=d (direct), c/r (scale to cells)
+               // q=2 (quiet - suppress response)
+               process.stdout.write(`\x1b_Ga=T,t=d${formatParam},m=${m},c=${previewWidth},r=${maxVisible},q=2;${chunk}\x1b\\`);
+               isFirstChunk = false;
+            } else {
+               process.stdout.write(`\x1b_Gm=${m};${chunk}\x1b\\`);
+            }
+          }
+        } catch (e) {
+          // Failed to read or send, ignore
+        }
+      }
+      
+      // Restore cursor
+      process.stdout.write('\x1b8');
+    }
+
+    filePickerState.lastLineCount = lineCount;
+  } finally {
+    isPickerRendering = false;
+  }
 }
 
 function clearFilePickerOverlay() {
@@ -3129,7 +3851,7 @@ function clearFilePickerOverlay() {
   process.stdout.write('\x1b8'); // 4. Restore cursor (back to the prompt position)
 }
 
-function handleFilePickerKey(str, key) {
+async function handleFilePickerKey(str, key) {
   if (!filePickerState) return;
   const { files } = filePickerState;
 
@@ -3140,7 +3862,7 @@ function handleFilePickerKey(str, key) {
       filePickerState.filterQuery = '';
       filePickerState.files = [...filePickerState.allFiles];
       filePickerState.selectedIndex = 0;
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     
@@ -3169,7 +3891,7 @@ function handleFilePickerKey(str, key) {
         filePickerState.files = [...filePickerState.allFiles];
       }
       filePickerState.selectedIndex = 0;
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     
@@ -3178,14 +3900,17 @@ function handleFilePickerKey(str, key) {
       if (!selected) return;
       if (selected.isDirectory) {
         SHELL.cwd = path.resolve(SHELL.cwd, selected.name);
-        readDirAsync(SHELL.cwd).then(newFiles => {
+        try {
+          const newFiles = await readDirAsync(SHELL.cwd);
           filePickerState.files = newFiles;
           filePickerState.allFiles = newFiles;
           filePickerState.filterQuery = '';
           filePickerState.filterMode = false;
           filePickerState.selectedIndex = 0;
-          renderFilePickerOverlay();
-        });
+          await renderFilePickerOverlay();
+        } catch (e) {
+          // Handle error if directory cannot be read
+        }
       } else {
         if (filePickerResolve) filePickerResolve(selected.name);
       }
@@ -3216,7 +3941,7 @@ function handleFilePickerKey(str, key) {
         filePickerState.files = [...filePickerState.allFiles];
       }
       filePickerState.selectedIndex = 0;
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     
@@ -3226,7 +3951,7 @@ function handleFilePickerKey(str, key) {
       } else {
         filePickerState.selectedIndex = Math.min(files.length - 1, filePickerState.selectedIndex + 1);
       }
-      renderFilePickerOverlay();
+      await renderFilePickerOverlay();
       return;
     }
     return;
@@ -3242,39 +3967,45 @@ function handleFilePickerKey(str, key) {
     filePickerState.filterMode = true;
     filePickerState.filterQuery = '';
     filePickerState.allFiles = [...files];
-    renderFilePickerOverlay();
+    await renderFilePickerOverlay();
     return;
   }
 
   if (key.name === 'up') {
     filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
-    renderFilePickerOverlay();
+    await renderFilePickerOverlay();
   } else if (key.name === 'down') {
     filePickerState.selectedIndex = Math.min(filePickerState.files.length - 1, filePickerState.selectedIndex + 1);
-    renderFilePickerOverlay();
+    await renderFilePickerOverlay();
   } else if (key.name === 'left') {
     const parentDir = path.dirname(SHELL.cwd);
     if (parentDir !== SHELL.cwd) {
       SHELL.cwd = parentDir;
-      readDirAsync(SHELL.cwd).then(newFiles => {
+      try {
+        const newFiles = await readDirAsync(SHELL.cwd);
         filePickerState.files = newFiles;
         filePickerState.allFiles = newFiles;
         filePickerState.selectedIndex = 0;
-        renderFilePickerOverlay();
-      });
+        await renderFilePickerOverlay();
+      } catch (e) {
+        // Handle error
+      }
     }
   } else if (key.name === 'right' || key.name === 'return') {
     const selected = filePickerState.files[filePickerState.selectedIndex];
     if (!selected) return;
     if (selected.isDirectory) {
       SHELL.cwd = path.resolve(SHELL.cwd, selected.name);
-      readDirAsync(SHELL.cwd).then(newFiles => {
+      try {
+        const newFiles = await readDirAsync(SHELL.cwd);
         filePickerState.files = newFiles;
         filePickerState.allFiles = newFiles;
         filePickerState.filterQuery = '';
         filePickerState.selectedIndex = 0;
-        renderFilePickerOverlay();
-      });
+        await renderFilePickerOverlay();
+      } catch (e) {
+        // Handle error
+      }
     } else {
       if (filePickerResolve) filePickerResolve(selected.name);
     }
@@ -3319,7 +4050,7 @@ async function showFilePicker() {
       resolve(result);
     };
 
-    renderFilePickerOverlay();
+    renderFilePickerOverlay().catch(e => console.error('Picker render error:', e));
   });
 }
 
@@ -3477,7 +4208,7 @@ if (process.stdin.isTTY) {
   process.stdin.on('keypress', (str, key) => {
     // Route ALL input to file picker when active
     if (isFilePickerActive) {
-      handleFilePickerKey(str, key);
+      handleFilePickerKey(str, key).catch(e => console.error('Picker error:', e));
       return;
     }
 
@@ -3608,6 +4339,27 @@ function hasUnclosedQuotes(str) {
     i++;
   }
   return inSingle || inDouble;
+}
+
+// Handle --version and --help flags
+if (process.argv[2] === '--version' || process.argv[2] === '-v') {
+  console.log(`fgsh version ${VERSION}`);
+  process.exit(0);
+}
+
+if (process.argv[2] === '--help' || process.argv[2] === '-h') {
+  console.log('Usage: fgsh [OPTIONS] [SCRIPT] [-c COMMAND]');
+  console.log('');
+  console.log('A simple interactive shell in Node.js');
+  console.log('');
+  console.log('Options:');
+  console.log('  --version, -v     Display version information and exit');
+  console.log('  --help, -h        Display this help message and exit');
+  console.log('  -c COMMAND        Execute a command and exit');
+  console.log('  SCRIPT            Execute a shell script');
+  console.log('');
+  console.log('Interactive mode starts if no SCRIPT or -c is specified.');
+  process.exit(0);
 }
 
 // (not running a script or -c command)
@@ -3742,7 +4494,8 @@ if (process.argv[2] === '-c' && process.argv[3]) {
     rl.pause();
     
     // Parse script into blocks (handles multi-line control structures)
-    function parseScriptBlocks(lines) {
+    // Returns blocks with line number metadata
+    async function parseScriptBlocks(lines) {
       const blocks = [];
       let idx = 0;
       
@@ -3760,17 +4513,57 @@ if (process.argv[2] === '-c' && process.argv[3]) {
         if (trimmed.startsWith('if ') || trimmed.startsWith('while ') || 
             trimmed.startsWith('for ') || trimmed.startsWith('case ')) {
           const block = collectBlock(lines, idx);
-          blocks.push(block.content);
+          blocks.push({
+            content: block.content,
+            startLine: idx + 1,  // 1-indexed line numbers
+            endLine: block.endIdx + 1,
+            filename: scriptPath
+          });
           idx = block.endIdx + 1;
         } else if (trimmed.startsWith('function ') || trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/)) {
           // Function definition block
           const block = collectBlock(lines, idx);
-          blocks.push(block.content);
+          blocks.push({
+            content: block.content,
+            startLine: idx + 1,
+            endLine: block.endIdx + 1,
+            filename: scriptPath
+          });
           idx = block.endIdx + 1;
         } else {
-          // Single-line command
-          blocks.push(line);
-          idx++;
+          // Check for here-document
+          const heredocMatch = line.match(/<<\s*-?\s*([A-Za-z_][A-Za-z0-9_]*)/);
+          if (heredocMatch) {
+            const heredoc = await parseHereDocument(lines, idx);
+            if (heredoc) {
+              const commandLine = line.replace(/<<\s*-?\s*[A-Za-z_][A-Za-z0-9_]*/, heredoc.tmpFile);
+              blocks.push({
+                content: commandLine,
+                startLine: idx + 1,
+                endLine: heredoc.endIdx + 1,
+                filename: scriptPath,
+                _heredocTmpFile: heredoc.tmpFile
+              });
+              idx = heredoc.endIdx + 1;
+            } else {
+              blocks.push({
+                content: line,
+                startLine: idx + 1,
+                endLine: idx + 1,
+                filename: scriptPath
+              });
+              idx++;
+            }
+          } else {
+            // Single-line command
+            blocks.push({
+              content: line,
+              startLine: idx + 1,
+              endLine: idx + 1,
+              filename: scriptPath
+            });
+            idx++;
+          }
         }
       }
       
@@ -3833,10 +4626,14 @@ if (process.argv[2] === '-c' && process.argv[3]) {
     // Execute script
     (async () => {
       try {
-        const blocks = parseScriptBlocks(lines);
+        const blocks = await parseScriptBlocks(lines);
         for (const block of blocks) {
-          if (block.trim()) {
-            await executeControlFlow(block);
+          if (block.content && block.content.trim()) {
+            await executeControlFlow(block.content, block);
+          }
+          // Clean up heredoc temp files
+          if (block._heredocTmpFile) {
+            try { fs.unlinkSync(block._heredocTmpFile); } catch (e) {}
           }
         }
       } catch (e) {

@@ -6,7 +6,15 @@ let ptctl = null;
 let error = null;
 
 try {
-  const libPath = path.join(__dirname, '..', 'libptctl.so');
+  let libPath = path.join(__dirname, '..', 'libptctl.so');
+  // On macOS, also try .dylib
+  if (process.platform === 'darwin') {
+    const dylib = path.join(__dirname, '..', 'libptctl.dylib');
+    try {
+      require('fs').accessSync(dylib);
+      libPath = dylib;
+    } catch {}
+  }
   ptctl = dlopen(libPath, {
     ptctl_tcsetpgrp: {
       args: ['i32', 'i32'],
@@ -28,8 +36,20 @@ try {
       args: ['i32'],
       returns: 'i32',
     },
+    ptctl_setsid: {
+      args: [],
+      returns: 'i32',
+    },
     ptctl_get_errno: {
       args: [],
+      returns: 'i32',
+    },
+    ptctl_enable_signals: {
+      args: ['i32'],
+      returns: 'i32',
+    },
+    ptctl_acquire_tty: {
+      args: ['i32'],
       returns: 'i32',
     },
   });
@@ -42,6 +62,26 @@ module.exports = {
   available: ptctl !== null && error === null,
   error,
   
+  /**
+   * Acquire the terminal as the controlling terminal for the session
+   * @param {number} fd - File descriptor (usually 0 for stdin)
+   * @returns {number} 0 on success, -1 on error
+   */
+  acquire_tty(fd) {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_acquire_tty(fd);
+  },
+
+  /**
+   * Enable signal generation (ISIG), canonical mode (ICANON), and echo on the terminal
+   * @param {number} fd - File descriptor (usually 0 for stdin)
+   * @returns {number} 0 on success, -1 on error
+   */
+  enable_signals(fd) {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_enable_signals(fd);
+  },
+
   /**
    * Set the process group associated with terminal fd
    * @param {number} fd - File descriptor (usually 1 for stdout)
@@ -91,6 +131,15 @@ module.exports = {
   getpgid(pid) {
     if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
     return ptctl.symbols.ptctl_getpgid(pid);
+  },
+  
+  /**
+   * Create a new session (make this process a session leader)
+   * @returns {number} Session ID on success, -1 on error
+   */
+  setsid() {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_setsid();
   },
   
   /**

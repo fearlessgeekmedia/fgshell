@@ -1,6 +1,32 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <termios.h>
+
+/**
+ * Enable signal generation (ISIG), canonical mode (ICANON), and echo (ECHO) on the terminal
+ * Returns 0 on success, -1 on error
+ */
+int ptctl_enable_signals(int fd) {
+  struct termios t;
+  if (tcgetattr(fd, &t) < 0) return -1;
+  t.c_lflag |= ISIG;   // Enable signals (Ctrl+C, Ctrl+Z)
+  t.c_lflag |= ICANON; // Enable canonical mode
+  t.c_lflag |= ECHO;   // Enable echo
+  return tcsetattr(fd, TCSANOW, &t);
+}
+
+/**
+ * Acquire the terminal as the controlling terminal for the session
+ * Returns 0 on success, -1 on error
+ */
+int ptctl_acquire_tty(int fd) {
+#ifdef TIOCSCTTY
+  return ioctl(fd, TIOCSCTTY, 0);
+#else
+  return -1;
+#endif
+}
 
 /**
  * Set the process group associated with the terminal
@@ -40,6 +66,14 @@ int ptctl_getpgrp(void) {
  */
 int ptctl_getpgid(int pid) {
   return getpgid(pid);
+}
+
+/**
+ * Create a new session (session leader)
+ * Returns the new session ID on success, -1 on error
+ */
+pid_t ptctl_setsid(void) {
+  return setsid();
 }
 
 /**
