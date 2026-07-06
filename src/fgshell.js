@@ -864,12 +864,16 @@ try {
             } catch (e) {}
           }
           
-          // Resume readline
-          if (rl.paused) {
-            rl.resume();
-            rl.line = '';
-            rl.cursor = 0;
-          }
+              // Resume readline
+              if (rl.paused) {
+                rl.resume();
+                if (process.stdin.isTTY && process.stdin.setRawMode) {
+                  process.stdin.setRawMode(true);
+                }
+                prompt().catch(() => {});
+                rl.line = '';
+                rl.cursor = 0;
+              }
           resolve();
         };
 
@@ -3095,19 +3099,24 @@ async function executePipeline(cmds) {
           isDone = true;
           clearInterval(checkStatus);
           
-          // Restore terminal to shell
-          if (ptctl.available) {
-            try {
-              ptctl.tcsetpgrp(0, shellPgid);
-            } catch (e) {}
-          }
-          
-          // Resume readline
-          if (rl.paused) {
-            rl.resume();
-            rl.line = '';
-            rl.cursor = 0;
-          }
+            // Restore terminal to shell
+            if (ptctl.available) {
+              try {
+                ptctl.tcsetpgrp(0, shellPgid);
+                ptctl.enable_signals(0);
+              } catch (e) {}
+            }
+            
+              // Resume readline
+              if (rl.paused) {
+                rl.resume();
+                if (process.stdin.isTTY && process.stdin.setRawMode) {
+                  process.stdin.setRawMode(true);
+                }
+                prompt().catch(() => {});
+                rl.line = '';
+                rl.cursor = 0;
+              }
           
           currentChild = null;
           resolve();
