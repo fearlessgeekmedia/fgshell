@@ -1850,6 +1850,8 @@ let isFilePickerActive = false; // Track if file picker is active
 let filePickerState = null; // { files, selectedIndex, maxVisible }
 let filePickerResolve = null; // Promise resolver for file picker
 let commandStartTime = 0; // Track when command started for duration calculation
+let commandCache = null; // Cached command list for completer
+let commandCacheKeys = null;
 
 // Shell process group control (for job control with Ctrl+Z)
  let shellPgid = process.pid;
@@ -1923,16 +1925,112 @@ function debug(...args) {
   }
 }
 
+// Enhanced completer with Fuse.js fuzzy matching across history, builtins,
+// PATH executables, and filenames. Node.js readline only fires completion on
+// Tab press, so we maximize what that single interaction can do.
+function getCommandList() {
+  const now = Date.now();
+  if (commandCache && commandCacheKeys && (now - commandCache.ts < 5000)) {
+    return commandCache;
+  }
+
+  const names = new Set();
+  if (builtins && typeof builtins === 'object') {
+    for (const k of Object.keys(builtins)) names.add(k);
+  }
+  for (const k of Object.keys(SHELL.aliases || {})) names.add(k);
+  const PATH = (SHELL.env.PATH || process.env.PATH || '/usr/bin:/bin').split(':');
+  for (const p of PATH) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      for (const entry of fs.readdirSync(p)) {
+        if (entry.startsWith('.')) continue;
+        try {
+          if (fs.statSync(path.join(p, entry)).isFile()) names.add(entry);
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+
+  commandCacheKeys = Array.from(names);
+  commandCache = { keys: commandCacheKeys, ts: now };
+  return commandCache;
+}
+
+function fuzzyMatchFuse(items, query, keys, threshold = 0.4, limit = 50) {
+  if (!items || items.length === 0) return [];
+  const Fuse = require('fuse.js');
+  const fuse = new Fuse(items, {
+    keys: keys,
+    threshold: threshold,
+    ignoreFieldNorm: false,
+    useExtendedScoring: true,
+  });
+  const results = fuse.search(query);
+  return results.slice(0, limit).map(r => r.item);
+}
+
 function completer(line) {
-  // simple completion: complete filenames in cwd or after space complete nothing fancy.
   try {
     const parts = line.split(/\s+/);
-    const last = parts[parts.length - 1];
+    const last = parts[parts.length - 1] || '';
+    const isStartOfToken = line === '' || /\s$/.test(line);
+
+    if (isStartOfToken || last === '') {
+      // Start of a new token: suggest commands + history + filenames.
+      const query = last;
+      const seen = new Set();
+      const results = [];
+
+      // 1. History fuzzy match (most valuable - what you've actually typed)
+      try {
+        const histEntries = historyDB.getAll(1000);
+        if (histEntries && histEntries.length > 0) {
+          const histItems = histEntries.map(e => e.command);
+          const histMatches = fuzzyMatchFuse(histItems, query, ['command'], 0.45, 30);
+          for (const m of histMatches) {
+            if (!seen.has(m)) { seen.add(m); results.push(m); }
+          }
+        }
+      } catch (e) {}
+
+      // 2. Command fuzzy match (builtins + aliases + PATH executables)
+      try {
+        const cmdInfo = getCommandList();
+        const cmdMatches = fuzzyMatchFuse(cmdInfo.keys, query, ['key'], 0.4, 30);
+        for (const m of cmdMatches) {
+          if (!seen.has(m)) { seen.add(m); results.push(m); }
+        }
+      } catch (e) {}
+
+      // 3. Filename fuzzy match in cwd
+      try {
+        const list = fs.readdirSync(SHELL.cwd);
+        const fileMatches = fuzzyMatchFuse(list, query, ['name'], 0.4, 30);
+        for (const m of fileMatches) {
+          if (!seen.has(m)) { seen.add(m); results.push(m); }
+        }
+      } catch (e) {}
+
+      const unique = results.slice(0, 50);
+      return [unique.length ? unique : [], last];
+    }
+
+    // Mid-token completion: filename completion with fuzzy matching
     const dir = path.dirname(last || '.');
     const base = path.basename(last || '');
-    const list = fs.readdirSync(path.resolve(SHELL.cwd, dir === '.' ? '' : dir));
-    const hits = list.filter(f => f.startsWith(base)).map(f => (dir === '.' ? f : path.join(dir, f)));
-    return [hits.length ? hits : list, last];
+    const resolvedDir = path.resolve(SHELL.cwd, dir === '.' ? '' : dir);
+
+    let list = [];
+    try {
+      list = fs.readdirSync(resolvedDir);
+    } catch (e) {
+      return [[], last];
+    }
+
+    const hits = fuzzyMatchFuse(list, base, ['name'], 0.35, 100);
+    const mapped = hits.map(f => (dir === '.' ? f : path.join(dir, f)));
+    return [mapped.length ? mapped : list, last];
   } catch (e) {
     return [[], line];
   }
