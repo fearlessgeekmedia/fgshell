@@ -4304,6 +4304,16 @@ function showHistoryPicker() {
 if (process.stdin.isTTY) {
   readline.emitKeypressEvents(process.stdin);
   process.stdin.on('keypress', (str, key) => {
+    // Filter terminal capability responses. Tools like chafa (run from .fgshrc)
+    // query the terminal for image support. The terminal replies with escape
+    // sequences that arrive on stdin. readline's keypress parser can misinterpret
+    // these responses as user keystrokes — notably triggering the Ctrl+N file
+    // picker, which floods the terminal with more graphics data. We drop any
+    // keypress that is part of an escape sequence (starts with \x1b).
+    if (str && str.length > 0 && str.charCodeAt(0) === 0x1b) {
+      return;
+    }
+
     // Route ALL input to file picker when active
     if (isFilePickerActive) {
       handleFilePickerKey(str, key).catch(e => console.error('Picker error:', e));
