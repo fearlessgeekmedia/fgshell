@@ -60,6 +60,9 @@ class LineEditor extends EventEmitter {
     this._onCtrlR = null;       // shell hook: history picker
     this._onCtrlZ = null;       // shell hook: job control suspend
 
+    // Input received while paused but before a picker attaches its listener
+    this._pausedInput = [];
+
     // Kill sequence: Ctrl+C twice exits
     this._ctrlCCount = 0;
 
@@ -96,13 +99,19 @@ class LineEditor extends EventEmitter {
   pause() {
     if (this._paused) return;
     this._paused = true;
-    this._setRawMode(false);
+    // Keep raw mode and the data listener attached. The file/history pickers
+    // read keys from stdin while paused, and the shell's own rl.pause() calls
+    // (job control) are paired with resume(), which re-asserts raw mode.
   }
 
   resume() {
     if (!this._paused) return;
     this._paused = false;
-    this._setRawMode(true);
+    this._pausedInput = [];
+    // Re-assert raw mode: the shell may have disabled it for a child process.
+    if (this._active) this._setRawMode(true);
+    this._requestGhost();
+    this._render();
   }
 
   prompt() {
@@ -153,6 +162,19 @@ class LineEditor extends EventEmitter {
 
   // ---- raw mode plumbing ----
 
+  /** Force raw mode + stdin flowing. Used before handing stdin to a picker. */
+  ensureRawMode() {
+    if (!this.terminal || !this.input.setRawMode) return;
+    try {
+      this.input.setRawMode(true);
+      this.input.resume();
+      if (!this._rawModeSet) {
+        this.input.on('data', this._onData);
+        this._rawModeSet = true;
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   _setRawMode(on) {
     if (!this.terminal || !this.input.setRawMode) return;
     if (on) {
@@ -197,16 +219,21 @@ class LineEditor extends EventEmitter {
       ghost = this._ghost.slice(text.length);
     }
 
-    let out = A.saveCursor + A.clearLine;
+    // Two-pass render:
+    //   1. draw prompt + text + dimmed ghost (cursor ends up at the far right)
+    //   2. redraw without ghost, then move the cursor back to the input position
+    // Using relative cursor-left movement keeps this correct when the line
+    // wraps, which absolute column positioning (CSI n G) does not.
+    let out = '\r' + A.clearLine;
     out += this.promptText + text;
     if (ghost) {
       out += A.dim + ghost + A.reset;
     }
-    // Position cursor at the input cursor
-    const promptLen = this._visibleLength(this.promptText);
-    const target = promptLen + this._cursor;
-    out += A.restoreCursor + A.clearLine + this.promptText + text;
-    out += A.cursorTo(target);
+    // Second pass: redraw without the ghost
+    out += '\r' + A.clearLine + this.promptText + text;
+    // Cursor is now just past the input text. Move it back to the insert point.
+    const back = text.length - this._cursor;
+    if (back > 0) out += A.cursorLeft(back);
     try { this.output.write(out); } catch (e) { /* ignore */ }
   }
 
@@ -218,7 +245,15 @@ class LineEditor extends EventEmitter {
   // ---- input parsing ----
 
   _onData(chunk) {
-    if (this._paused || this._closed) return;
+    if (this._closed) return;
+    // While paused, input belongs to the file/history picker. The picker
+    // attaches its keypress listener asynchronously (it awaits a directory
+    // read first), so buffer anything that arrives before then and replay it.
+    if (this._paused) {
+      this._pausedInput.push(chunk);
+      this._flushPausedInput();
+      return;
+    }
     const s = chunk.toString('utf8');
     let i = 0;
     while (i < s.length) {
@@ -226,6 +261,80 @@ class LineEditor extends EventEmitter {
       i += consumed > 0 ? consumed : 1;
     }
     this._render();
+  }
+
+  _flushPausedInput() {
+    if (!this._pausedInput.length) return;
+    if (!this.listenerCount('keypress')) return; // picker not listening yet
+    const queued = this._pausedInput;
+    this._pausedInput = [];
+    for (const chunk of queued) this._emitKeypressFor(chunk);
+  }
+
+  /** Called when a picker attaches a keypress listener. */
+  notifyKeypressListener() {
+    this._flushPausedInput();
+  }
+
+  on(event, listener) {
+    super.on(event, listener);
+    if (event === 'keypress') this._flushPausedInput();
+    return this;
+  }
+
+  /**
+   * Parse raw bytes into readline-compatible (str, key) pairs and emit
+   * them as a 'keypress' event. The file/history pickers listen for this.
+   * Kept separate from _handleKey so picker input doesn't mutate the line.
+   */
+  _emitKeypressFor(data) {
+    const s = data.toString('utf8');
+    let i = 0;
+    while (i < s.length) {
+      const ch = s[i];
+      let str = ch;
+      let key = { name: ch, ctrl: false, meta: false, shift: false, sequence: ch };
+
+      if (ch === ESC) {
+        const rest = s.slice(i);
+        const arrows = {
+          '[A': 'up', '[B': 'down', '[C': 'right', '[D': 'left',
+          '[H': 'home', '[F': 'end', '[3~': 'delete', '[1;5C': 'c', '[1;5D': 'd',
+        };
+        let m;
+        if ((m = rest.match(/^\x1b\[[0-9;?]*[a-zA-Z@`~]/)) ||
+            (m = rest.match(/^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/)) ||
+            (m = rest.match(/^\x1b_[\s\S]*?\x1b\\/)) ||
+            (m = rest.match(/^\x1bP[\s\S]*?\x1b\\/))) {
+          str = m[0];
+          key = { name: arrows[str] || 'escape', ctrl: false, meta: false, shift: false, sequence: str };
+          i += str.length;
+          this.emit('keypress', str, key);
+          continue;
+        }
+        i += 1;
+        this.emit('keypress', ESC, { name: 'escape', ctrl: false, meta: true, shift: false, sequence: ESC });
+        continue;
+      }
+
+      if (ch === '\r' || ch === '\n') {
+        key = { name: 'return', ctrl: false, meta: false, shift: false, sequence: ch };
+      } else if (ch === '\t') {
+        key = { name: 'tab', ctrl: false, meta: false, shift: false, sequence: ch };
+      } else if (ch === '\x7f' || ch === '\b') {
+        key = { name: 'backspace', ctrl: false, meta: false, shift: false, sequence: ch };
+      } else if (ch === '\x03') {
+        key = { name: 'c', ctrl: true, meta: false, shift: false, sequence: ch };
+      } else if (ch === '\x0e') {
+        key = { name: 'n', ctrl: true, meta: false, shift: false, sequence: ch };
+      } else if (ch === '\x12') {
+        key = { name: 'r', ctrl: true, meta: false, shift: false, sequence: ch };
+      } else if (ch < ' ') {
+        key = { name: ch, ctrl: true, meta: false, shift: false, sequence: ch };
+      }
+      i += ch.length;
+      this.emit('keypress', str, key);
+    }
   }
 
   _handleKey(s, i) {

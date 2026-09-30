@@ -4173,12 +4173,17 @@ async function showFilePicker() {
   return new Promise((resolve) => {
     filePickerResolve = (result) => {
       isFilePickerActive = false;
+      rl.removeAllListeners('keypress');
       clearFilePickerOverlay(); // Clear before nulling state for maximum compatibility
       filePickerState = null;
       filePickerResolve = null;
-      rl._refreshLine();
       resolve(result);
     };
+
+    // The line editor emits readline-compatible 'keypress' events while paused.
+    rl.on('keypress', (str, key) => {
+      handleFilePickerKey(str, key).catch(e => console.error('Picker error:', e));
+    });
 
     renderFilePickerOverlay().catch(e => console.error('Picker render error:', e));
   });
@@ -4257,7 +4262,7 @@ function showHistoryPicker() {
 
       const finalize = (result) => {
         pickerDone = true;
-        process.stdin.removeAllListeners('keypress');
+        rl.removeAllListeners('keypress');
         process.stdout.write('\x1b[?25h'); // Show cursor
         isFilePickerActive = false;
         resolve(result);
@@ -4312,23 +4317,8 @@ function showHistoryPicker() {
       }
     };
     
-    // Remove all keypress listeners temporarily
-    const listeners = process.stdin.listeners('keypress');
-    listeners.forEach(l => process.stdin.removeListener('keypress', l));
-    
-    // Add only our handler
-    process.stdin.on('keypress', keypressHandler);
-    
-    // When done, restore original listeners
-    const originalResolve = resolve;
-    return new Promise((res) => {
-      resolve = (result) => {
-        // Restore original keypress listeners
-        listeners.forEach(l => process.stdin.on('keypress', l));
-        originalResolve(result);
-        res(result);
-      };
-    });
+    // The line editor emits readline-compatible 'keypress' events while paused.
+    rl.on('keypress', keypressHandler);
   });
 }
 
@@ -4340,6 +4330,8 @@ if (process.stdin.isTTY) {
     const savedLine = rl.line;
     const savedCursor = rl.cursor;
     rl.pause();
+    // The picker needs live key input, so make sure raw mode is on.
+    rl.ensureRawMode();
     try {
       const selectedFile = await showFilePicker();
       if (selectedFile) {
@@ -4368,6 +4360,7 @@ if (process.stdin.isTTY) {
     const savedLine = rl.line;
     const savedCursor = rl.cursor;
     rl.pause();
+    rl.ensureRawMode();
     try {
       const selectedCommand = await showHistoryPicker();
       rl.resume();
