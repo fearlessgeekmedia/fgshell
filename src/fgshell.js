@@ -1878,14 +1878,56 @@ if (ptctl.available) {
 // Check if we're running as a login shell (stdin/stdout are TTY)
 const isLoginShell = process.stdin.isTTY && process.stdout.isTTY;
 
-let rl = readline.createInterface({
+const { LineEditor } = require('./line-editor');
+
+const rl = new LineEditor({
   input: process.stdin,
   output: process.stdout,
   prompt: '',
-  completer: completer,
-  terminal: isLoginShell && (!process.argv[2] || process.argv[2] === '-c'),  // Only terminal mode in interactive TTY
-  historySize: 1000,
-  handleSIGTSTP: false,  // Handle SIGTSTP ourselves for job control
+});
+
+// Flyline-style ghost text: best completion for current input, shown inline
+// after the cursor and accepted with Tab. Falls back to history entries and
+// command names when the fuzzy completer has no prefix match.
+rl.setGhostProvider((line) => {
+  if (!line) return '';
+  try {
+    // 1. Prefer a completer suggestion that the input is a prefix of
+    const [suggestions] = completer(line);
+    if (suggestions) {
+      for (const s of suggestions) {
+        if (s.length > line.length && s.startsWith(line)) return s;
+      }
+    }
+    // 2. Fall back to longest history entry with this prefix
+    let best = '';
+    for (const h of rl.history) {
+      if (h.length > line.length && h.startsWith(line) && h.length > best.length) {
+        best = h;
+      }
+    }
+    if (best) return best;
+    // 3. Fall back to a command name with this prefix
+    for (const name of getCommandList().keys) {
+      if (name.length > line.length && name.startsWith(line) && name.length > best.length) {
+        best = name;
+      }
+    }
+    return best;
+  } catch (e) {
+    return '';
+  }
+});
+
+// Tab falls back to the fuzzy completer when there's no inline ghost.
+rl.setTabHandler((line) => {
+  try {
+    const [suggestions] = completer(line);
+    if (suggestions && suggestions.length === 1) return suggestions[0];
+    return null;
+  } catch (e) {
+    return null;
+  }
 });
 
 function isPickerNavKey(key) {
@@ -1899,16 +1941,6 @@ function isPickerNavKey(key) {
     key.name === 'escape'
   );
 }
-
-const originalTtyWrite = rl._ttyWrite.bind(rl);
-
-rl._ttyWrite = function(s, key) {
-  if (isFilePickerActive) {
-    // When picker is active, suppress echo but still allow keypress events
-    return;
-  }
-  return originalTtyWrite(s, key);
-};
 
 function debug(...args) {
   const msg = '[DEBUG] ' + args.join(' ');
@@ -4301,80 +4333,54 @@ function showHistoryPicker() {
 }
 
 // Handle Ctrl+N for file picker and Ctrl+R for history picker
+// The line editor owns stdin and routes these keys via callbacks.
 if (process.stdin.isTTY) {
-  readline.emitKeypressEvents(process.stdin);
-  process.stdin.on('keypress', (str, key) => {
-    // Filter terminal capability responses. Tools like chafa (run from .fgshrc)
-    // query the terminal for image support. The terminal replies with escape
-    // sequences that arrive on stdin. readline's keypress parser can misinterpret
-    // these responses as user keystrokes — notably triggering the Ctrl+N file
-    // picker, which floods the terminal with more graphics data. We drop any
-    // keypress that is part of an escape sequence (starts with \x1b).
-    if (str && str.length > 0 && str.charCodeAt(0) === 0x1b) {
-      return;
+  rl.onCtrlN(async () => {
+    if (isFilePickerActive) return;
+    const savedLine = rl.line;
+    const savedCursor = rl.cursor;
+    rl.pause();
+    try {
+      const selectedFile = await showFilePicker();
+      if (selectedFile) {
+        rl.resume();
+        const line = rl.line;
+        const cursor = rl.cursor;
+        const needsSpace = line.length > 0 && !line.endsWith(' ');
+        const insertText = (needsSpace ? ' ' : '') + selectedFile.replace(/ /g, '\\ ');
+        const left = line.slice(0, cursor);
+        const right = line.slice(cursor);
+        rl.line = left + insertText + right;
+        rl.cursor = left.length + insertText.length;
+      } else {
+        rl.line = savedLine;
+        rl.cursor = savedCursor;
+        rl.resume();
+      }
+    } catch (e) {
+      console.error('Picker error:', e);
+      rl.resume();
     }
+  });
 
-    // Route ALL input to file picker when active
-    if (isFilePickerActive) {
-      handleFilePickerKey(str, key).catch(e => console.error('Picker error:', e));
-      return;
-    }
-
-    if (key && key.ctrl && key.name === 'n') {
-      // Prevent re-entrancy from multiple rapid key presses
-      if (isFilePickerActive) return;
-      (async () => {
-        try {
-          const selectedFile = await showFilePicker();
-          
-          if (selectedFile) {
-            const line = rl.line;
-            const cursor = rl.cursor;
-            const needsSpace = line.length > 0 && !line.endsWith(' ');
-            const insertText = (needsSpace ? ' ' : '') + selectedFile.replace(/ /g, '\\ ');
-            
-            const left = line.slice(0, cursor);
-            const right = line.slice(cursor);
-            
-            rl.line = left + insertText + right;
-            rl.cursor = left.length + insertText.length;
-            rl._refreshLine();
-          }
-        } catch (e) {
-          console.error('Picker error:', e);
-        }
-      })();
-    } else if (key && key.ctrl && key.name === 'r') {
-      // Prevent re-entrancy from multiple rapid key presses
-      if (isFilePickerActive) return;
-
-      const savedLine = rl.line;
-      const savedCursor = rl.cursor;
-      
-      // Spawn history picker in a separate context
-      (async () => {
-        try {
-          const selectedCommand = await showHistoryPicker();
-          
-          // After picker completes, replace the entire line with selected command
-          rl.line = '';
-          rl.cursor = 0;
-          
-          if (selectedCommand) {
-            rl.line = selectedCommand;
-            rl.cursor = selectedCommand.length;
-          } else {
-            // User cancelled, restore original line
-            rl.line = savedLine;
-            rl.cursor = savedCursor;
-          }
-          
-          // Force redraw
-          rl._refreshLine();
-        } catch (e) {
-          console.error('History picker error:', e);
-        }
-      })();
+  rl.onCtrlR(async () => {
+    if (isFilePickerActive) return;
+    const savedLine = rl.line;
+    const savedCursor = rl.cursor;
+    rl.pause();
+    try {
+      const selectedCommand = await showHistoryPicker();
+      rl.resume();
+      if (selectedCommand) {
+        rl.line = selectedCommand;
+        rl.cursor = selectedCommand.length;
+      } else {
+        rl.line = savedLine;
+        rl.cursor = savedCursor;
+      }
+    } catch (e) {
+      console.error('History picker error:', e);
+      rl.resume();
     }
   });
 }
