@@ -1887,35 +1887,66 @@ const rl = new LineEditor({
 });
 
 // Flyline-style ghost text: best completion for current input, shown inline
-// after the cursor and accepted with Tab. Falls back to history entries and
-// command names when the fuzzy completer has no prefix match.
+// after the cursor and accepted with Tab. Only prefix matches — the fuzzy
+// completer's substring hits (filenames, unrelated commands) are wrong here.
 rl.setGhostProvider((line) => {
-  if (!line) return '';
-  try {
-    // 1. Prefer a completer suggestion that the input is a prefix of
-    const [suggestions] = completer(line);
-    if (suggestions) {
-      for (const s of suggestions) {
-        if (s.length > line.length && s.startsWith(line)) return s;
-      }
+  if (!line || /\s/.test(line)) {
+    // Mid-line: fall back to path completion for the current word
+    if (line) {
+      try {
+        const word = line.slice(line.lastIndexOf(' ') + 1);
+        if (word) {
+          const dir = path.dirname(word) === '.' ? '' : path.dirname(word);
+          const base = path.basename(word);
+          const entries = fs.readdirSync(path.resolve(SHELL.cwd, dir));
+          const hit = entries.find(e => e.startsWith(base) && e.length > base.length);
+          if (hit) return line.slice(0, line.length - base.length) + hit;
+        }
+      } catch (e) {}
     }
-    // 2. Fall back to longest history entry with this prefix
-    let best = '';
-    for (const h of rl.history) {
-      if (h.length > line.length && h.startsWith(line) && h.length > best.length) {
-        best = h;
-      }
-    }
-    if (best) return best;
-    // 3. Fall back to a command name with this prefix
-    for (const name of getCommandList().keys) {
-      if (name.length > line.length && name.startsWith(line) && name.length > best.length) {
-        best = name;
-      }
-    }
-    return best;
-  } catch (e) {
     return '';
+  }
+  let best = '';
+  // Longest history entry that extends what was typed
+  for (const h of rl.history) {
+    if (h.length > line.length && h.startsWith(line) && h.length > best.length) best = h;
+  }
+  if (best) return best;
+  // Longest command name that extends what was typed
+  try {
+    for (const name of getCommandList().keys) {
+      if (name.length > line.length && name.startsWith(line) && name.length > best.length) best = name;
+    }
+  } catch (e) {}
+  return best;
+});
+
+// Fuzzy completion menu: the list of matches shown below the prompt as you
+// type. Up/Down move the selection, Tab or Enter accepts, Escape dismisses.
+// Only shown at the start of a command and only for prefix matches — the
+// fuzzy completer's filename hits are noise once you have a word started.
+rl.setMenuProvider((line) => {
+  if (!line || /\s/.test(line)) return [];
+  try {
+    const seen = new Set();
+    const out = [];
+    const add = (s) => {
+      if (typeof s === 'string' && s && s !== line && !seen.has(s)) {
+        seen.add(s);
+        out.push(s);
+      }
+    };
+    // History entries that extend what was typed
+    for (const h of rl.history) {
+      if (h.startsWith(line)) add(h);
+    }
+    // Command names that extend what was typed
+    for (const name of getCommandList().keys) {
+      if (name.startsWith(line)) add(name);
+    }
+    return out;
+  } catch (e) {
+    return [];
   }
 });
 

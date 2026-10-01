@@ -55,6 +55,13 @@ class LineEditor extends EventEmitter {
     // Ghost text (Flyline-style inline suggestions)
     this._ghost = '';
     this._ghostProvider = null; // (line) => string
+    // Fuzzy completion menu
+    this._menuProvider = null;  // (line) => string[]
+    this._menuItems = [];
+    this._menuIndex = 0;
+    this._menuOpen = false;
+    this._menuLines = 0;
+    this._menuBase = '';        // input text the menu was built for
     this._tabHandler = null;    // (line) => string|null
     this._onCtrlN = null;       // shell hook: file picker
     this._onCtrlR = null;       // shell hook: history picker
@@ -121,6 +128,10 @@ class LineEditor extends EventEmitter {
     this._historyIndex = -1;
     this._historyStash = null;
     this._ghost = '';
+    this._menuItems = [];
+    this._menuIndex = 0;
+    this._menuOpen = false;
+    this._menuLines = 0;
     this._active = true;
     this._setRawMode(true);
     this._render();
@@ -150,6 +161,14 @@ class LineEditor extends EventEmitter {
 
   setTabHandler(handler) {
     this._tabHandler = handler;
+  }
+
+  /**
+   * Set the function that produces the fuzzy match list shown in the menu.
+   * @param {(line: string) => string[]} provider
+   */
+  setMenuProvider(provider) {
+    this._menuProvider = provider;
   }
 
   /** Shell hook: Ctrl+N opens the file picker. */
@@ -210,6 +229,40 @@ class LineEditor extends EventEmitter {
 
   // ---- rendering ----
 
+  /** Erase any previously drawn completion menu. */
+  _clearMenu() {
+    if (!this._menuLines) return;
+    let out = '';
+    for (let i = 0; i < this._menuLines; i++) out += '\r' + A.clearLine + '\n';
+    // move back up to the prompt line
+    out += `\x1b[${this._menuLines}A`;
+    this._menuLines = 0;
+    this._menuOpen = false;
+    try { this.output.write(out); } catch (e) { /* ignore */ }
+  }
+
+  /** Draw the fuzzy completion menu below the prompt line. */
+  _drawMenu() {
+    if (!this.terminal || this._paused || !this._active) return;
+    if (!this._menuOpen || !this._menuItems || !this._menuItems.length) return;
+    // Erase the previous menu (we are on the prompt line, menu is below it)
+    let out = '';
+    for (let i = 0; i < this._menuLines; i++) out += '\n\r' + A.clearLine;
+    if (this._menuLines) out += `\x1b[${this._menuLines}A`;
+    // Draw the new menu
+    out += '\n';
+    const n = this._menuItems.length;
+    for (let i = 0; i < n; i++) {
+      out += (i === this._menuIndex ? A.rev : '') + this._menuItems[i] + (i === this._menuIndex ? A.reset : '');
+      out += '\n';
+    }
+    out += `\x1b[${n}A`;
+    this._menuLines = n;
+    try { this.output.write(out); } catch (e) { /* ignore */ }
+    // Repaint the prompt line and restore the cursor
+    this._render();
+  }
+
   _render() {
     if (!this.terminal || this._paused || !this._active) return;
     const text = this._line;
@@ -244,6 +297,41 @@ class LineEditor extends EventEmitter {
 
   // ---- input parsing ----
 
+  // Escape sequences can arrive split across reads (a terminal may flush
+  // "\x1b" and "[B" as separate chunks). Buffer a trailing partial sequence
+  // until the rest arrives, otherwise a bare ESC is mistaken for the user
+  // pressing Escape — which closes the pickers.
+  _pending = '';
+  _pendingTimer = null;
+
+  /** Length of a complete escape sequence at s[i], or 0 if incomplete, -1 if not one. */
+  _escapeLen(s, i) {
+    if (s[i] !== ESC) return -1;
+    const rest = s.slice(i);
+    if (/^\x1b\[[0-9;?]*[a-zA-Z@`~]/.test(rest)) return rest.match(/^\x1b\[[0-9;?]*[a-zA-Z@`~]/)[0].length;
+    if (/^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.test(rest)) return rest.match(/^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/)[0].length;
+    if (/^\x1b_[\s\S]*?\x1b\\/.test(rest)) return rest.match(/^\x1b_[\s\S]*?\x1b\\/)[0].length;
+    if (/^\x1bP[\s\S]*?\x1b\\/.test(rest)) return rest.match(/^\x1bP[\s\S]*?\x1b\\/)[0].length;
+    // Could still be a complete short sequence (Alt+key) or a lone ESC.
+    // Treat a trailing ESC (nothing after it) as incomplete only if more
+    // input is likely; callers decide via _isPartialTail.
+    return -1;
+  }
+
+  /** True if s ends with the start of an escape sequence that isn't finished. */
+  _isPartialTail(s) {
+    if (!s) return false;
+    const lastEsc = s.lastIndexOf(ESC);
+    if (lastEsc < 0) return false;
+    const tail = s.slice(lastEsc);
+    if (tail.length === 1) return true;               // bare trailing ESC
+    // ESC [ ... with no final byte yet
+    if (/^\x1b\[[0-9;?]*$/.test(tail)) return true;
+    // OSC with no terminator
+    if (/^\x1b\][^\x07\x1b]*$/.test(tail)) return true;
+    return false;
+  }
+
   _onData(chunk) {
     if (this._closed) return;
     // While paused, input belongs to the file/history picker. The picker
@@ -254,7 +342,27 @@ class LineEditor extends EventEmitter {
       this._flushPausedInput();
       return;
     }
-    const s = chunk.toString('utf8');
+    let s = this._pending + chunk.toString('utf8');
+    // Hold back a trailing partial escape sequence
+    if (this._pending) {
+      this._pending = '';
+    } else if (this._isPartialTail(s)) {
+      // A lone ESC is ambiguous: it could be the Escape key or the start of
+      // a sequence split across reads. Hold it briefly; if nothing follows,
+      // treat it as a real Escape.
+      const keep = s.slice(s.lastIndexOf(ESC));
+      this._pending = keep;
+      s = s.slice(0, s.lastIndexOf(ESC));
+      clearTimeout(this._pendingTimer);
+      this._pendingTimer = setTimeout(() => {
+        this._pendingTimer = null;
+        if (!this._pending) return;
+        const lone = this._pending;
+        this._pending = '';
+        this._deliverLoneEscape(lone);
+      }, 40);
+    }
+    if (!s) return;
     let i = 0;
     while (i < s.length) {
       const consumed = this._handleKey(s, i);
@@ -263,12 +371,39 @@ class LineEditor extends EventEmitter {
     this._render();
   }
 
+  /** A lone ESC survived the flush window: deliver it as a real Escape key. */
+  _deliverLoneEscape(lone) {
+    if (this._paused) {
+      this._emitKeypressFor(lone);
+      return;
+    }
+    // At the line editor, Escape dismisses the menu, then clears the line.
+    if (this._menuOpen) {
+      this._menuDismiss();
+      this._render();
+      return;
+    }
+    if (this._line) {
+      this._line = '';
+      this._cursor = 0;
+      this._ghost = '';
+      this._render();
+    }
+  }
+
   _flushPausedInput() {
     if (!this._pausedInput.length) return;
     if (!this.listenerCount('keypress')) return; // picker not listening yet
     const queued = this._pausedInput;
     this._pausedInput = [];
-    for (const chunk of queued) this._emitKeypressFor(chunk);
+    let s = this._pending + Buffer.concat(queued).toString('utf8');
+    this._pending = '';
+    if (this._isPartialTail(s)) {
+      // Still incomplete — put it back for the next flush
+      this._pending = s.slice(s.lastIndexOf(ESC));
+      s = s.slice(0, s.lastIndexOf(ESC));
+    }
+    if (s) this._emitKeypressFor(s);
   }
 
   /** Called when a picker attaches a keypress listener. */
@@ -345,9 +480,9 @@ class LineEditor extends EventEmitter {
       const rest = s.slice(i);
 
       // Alt+Enter etc — ignore unknown escapes
-      // Arrow keys
-      if (rest.startsWith(ESC + '[A')) { this._historyPrev(); return 3; }   // Up
-      if (rest.startsWith(ESC + '[B')) { this._historyNext(); return 3; }   // Down
+      // Arrow keys — navigate the menu when it's open, else history/cursor
+      if (rest.startsWith(ESC + '[A')) { if (!this._menuMove(-1)) this._historyPrev(); return 3; }   // Up
+      if (rest.startsWith(ESC + '[B')) { if (!this._menuMove(1)) this._historyNext(); return 3; }    // Down
       if (rest.startsWith(ESC + '[C')) { this._cursorRight(); return 3; }    // Right
       if (rest.startsWith(ESC + '[D')) { this._cursorLeft(); return 3; }     // Left
       if (rest.startsWith(ESC + '[H')) { this._cursor = 0; return 3; }       // Home
@@ -379,6 +514,8 @@ class LineEditor extends EventEmitter {
     switch (ch) {
       case '\r':
       case '\n':
+        // Enter with a menu open accepts the highlighted entry
+        if (this._menuOpen && this._menuAccept()) return 1;
         this._submit();
         return 1;
 
@@ -502,6 +639,16 @@ class LineEditor extends EventEmitter {
   }
 
   _tab() {
+    // Tab with the menu open: accept the highlighted entry
+    if (this._menuOpen) {
+      if (this._menuAccept()) return;
+      // Only one candidate left and nothing highlighted — take it
+      if (this._menuItems && this._menuItems.length === 1) {
+        this._menuIndex = 0;
+        this._menuAccept();
+        return;
+      }
+    }
     // Tab: accept ghost if present, else insert spaces for indent
     if (this._ghost && this._ghost.startsWith(this._line) && this._ghost.length > this._line.length) {
       this._acceptGhost();
@@ -564,6 +711,16 @@ class LineEditor extends EventEmitter {
 
   _submit() {
     const line = this._line;
+    // Erase the menu before the newline so it doesn't scroll into the output
+    if (this._menuOpen) {
+      let out = '';
+      for (let i = 0; i < this._menuLines; i++) out += '\r' + A.clearLine + '\n';
+      out += `\x1b[${this._menuLines}A`;
+      this._menuLines = 0;
+      this._menuOpen = false;
+      try { this.output.write(out); } catch (e) {}
+    }
+    this._menuItems = [];
     this._line = '';
     this._cursor = 0;
     this._ghost = '';
@@ -610,6 +767,11 @@ class LineEditor extends EventEmitter {
   // ---- ghost text ----
 
   _requestGhost() {
+    this._requestGhostText();
+    this._requestMenu();
+  }
+
+  _requestGhostText() {
     if (!this._ghostProvider) {
       this._ghost = '';
       return;
@@ -637,6 +799,66 @@ class LineEditor extends EventEmitter {
     } else {
       this._ghost = result || '';
     }
+  }
+
+  _requestMenu() {
+    if (!this._menuProvider) return;
+    const input = this._line;
+    // Only offer the menu once there's something to match against
+    if (!input.trim()) {
+      if (this._menuOpen) { this._clearMenu(); }
+      this._menuItems = [];
+      return;
+    }
+    let items;
+    try {
+      items = this._menuProvider(input) || [];
+    } catch (e) {
+      items = [];
+    }
+    items = items.filter(x => typeof x === 'string' && x.length).slice(0, 10);
+    // Don't show the menu when the only match is what the user already typed
+    items = items.filter(x => x !== input);
+    if (!items.length) {
+      if (this._menuOpen) this._clearMenu();
+      this._menuItems = [];
+      this._menuBase = input;
+      return;
+    }
+    this._menuItems = items;
+    this._menuBase = input;
+    // Reset selection when the query changed
+    if (!this._menuOpen || this._menuBase !== input) this._menuIndex = 0;
+    this._menuOpen = true;
+    this._drawMenu();
+  }
+
+  /** Move the menu selection. */
+  _menuMove(delta) {
+    if (!this._menuOpen || !this._menuItems.length) return;
+    const n = this._menuItems.length;
+    this._menuIndex = (this._menuIndex + delta + n) % n;
+    this._drawMenu();
+  }
+
+  /** Put the highlighted menu entry on the command line. */
+  _menuAccept() {
+    if (!this._menuOpen || !this._menuItems.length) return false;
+    const choice = this._menuItems[this._menuIndex];
+    if (!choice) return false;
+    this._clearMenu();
+    this._menuItems = [];
+    this._line = choice;
+    this._cursor = choice.length;
+    this._ghost = '';
+    this._render();
+    return true;
+  }
+
+  _menuDismiss() {
+    if (!this._menuOpen) return;
+    this._clearMenu();
+    this._menuItems = [];
   }
 }
 
