@@ -2,12 +2,14 @@
 
 ## Overview
 
-The fgshell prompt can be customized using the `PS1` environment variable, following standard shell conventions. When `PS1` is not set, fgshell uses a default prompt of the form `username:directory$ `.
+The fgshell prompt can be customized using the `PS1` environment variable, following standard shell conventions. When `PS1` is not set, fgshell uses a default prompt of the form `username:directory > ` (cyan username, green directory).
+
+For the full placeholder reference (`%user%`, `%dir%`, colors, examples) see [docs/PROMPT.md](docs/PROMPT.md).
 
 ## Basic Usage
 
 ### Default Prompt
-If no `PS1` is set, fgshell displays: `fearlessgeek:fgshell$ `
+If no `PS1` is set, fgshell displays: `fearlessgeek:fgshell > `
 
 ### Custom Static Prompt
 ```bash

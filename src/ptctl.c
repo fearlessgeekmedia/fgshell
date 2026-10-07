@@ -2,6 +2,24 @@
 #include <unistd.h>
 #include <errno.h>
 #include <termios.h>
+#include <signal.h>
+
+/**
+ * Ignore SIGTTOU the way interactive shells do before touching terminal
+ * attributes from a background process group.
+ * A *caught* handler (e.g. Node's process.on('SIGTTOU')) is NOT sufficient:
+ * with a caught disposition, tcsetpgrp() from the shell's background process
+ * group fails with ENOTTY and the terminal stays owned by the dead child's
+ * process group, after which tcsetattr() (setRawMode) fails with EIO and the
+ * shell dies.  Only SIG_IGN makes the restore succeed.
+ * SIGTTIN is left alone so children keep default job-control behaviour
+ * (a caught handler is reset to default on exec, an ignored one is not).
+ * Returns 0 on success.
+ */
+int ptctl_ignore_job_signals(void) {
+  if (signal(SIGTTOU, SIG_IGN) == SIG_ERR) return -1;
+  return 0;
+}
 
 /**
  * Enable signal generation (ISIG), canonical mode (ICANON), and echo (ECHO) on the terminal

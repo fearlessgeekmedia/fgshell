@@ -1,5 +1,5 @@
 {
-  description = "fgshell - A shell written in JavaScript that probably shouldn't exist, but does";
+  description = "fgshell - A modern Unix shell written in JavaScript on the Bun runtime";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -14,7 +14,7 @@
       {
         packages.default = pkgs.stdenv.mkDerivation {
           name = "fgshell";
-          version = "0.0.2a";
+          version = (builtins.fromJSON (builtins.readFile ./package.json)).version;
           
           src = builtins.filterSource
             (path: type:
@@ -73,7 +73,7 @@
           '';
           
           meta = {
-            description = "A shell written in JavaScript that probably shouldn't exist, but does";
+            description = "A modern Unix shell written in JavaScript on the Bun runtime";
             license = nixpkgs.lib.licenses.unlicense;
             platforms = nixpkgs.lib.platforms.unix;
           };

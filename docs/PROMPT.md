@@ -8,9 +8,9 @@ The fgshell prompt is fully customizable using the `PS1` environment variable. B
 
 When no `PS1` is set, fgshell displays:
 ```
-user:directory »
+user:directory >
 ```
-With colors: cyan username, green directory.
+With colors: cyan username, green directory — for example `fearlessgeek:fgshell > `.
 
 ## Setting a Custom Prompt
 
@@ -101,17 +101,14 @@ This will execute the date command each time the prompt is displayed.
 
 ## Default ~/.fgshrc
 
-The default `~/.fgshrc` includes an example:
+A typical `~/.fgshrc` looks like this:
 
 ```bash
 #!/usr/bin/env fgsh
 
-echo "This is an experimental shell"
-fastfetch
-
 # Customize prompt using color placeholders:
 # Available: %user%, %host%, %pwd%, %dir%, %cyan%, %green%, %red%, %yellow%, %reset%
-export PS1="%cyan%%user%%reset%:%green%%dir%%reset% » "
+export PS1="%cyan%%user%%reset%:%green%%dir%%reset% > "
 ```
 
 Edit this file to customize your prompt to your preference.

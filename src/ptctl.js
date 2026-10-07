@@ -52,6 +52,10 @@ try {
       args: ['i32'],
       returns: 'i32',
     },
+    ptctl_ignore_job_signals: {
+      args: [],
+      returns: 'i32',
+    },
   });
 } catch (e) {
   error = e;
@@ -70,6 +74,17 @@ module.exports = {
   acquire_tty(fd) {
     if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
     return ptctl.symbols.ptctl_acquire_tty(fd);
+  },
+
+  /**
+   * Set SIGTTOU to SIG_IGN so the shell (often in a background process
+   * group) can restore terminal ownership without tcsetpgrp() failing.
+   * Must be called once at startup, before any job-control handoff.
+   * @returns {number} 0 on success, -1 on error
+   */
+  ignore_job_signals() {
+    if (!ptctl) throw new Error('ptctl library not loaded: ' + (error ? error.message : 'unknown error'));
+    return ptctl.symbols.ptctl_ignore_job_signals();
   },
 
   /**

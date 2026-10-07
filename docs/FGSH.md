@@ -18,19 +18,21 @@ fgsh provides:
 
 ```
 src/
-  fgshell.js      - Main shell implementation (3800+ lines)
+  fgshell.js      - Main shell implementation (5700+ lines)
+  line-editor.js  - Custom line editor: raw-mode keys, prompt/ghost rendering,
+                    history, and the fuzzy completion menu
   shell.js        - Shell state and context
   history-db.js   - SQLite history database
+  output-formatter.js - JSON/YAML formatting
   ptctl.js        - FFI bindings for process group control
   ptctl.c         - C library for tcsetpgrp/setpgid/killpg
-  output-formatter.js - JSON/YAML formatting
 ```
 
 ### Execution Flow
 
 1. **Initialization** (`fgshell.js` start)
    - Load rc file if it exists
-   - Set up readline/PTY handling
+   - Set up the line editor (`line-editor.js`) and PTY handling
    - Initialize job control
 
 2. **Interactive Mode**
@@ -68,7 +70,8 @@ executeControlFlow(line)
 
 ### Multi-line Block Parsing
 
-Script mode uses `parseScriptBlocks()` to group multi-line structures before execution:
+Script mode, `~/.fgshrc` loading, and the `source` builtin all use
+`parseScriptBlocks()` to group multi-line structures before execution:
 
 ```javascript
 // Input script lines
@@ -144,7 +147,7 @@ runSingle(line)
 
 ### Builtin Commands
 
-Builtins are implemented as functions in the `builtins` object (L475):
+Builtins are implemented as functions in the `builtins` object:
 
 ```javascript
 builtins = {
@@ -161,17 +164,20 @@ Builtins have special handling:
 - Support output formatting (--json, --yaml for env, history, jobs)
 
 Available builtins:
-- `echo` - output text
-- `cd` / `pwd` - directory management
+- `echo` / `printf` - output text
+- `cd` / `mkcd` / `pwd` / `clear` - directory and terminal management
+- `ls` / `cat` - file listing and concatenation
 - `export` / `unset` / `env` - environment variables
 - `declare` - display arrays/variables
 - `alias` / `unalias` - command shortcuts
 - `history` - command history
+- `source` - run a script in the current shell
 - `read` - user input
 - `test` / `[` - conditionals
 - `jobs` / `fg` / `bg` - job control
 - `trap` - signal handling
 - `true` / `false` - test commands
+- `exit` - leave the shell
 - `js` - JavaScript evaluation
 
 ### Pipeline Execution
@@ -241,21 +247,31 @@ Signal handlers registered with Node.js event system, actual signal delivery thr
 See [HISTORY.md](HISTORY.md) for detailed information.
 
 Quick overview:
-- SQLite database in `~/.fgshell_history`
+- SQLite database in `~/.fgshell_history.db`
 - Records: command, directory, exit code, timestamp, duration
-- Fuzzy search with Fuse.js
+- Fuzzy search with Fuse.js; Ctrl+R opens the full picker UI
 - JSON/YAML export support
 
 ## Interactive Features
 
 ### Fuzzy History Search (Ctrl+R)
 
-Uses Fuse.js to search historical commands:
-1. User presses Ctrl+R
-2. Display search interface
-3. Filter commands as user types
-4. Show matching commands with context
-5. Execute selected command
+A two-pane search UI over the SQLite history, built with
+[OpenTUI](https://opentui.com) (`@opentui/core`) and Fuse.js:
+1. User presses Ctrl+R — the picker takes over the screen in the
+   alternate buffer, so the prompt and scrollback are untouched
+2. Left pane lists commands (newest first) with timestamp and exit code;
+   the right pane previews the selection: full command, time, exit code,
+   duration and directory
+3. Typing fuzzy-filters the list (Fuse.js, substring fallback)
+4. Up/Down move the selection; the mouse wheel/click work too
+5. Enter inserts the selected command into the prompt line; Escape or
+   Ctrl+C cancels without changing the line (Enter with no matches just
+   closes the picker)
+
+The OpenTUI core is loaded lazily the first time Ctrl+R is pressed, and
+works in the compiled `./fgsh` binary (its native library is embedded by
+`bun build --compile`).
 
 ### File Picker (Ctrl+N)
 
@@ -263,8 +279,44 @@ Custom file browser:
 1. User presses Ctrl+N
 2. Display directory tree
 3. Show live preview of selected file
-4. Navigate with arrow keys
-5. Insert selected path into command line
+4. Navigate with arrow keys: Up/Down move the list, Left goes to the
+   parent directory, Right enters the highlighted directory (the picker
+   browses on its own — it never changes the shell's working directory)
+5. Enter selects the highlighted entry — a file **or a directory** — and
+   closes the picker. The selected path is inserted relative to the
+   shell's cwd (`docs/notes.md` when picked inside `docs/`, a bare
+   `notes.md` when picked in the cwd itself, or the absolute path when the
+   file lives outside the cwd)
+6. Ctrl+F opens filter mode: typed text fuzzy-filters the list, Enter
+   selects the best match
+
+### Command Prediction Menu
+
+The fuzzy prediction box drawn below the prompt while typing:
+
+1. Matches commands/history at the start of a line — each command row
+   shows the executable's full path on the right of the box — path/file
+   candidates for the current token after a space (tilde-expanded, so
+   `cat ~/` lists the home directory), and long options after `--`
+2. Draws a bordered box with a scrollbar once more than 10 entries match
+3. Up/Down move the selection and Tab accepts it; Enter runs the line as
+   you typed it, so `ls` + Enter always runs `ls` — Enter only accepts a
+   menu entry after you picked it with Up/Down (or when the menu holds a
+   single candidate). Escape dismisses
+4. Accepting replaces only the current token: `cat ~/` + `.fgshrc` becomes
+   `cat ~/.fgshrc`; accepting a directory reopens the menu inside it
+5. Inline ghost text previews the best candidate after the cursor
+
+Optional behavior is configured through environment variables set in
+`~/.fgshrc`. To show a right-aligned relative modification time next to
+each file entry (as in Flyline):
+
+```sh
+export FGSH_MENU_MTIME=1
+```
+
+The age column is display-only — accepting an entry inserts the path, never
+the age. Off by default.
 
 ## Performance Considerations
 
@@ -284,23 +336,30 @@ Custom file browser:
 
 ## Testing
 
-Test scripts in root directory:
-- `test_control.sh` - if/while/for statements
-- `test_case.sh` - case statement matching
-- `test_func.sh` - function definition and calls
-- `test_array_*.sh` - array operations
-- `test_advanced.sh` - comprehensive feature test
+There is no separate unit-test suite; verification is by running the shell
+by hand plus two harnesses in the repository:
 
-Run with:
-```bash
-./fgsh test_*.sh
-```
+- `test-menu-duplication.py` - PTY harness for the fuzzy completion menu and
+  the Ctrl+R history picker. Spawns `bun src/fgshell.js` under a real pty,
+  replays its output through an ANSI screen model, and asserts the prompt is
+  never duplicated, the menu geometry is correct, and Enter/Escape behave as
+  expected. Run:
+
+  ```bash
+  python3 test-menu-duplication.py   # exit 0 = pass
+  ```
+
+- `src/test-fgshell.js` and `src/test-fgshell2.js` - snapshots of the shell
+  used for manual side-by-side testing (they are complete shells, not test
+  suites; run them the same way as `src/fgshell.js`).
 
 ## Debugging
 
 Enable debug output:
 ```bash
-DEBUG=1 ./fgsh script.sh
+FGSH_DEBUG=1 ./fgsh script.sh    # tokenization, expansion, spawning, signals
+FGSH_DEVEL=1 ./fgsh              # line editor pause/resume and render tracing
+FGSH_LOG=1 ./fgsh                # append startup markers to a debug log file
 ```
 
 This logs:
@@ -350,7 +409,10 @@ formatError('if: syntax error - expected "then"', context, showSnippet)
 
 ## Future Improvements
 
-1. **Complete here-document support** - Pass content to commands
+1. **Here-documents in interactive mode and `-c`** - Scripts, files loaded
+   with `source`, and `~/.fgshrc` work today; interactive/`-c` input,
+   quoted delimiters (`<<'EOF'`), and variable expansion in the body are
+   still pending
 2. **Process substitution** - `<(cmd)` and `>(cmd)` syntax
 3. **Arithmetic conditionals** - `((expr))` syntax
 4. **More builtins** - grep, sed, awk as builtins

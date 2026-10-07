@@ -61,10 +61,17 @@ For now, you can use SQLite tools:
 sqlite3 ~/.fgshell_history.db "DELETE FROM history WHERE timestamp < strftime('%s', 'now', '-30 days')"
 ```
 
+### Interactive Picker
+
+Press **Ctrl+R** to open the two-pane history picker (built with OpenTUI):
+the left pane lists commands newest-first, the right pane previews the
+selection with time, exit code, duration, and directory. Typing fuzzy-filters
+the list; Enter inserts the selected command into the prompt line.
+
 ## Future Features
 
 Planned enhancements:
 - `history-by-exit-code` - filter by exit status
 - `history-by-directory` - show commands run in a specific directory
 - Configurable history retention policy
-- Integration with fzf for interactive history selection
+- Export history for use with external tools (the built-in Ctrl+R picker covers interactive selection)

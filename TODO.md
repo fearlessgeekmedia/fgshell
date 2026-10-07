@@ -44,12 +44,12 @@
 - [x] Environment variables
 - [x] Aliases
 - [x] Tab completion
-- [x] Readline integration
+- [x] Custom Bun-native line editor (raw-mode input, history, ghost text)
 
 ## In Progress
 
-- [ ] Here-documents (`<<EOF`) - parsing complete, content delivery pending
-- [ ] Arithmetic operators in test conditionals
+- [ ] Here-documents (`<<EOF`) - works whenever the input comes from a file (scripts, `source`, `.fgshrc`); interactive/`-c` input, quoted delimiters, and body expansion pending
+- [ ] Logical operators in test conditionals (`-a`, `-o`, and `!` negation are not yet handled by `test`/`[`; unquoted `!=` is mangled by history expansion — quote it: `test "$a" "!=" "$b"`)
 - [ ] Additional builtins (grep, sed, awk as optimized shell commands)
 
 ## TODO - High Priority
@@ -89,13 +89,12 @@
 - [ ] Negation in conditionals
 
 ### Builtins
-- [ ] printf (more formatting options than echo)
 - [ ] sed/grep as optimized builtins
 - [ ] bc calculator
 - [ ] base64 encoding/decoding
 
 ### Interactive Features
-- [ ] Command preview in Ctrl+R search
+- [x] Command preview in Ctrl+R search (two-pane preview: time, exit code, duration, directory)
 - [ ] Persistent session state
 - [ ] History filtering options
 
@@ -126,7 +125,7 @@
 
 ## Known Issues to Fix
 
-1. **Here-documents** - Parsed but content not passed to commands
+1. **Here-documents** - File-based input works (scripts, `source`, `.fgshrc`; content delivered via temp file); interactive/`-c` mode and quoted delimiters still pending
 2. **Ctrl+Z handling** - Edge cases with terminal state
 3. **sudo password input** - Requires `-S` flag to read from stdin
 4. **Performance** - JS/Bun slower than native C shells
