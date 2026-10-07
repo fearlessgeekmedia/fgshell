@@ -1,6 +1,6 @@
 # fgshell
 
-A Unix shell with modern features like fuzzy history search and interactive file picker—written in JavaScript/Bun because apparently we can. It probably shouldn't exist. You probably shouldn't use it. But here it is if you really want to use it. 
+A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime.
 
 ## What is this?
 
@@ -8,6 +8,7 @@ A Unix shell with modern features like fuzzy history search and interactive file
 
 - **Interactive file picker** (Ctrl+N) with live preview and Kitty image support
 - **Fuzzy history search** (Ctrl+R) with Fuse.js and an OpenTUI two-pane preview UI
+- **Inline command prediction** with ghost text and a fuzzy completion menu
 - **SQLite history database** with timestamps, exit codes, and command duration
 - **Customizable prompts** with color support
 
@@ -34,6 +35,8 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 - **🎨 Customizable prompts** — full color support and variable expansion
 - **⚡ Inline command prediction** — ghost text plus a bordered, scrollable menu that completes paths as you type (`cat ~/` lists your home), shows each command's full path on the right, with an optional mtime column (`export FGSH_MENU_MTIME=1` in `~/.fgshrc`)
 - **💻 Embedded JavaScript REPL** — `js` command for quick JavaScript evaluation
+- **📜 History expansion** — `!!` (last command), `!$` (last argument), `!^` (first argument), `!n`, and `!?text` (search)
+- **📦 Structured output** — `--json` and `--yaml` flags on `ls`, `history`, `jobs`, and `env`
 
 ### Standard Shell Features
 - **Command execution** with proper process spawning
@@ -42,16 +45,17 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 - **Environment variables**: `$VAR` and `${VAR}` expansion
 - **Command substitution**: `$(command)` and arithmetic `$((expr))`
 - **Tab completion** for files and directories
-- **Interactive line editing** with readline
+- **Interactive line editing** with a custom Bun-native line editor (raw-mode input, history, and inline ghost text)
 - **Aliases**: `alias name=command` syntax
 - **Shell scripting** with full control flow: if/else, while, for (C-style and for-in), case statements
 - **Shell functions** with parameter passing
 - **Arrays** with indexing and expansion (`${arr[@]}`, `${arr[i]}`)
 - **Logical operators**: `&&` and `||` for command chaining
 - **Subshells** with `()`
-- **Here-documents** with `<<EOF`
+- **Here-documents** with `<<EOF` (in scripts, files loaded with `source`, and `~/.fgshrc`)
 - **Signal traps** with `trap` command
-- **Built-in commands**: `cd`, `pwd`, `echo`, `export`, `unset`, `env`, `history`, `alias`, `unalias`, `declare`
+- **Sourcing**: `source file` to run a script in the current shell
+- **Built-in commands**: `cd`, `mkcd`, `pwd`, `clear`, `echo`, `ls`, `cat`, `printf`, `export`, `unset`, `env`, `history`, `alias`, `unalias`, `source`, `declare`, `read`, `test`/`[`, `trap`, `jobs`, `fg`, `bg`, `true`, `false`, `exit`, `js`
 - **Helpful error messages** with file:line references and source code snippets in scripts
 
 ## Building
@@ -137,6 +141,8 @@ bun run build
 | SQLite history database | ✓ | ✗ | ✗ |
 | Command duration tracking | ✓ | ✗ | ✓ (with plugins) |
 | Exit code in history | ✓ | ✗ | ✗ |
+| Inline command prediction (ghost text + menu) | ✓ | ✗ | ✓ (with plugins) |
+| JSON/YAML output from builtins | ✓ | ✗ | ✗ |
 | Basic shell features | ✓ | ✓ | ✓ |
 | POSIX compatibility | ✗ | ✓ | ✓ |
 | Cross-platform (Unix/Linux/macOS) | ✓ | ✓ | ✓ |
@@ -144,10 +150,12 @@ bun run build
 ## Architecture
 
 - **src/fgshell.js** - Main shell implementation with command parsing, execution, and job control
+- **src/line-editor.js** - Custom line editor: raw-mode key handling, prompt rendering, ghost text, and the completion menu
 - **src/shell.js** - Shell state (environment, current directory, aliases, jobs)
 - **src/ptctl.js** - FFI bindings for Unix process group control (tcsetpgrp, setpgid, etc)
 - **src/ptctl.c** - C library exposing terminal control syscalls
 - **src/history-db.js** - SQLite-backed command history
+- **src/output-formatter.js** - JSON/YAML output formatting for builtins
 
 ## Job Control Notes
 
@@ -159,7 +167,7 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 - [FGSH.md](docs/FGSH.md) - Shell design, architecture, and implementation details
 - [HISTORY.md](docs/HISTORY.md) - Command history system
 - [PROMPT.md](docs/PROMPT.md) - Prompt customization
-- [JAVASCRIPT.md](docs/JAVASCRIPT.md) - Why JavaScript was chosen (spoiler: bad reasons)
+- [JAVASCRIPT.md](docs/JAVASCRIPT.md) - Using JavaScript from the shell with the `js` builtin
 
 ## Known Limitations & Issues
 
@@ -168,12 +176,13 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 - **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
 - **POSIX compliance**: Not fully POSIX-compliant; designed for interactive use
-- **Here-documents**: Parsed but content isn't yet passed to commands
+- **Here-documents**: Work whenever the input comes from a file — scripts, files loaded with `source`, and `~/.fgshrc` (content is delivered through a temporary file) — but not yet in interactive mode or with `-c`. Quoted delimiters (`<<'EOF'`) and variable expansion inside the body are not supported yet
 
 ## Roadmap
 
 - [ ] Proper Ctrl+Z terminal state handling
-- [ ] Complete here-document support
+- [x] Here-documents in scripts, `source`, and `~/.fgshrc` (content delivery complete)
+- [ ] Here-documents in interactive mode and `-c`, with quoted delimiters and variable expansion
 - [ ] Plugin system for extending commands
 - [x] Better error messages with line numbers (completed)
 - [ ] Stack traces for function calls
@@ -182,4 +191,4 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 
 ## License
 
-Probably shouldn't exist, so probably shouldn't be licensed. Use at your own risk. Regardless, it's under the MIT license anyway.
+fgshell is distributed under the MIT license — see [LICENSE](LICENSE).

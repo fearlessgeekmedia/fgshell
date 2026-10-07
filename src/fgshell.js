@@ -1451,10 +1451,15 @@ try {
     try {
       const script = fs.readFileSync(filePath, 'utf8');
       const lines = script.split('\n');
-      for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx];
-        if (line.trim() && !line.trim().startsWith('#')) {
-          await runLine(line);
+      // Group multi-line functions and control structures into blocks so
+      // their bodies are not executed line-by-line as separate commands.
+      const blocks = await parseScriptBlocks(lines, filePath);
+      for (const block of blocks) {
+        if (block.content && block.content.trim()) {
+          await runLine(block.content, block);
+        }
+        if (block._heredocTmpFile) {
+          try { fs.unlinkSync(block._heredocTmpFile); } catch (e) {}
         }
       }
       return 0;
@@ -2842,7 +2847,7 @@ function resolveHistoryExpansion(input) {
 }
 
 // ---------------------- Execution ----------------------
-async function runLine(line) {
+async function runLine(line, context) {
   line = line.trim();
   if (!line) {
     return;
@@ -2852,7 +2857,7 @@ async function runLine(line) {
   
   // Parse line for control flow structures and execute
   try {
-    await executeControlFlow(line);
+    await executeControlFlow(line, context);
   } catch (e) {
     if (isSignal(e, 'return')) {
       SHELL.lastExitCode = typeof e.__fgshCode === 'number' ? e.__fgshCode : 0;
@@ -2995,7 +3000,7 @@ async function executeControlFlow(line, context) {
     if (rest && rest.trim()) await executeControlFlow(rest.trim(), context);
     return;
   }
-  if (trimmed.startsWith('function ') || /^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/.test(trimmed)) {
+  if (trimmed.startsWith('function ') || /^[a-zA-Z_][a-zA-Z0-9_-]*\s*\(\s*\)/.test(trimmed)) {
     const rest = await defineFunctionLine(trimmed, context);
     if (rest && rest.trim()) await executeControlFlow(rest.trim(), context);
     return;
@@ -3515,7 +3520,7 @@ function matchPattern(str, pattern) {
 // Define a function
 async function defineFunctionLine(line, context) {
   // Parse function definition: function name { ... } or name() { ... }
-  const funcMatch = line.match(/^(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\)\s*{/);
+  const funcMatch = line.match(/^(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_-]*)\s*\(\s*\)\s*{/);
   if (!funcMatch) {
     const errMsg = formatError('function: syntax error - expected "{ ... }"', context, true);
     console.error(errMsg || 'function: syntax error');
@@ -3525,20 +3530,41 @@ async function defineFunctionLine(line, context) {
   
   const funcName = funcMatch[1];
   
-  // Find the closing brace (simple parsing)
+  // Find the closing brace, ignoring braces inside quotes and comments.
   let depth = 1;
-  let bodyStart = line.indexOf('{') + 1;
+  const bodyStart = line.indexOf('{') + 1;
   let bodyEnd = bodyStart;
-  
+  let state = null;
   for (let i = bodyStart; i < line.length; i++) {
-    if (line[i] === '{') depth++;
-    if (line[i] === '}') {
+    const ch = line[i];
+    if (state) {
+      if (ch === '\\' && state === '"') { i++; continue; }
+      if (ch === state) state = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { state = ch; continue; }
+    if (ch === '#' && (i === 0 || /[\s;]/.test(line[i - 1]))) {
+      const nl = line.indexOf('\n', i);
+      i = nl === -1 ? line.length : nl;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
       depth--;
       if (depth === 0) {
         bodyEnd = i;
         break;
       }
     }
+  }
+  
+  if (depth !== 0) {
+    // Never saw the closing `}` - report it instead of silently storing an
+    // empty function whose body would never run.
+    const errMsg = formatError(`function ${funcName}: syntax error - missing closing "}"`, context, true);
+    console.error(errMsg || `function ${funcName}: syntax error - missing closing "}"`);
+    SHELL.lastExitCode = 1;
+    return '';
   }
   
   const body = line.slice(bodyStart, bodyEnd).trim();
@@ -5381,6 +5407,21 @@ function hasUnclosedQuotes(str) {
   return inSingle || inDouble;
 }
 
+// Helper to detect whether multi-line input still has an open block:
+// an unfinished function definition (unbalanced braces) or a control
+// structure (if/while/until/for/case) that is missing its closer.
+function hasOpenBlock(text) {
+  const trimmed = text.trimStart();
+  if (!trimmed) return false;
+  if (/^function\b/.test(trimmed) || /^[a-zA-Z_][a-zA-Z0-9_-]*\s*\(\s*\)/.test(trimmed)) {
+    return countBraces(text) > 0;
+  }
+  if (/^(if|while|until|for|case)\b/.test(trimmed)) {
+    return countBlockDepth(text) > 0;
+  }
+  return false;
+}
+
 // Handle --version and --help flags
 if (process.argv[2] === '--version' || process.argv[2] === '-v') {
   console.log(`fgsh version ${VERSION}`);
@@ -5415,11 +5456,14 @@ if (!isScriptMode && !isCommandMode) {
     // Accumulate input if we have unclosed quotes
     accumulatedInput += (accumulatedInput ? '\n' : '') + line;
     
-    if (hasUnclosedQuotes(accumulatedInput)) {
-      // Still have unclosed quotes, wait for more input
+    if (hasUnclosedQuotes(accumulatedInput) || hasOpenBlock(accumulatedInput)) {
+      // Still have unclosed quotes or an open block, wait for more input.
+      // resume() must precede prompt(): prompt() early-returns while paused
+      // and _render() skips paused state, so the old order (prompt then
+      // resume) silently dropped the continuation prompt from the screen.
       rl.setPrompt('> ');  // Show continuation prompt
-      rl.prompt();
       rl.resume();
+      rl.prompt();
     } else {
       // Quotes are closed, execute the accumulated input
       await runLine(accumulatedInput);
@@ -5434,7 +5478,9 @@ if (!isScriptMode && !isCommandMode) {
   });
 
   rl.on('SIGINT', () => {
-    // handled above by process SIGINT; do nothing
+    // Abandon any multi-line input being collected; the process SIGINT
+    // handler redisplays the prompt.
+    accumulatedInput = '';
   });
 }
 
@@ -5455,6 +5501,159 @@ function loadHistory() {
     rl.history.push(...SHELL.history);
     debug('Loaded', entries.length, 'history entries from database');
   }
+}
+
+// ---------------------- BLOCK PARSER (script / rc / source) ----------------------
+// Parse source lines into blocks: multi-line functions and control
+// structures stay together, here-documents are rewritten to temp files.
+// Returns blocks with line-number metadata for error reporting.
+async function parseScriptBlocks(lines, filename) {
+  const blocks = [];
+  let idx = 0;
+  
+  while (idx < lines.length) {
+    const line = lines[idx];
+    const trimmed = line.trim();
+    
+    // Skip empty lines and comments
+    if (!trimmed || trimmed.startsWith('#')) {
+      idx++;
+      continue;
+    }
+    
+    // Check if this is the start of a control structure
+    if (trimmed.startsWith('if ') || trimmed.startsWith('while ') || 
+        trimmed.startsWith('until ') ||
+        trimmed.startsWith('for ') || trimmed.startsWith('case ')) {
+      const block = collectBlock(lines, idx);
+      blocks.push({
+        content: block.content,
+        startLine: idx + 1,  // 1-indexed line numbers
+        endLine: block.endIdx + 1,
+        filename: filename
+      });
+      idx = block.endIdx + 1;
+    } else if (trimmed.startsWith('function ') || /^[a-zA-Z_][a-zA-Z0-9_-]*\s*\(\s*\)/.test(trimmed)) {
+      // Function definition block
+      const block = collectBlock(lines, idx);
+      blocks.push({
+        content: block.content,
+        startLine: idx + 1,
+        endLine: block.endIdx + 1,
+        filename: filename
+      });
+      idx = block.endIdx + 1;
+    } else {
+      // Check for here-document
+      const heredocMatch = line.match(/<<\s*-?\s*([A-Za-z_][A-Za-z0-9_]*)/);
+      if (heredocMatch) {
+        const heredoc = await parseHereDocument(lines, idx);
+        if (heredoc) {
+          const commandLine = line.replace(/<<\s*-?\s*[A-Za-z_][A-Za-z0-9_]*/, heredoc.tmpFile);
+          blocks.push({
+            content: commandLine,
+            startLine: idx + 1,
+            endLine: heredoc.endIdx + 1,
+            filename: filename,
+            _heredocTmpFile: heredoc.tmpFile
+          });
+          idx = heredoc.endIdx + 1;
+        } else {
+          blocks.push({
+            content: line,
+            startLine: idx + 1,
+            endLine: idx + 1,
+            filename: filename
+          });
+          idx++;
+        }
+      } else {
+        // Single-line command
+        blocks.push({
+          content: line,
+          startLine: idx + 1,
+          endLine: idx + 1,
+          filename: filename
+        });
+        idx++;
+      }
+    }
+  }
+  
+  return blocks;
+}
+
+// Collect a complete block (if/while/for/case/function)
+function collectBlock(lines, startIdx) {
+  const firstLine = lines[startIdx].trim();
+  let content = firstLine;
+  let idx = startIdx + 1;
+  
+  const isFunction = firstLine.startsWith('function ') ||
+    /^[a-zA-Z_][a-zA-Z0-9_-]*\s*\(\s*\)/.test(firstLine);
+  
+  if (isFunction) {
+    // Collect until the braces balance.
+    let depth = countBraces(firstLine);
+    while (idx < lines.length && depth > 0) {
+      content += '\n' + lines[idx];
+      depth += countBraces(lines[idx]);
+      idx++;
+    }
+  } else {
+    // Collect until this block's own keywords balance. Stopping at the
+    // first fi/done (the old behaviour) truncated every nested block and
+    // made `if` inside `for` a parse error.
+    let depth = countBlockDepth(firstLine);
+    while (idx < lines.length && depth > 0) {
+      content += '\n' + lines[idx];
+      depth += countBlockDepth(lines[idx]);
+      idx++;
+    }
+  }
+  
+  return { content, endIdx: idx - 1 };
+}
+
+// Net brace delta for a line, ignoring braces inside quotes and comments.
+function countBraces(line) {
+  let count = 0;
+  let state = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (state) {
+      if (ch === '\\' && state === '"') { i++; continue; }
+      if (ch === state) state = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { state = ch; continue; }
+    if (ch === '#' && (i === 0 || /[\s;]/.test(line[i - 1]))) break;
+    if (ch === '{') count++;
+    else if (ch === '}') count--;
+  }
+  return count;
+}
+
+// Depth delta for a line of shell source: +1 for each block opener
+// (if/for/while/until/case) and -1 for each closer (fi/done/esac).
+// Nesting matters: the `fi` of an inner if must not close an outer one.
+function countBlockDepth(text) {
+  let depth = 0, state = null, i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (state) { if (ch === state) state = null; i++; continue; }
+    if (ch === "'" || ch === '"') { state = ch; i++; continue; }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < text.length && /[A-Za-z0-9_.]/.test(text[j])) j++;
+      const w = text.slice(i, j).toLowerCase();
+      if (CTL_OPEN_WORDS[w]) depth++;
+      else if (CTL_CLOSE_WORDS[w]) depth--;
+      i = j; continue;
+    }
+    i++;
+  }
+  return depth;
 }
 
 async function loadRcFile() {
@@ -5495,10 +5694,15 @@ async function loadRcFile() {
       isLoadingRcFile = true;
       const script = fs.readFileSync(rcFile, 'utf8');
       const lines = script.split('\n');
-      for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx];
-        if (line.trim() && !line.trim().startsWith('#')) {
-          await runLine(line);
+      // Group multi-line functions and control structures into blocks so
+      // their bodies are not executed line-by-line as separate commands.
+      const blocks = await parseScriptBlocks(lines, rcFile);
+      for (const block of blocks) {
+        if (block.content && block.content.trim()) {
+          await runLine(block.content, block);
+        }
+        if (block._heredocTmpFile) {
+          try { fs.unlinkSync(block._heredocTmpFile); } catch (e) {}
         }
       }
       isLoadingRcFile = false;
@@ -5542,151 +5746,10 @@ if (process.argv[2] === '-c' && process.argv[3]) {
     rl.removeAllListeners('line');
     rl.pause();
     
-    // Parse script into blocks (handles multi-line control structures)
-    // Returns blocks with line number metadata
-    async function parseScriptBlocks(lines) {
-      const blocks = [];
-      let idx = 0;
-      
-      while (idx < lines.length) {
-        const line = lines[idx];
-        const trimmed = line.trim();
-        
-        // Skip empty lines and comments
-        if (!trimmed || trimmed.startsWith('#')) {
-          idx++;
-          continue;
-        }
-        
-        // Check if this is the start of a control structure
-        if (trimmed.startsWith('if ') || trimmed.startsWith('while ') || 
-            trimmed.startsWith('until ') ||
-            trimmed.startsWith('for ') || trimmed.startsWith('case ')) {
-          const block = collectBlock(lines, idx);
-          blocks.push({
-            content: block.content,
-            startLine: idx + 1,  // 1-indexed line numbers
-            endLine: block.endIdx + 1,
-            filename: scriptPath
-          });
-          idx = block.endIdx + 1;
-        } else if (trimmed.startsWith('function ') || trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/)) {
-          // Function definition block
-          const block = collectBlock(lines, idx);
-          blocks.push({
-            content: block.content,
-            startLine: idx + 1,
-            endLine: block.endIdx + 1,
-            filename: scriptPath
-          });
-          idx = block.endIdx + 1;
-        } else {
-          // Check for here-document
-          const heredocMatch = line.match(/<<\s*-?\s*([A-Za-z_][A-Za-z0-9_]*)/);
-          if (heredocMatch) {
-            const heredoc = await parseHereDocument(lines, idx);
-            if (heredoc) {
-              const commandLine = line.replace(/<<\s*-?\s*[A-Za-z_][A-Za-z0-9_]*/, heredoc.tmpFile);
-              blocks.push({
-                content: commandLine,
-                startLine: idx + 1,
-                endLine: heredoc.endIdx + 1,
-                filename: scriptPath,
-                _heredocTmpFile: heredoc.tmpFile
-              });
-              idx = heredoc.endIdx + 1;
-            } else {
-              blocks.push({
-                content: line,
-                startLine: idx + 1,
-                endLine: idx + 1,
-                filename: scriptPath
-              });
-              idx++;
-            }
-          } else {
-            // Single-line command
-            blocks.push({
-              content: line,
-              startLine: idx + 1,
-              endLine: idx + 1,
-              filename: scriptPath
-            });
-            idx++;
-          }
-        }
-      }
-      
-      return blocks;
-    }
-    
-    // Collect a complete block (if/while/for/case/function)
-    function collectBlock(lines, startIdx) {
-      const firstLine = lines[startIdx].trim();
-      let content = firstLine;
-      let idx = startIdx + 1;
-      
-      const isFunction = firstLine.startsWith('function ') ||
-        /^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)/.test(firstLine);
-      
-      if (isFunction) {
-        // Collect until the braces balance.
-        let depth = countBraces(firstLine);
-        while (idx < lines.length && depth > 0) {
-          content += '\n' + lines[idx];
-          depth += countBraces(lines[idx]);
-          idx++;
-        }
-      } else {
-        // Collect until this block's own keywords balance. Stopping at the
-        // first fi/done (the old behaviour) truncated every nested block and
-        // made `if` inside `for` a parse error.
-        let depth = countBlockDepth(firstLine);
-        while (idx < lines.length && depth > 0) {
-          content += '\n' + lines[idx];
-          depth += countBlockDepth(lines[idx]);
-          idx++;
-        }
-      }
-      
-      return { content, endIdx: idx - 1 };
-    }
-    
-    function countBraces(line) {
-      let count = 0;
-      for (const ch of line) {
-        if (ch === '{') count++;
-        if (ch === '}') count--;
-      }
-      return count;
-    }
-    
-    // Depth delta for a line of shell source: +1 for each block opener
-    // (if/for/while/until/case) and -1 for each closer (fi/done/esac).
-    // Nesting matters: the `fi` of an inner if must not close an outer one.
-    function countBlockDepth(text) {
-      let depth = 0, state = null, i = 0;
-      while (i < text.length) {
-        const ch = text[i];
-        if (state) { if (ch === state) state = null; i++; continue; }
-        if (ch === "'" || ch === '"') { state = ch; i++; continue; }
-        if (/[A-Za-z_]/.test(ch)) {
-          let j = i;
-          while (j < text.length && /[A-Za-z0-9_.]/.test(text[j])) j++;
-          const w = text.slice(i, j).toLowerCase();
-          if (CTL_OPEN_WORDS[w]) depth++;
-          else if (CTL_CLOSE_WORDS[w]) depth--;
-          i = j; continue;
-        }
-        i++;
-      }
-      return depth;
-    }
-    
     // Execute script
     (async () => {
       try {
-        const blocks = await parseScriptBlocks(lines);
+        const blocks = await parseScriptBlocks(lines, scriptPath);
         for (const block of blocks) {
           if (block.content && block.content.trim()) {
             await executeControlFlow(block.content, block);

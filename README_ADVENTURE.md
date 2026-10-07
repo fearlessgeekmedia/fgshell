@@ -89,4 +89,4 @@ This is exactly what makes fgsh unique compared to bash/zsh. Developers can use 
 - Saved game state using JavaScript file I/O
 - Procedurally generated dungeons
 - Multiple character classes with different abilities
-- Multiplayer mode (just kidding... or are we?)
+- Multiplayer mode (not yet implemented)

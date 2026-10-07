@@ -179,6 +179,12 @@ hello() {
 }
 ```
 
+Function names may contain letters, digits, underscores, and hyphens (for
+example `backup-all()`). Multi-line definitions work everywhere functions
+can be defined: in scripts, in `~/.fgshrc`, in files loaded with `source`,
+and interactively — the shell shows a `> ` continuation prompt until the
+closing `}` is entered, and Ctrl+C aborts the input.
+
 ### Function Calls
 ```bash
 greet "Alice"      # Output: Hello, Alice!
@@ -257,12 +263,13 @@ The `[` test command evaluates conditions. The closing `]` is required.
 
 ### String Comparisons
 - `=` or `==` : equal (always quote strings)
-- `!=` : not equal
+- `!=` : not equal (must be quoted — an unquoted `!` is intercepted by history expansion, so write `"!="`)
 - `-z` : string is empty
 - `-n` : string is not empty
 
 ```bash
 [ "$NAME" = "Alice" ]     # true if NAME equals "Alice"
+[ "$NAME" "!=" "Bob" ]    # true if NAME differs from Bob (quote "!=")
 [ -z "$EMPTY" ]           # true if EMPTY is empty
 [ -n "$NONEMPTY" ]        # true if NONEMPTY is not empty
 ```
@@ -452,6 +459,25 @@ echo "error" 2> errors.txt
 ```bash
 cat < input.txt
 ```
+
+### Here-Documents
+- `<<DELIM` : read lines until `DELIM` and pass them to the command
+
+```bash
+cat << EOF
+line one
+line two
+EOF
+```
+
+`<<-EOF` is also recognized (the delimiter line may be indented), but
+leading tabs in the body are currently kept rather than stripped.
+
+**Current scope:** here-documents work whenever the input comes from a file:
+scripts run as `./fgsh script.sh`, files loaded with `source`, and
+`~/.fgshrc`. They are not yet collected in interactive mode or with
+`-c`, quoted delimiters (`<<'EOF'`) are not recognized, and the body is
+passed verbatim — variables are not expanded inside it.
 
 ### Pipes
 Chain commands with `|` to pass output as input.
@@ -659,7 +685,8 @@ script.sh:15-17: error: for: syntax error - expected "in" and "do"
 
 ## Limitations
 
-- Here-documents (`<<EOF`) are parsed but content isn't yet passed to commands
+- Here-documents (`<<EOF`) work whenever the input comes from a file — scripts, `source`, and `~/.fgshrc` — with content delivered through a temporary file. Interactive/`-c` input, quoted delimiters (`<<'EOF'`), and variable expansion in the body are not yet supported
+- Logical operators inside `test`/`[` (`-a`, `-o`, and `!` negation) are not yet implemented
 - Pattern matching in case statements is basic (no full regex support)
 - Some advanced bash features aren't implemented (process substitution, etc.)
 - Stack traces for function calls are not yet displayed in error messages

@@ -18,19 +18,21 @@ fgsh provides:
 
 ```
 src/
-  fgshell.js      - Main shell implementation (3800+ lines)
+  fgshell.js      - Main shell implementation (5700+ lines)
+  line-editor.js  - Custom line editor: raw-mode keys, prompt/ghost rendering,
+                    history, and the fuzzy completion menu
   shell.js        - Shell state and context
   history-db.js   - SQLite history database
+  output-formatter.js - JSON/YAML formatting
   ptctl.js        - FFI bindings for process group control
   ptctl.c         - C library for tcsetpgrp/setpgid/killpg
-  output-formatter.js - JSON/YAML formatting
 ```
 
 ### Execution Flow
 
 1. **Initialization** (`fgshell.js` start)
    - Load rc file if it exists
-   - Set up readline/PTY handling
+   - Set up the line editor (`line-editor.js`) and PTY handling
    - Initialize job control
 
 2. **Interactive Mode**
@@ -68,7 +70,8 @@ executeControlFlow(line)
 
 ### Multi-line Block Parsing
 
-Script mode uses `parseScriptBlocks()` to group multi-line structures before execution:
+Script mode, `~/.fgshrc` loading, and the `source` builtin all use
+`parseScriptBlocks()` to group multi-line structures before execution:
 
 ```javascript
 // Input script lines
@@ -144,7 +147,7 @@ runSingle(line)
 
 ### Builtin Commands
 
-Builtins are implemented as functions in the `builtins` object (L475):
+Builtins are implemented as functions in the `builtins` object:
 
 ```javascript
 builtins = {
@@ -161,17 +164,20 @@ Builtins have special handling:
 - Support output formatting (--json, --yaml for env, history, jobs)
 
 Available builtins:
-- `echo` - output text
-- `cd` / `pwd` - directory management
+- `echo` / `printf` - output text
+- `cd` / `mkcd` / `pwd` / `clear` - directory and terminal management
+- `ls` / `cat` - file listing and concatenation
 - `export` / `unset` / `env` - environment variables
 - `declare` - display arrays/variables
 - `alias` / `unalias` - command shortcuts
 - `history` - command history
+- `source` - run a script in the current shell
 - `read` - user input
 - `test` / `[` - conditionals
 - `jobs` / `fg` / `bg` - job control
 - `trap` - signal handling
 - `true` / `false` - test commands
+- `exit` - leave the shell
 - `js` - JavaScript evaluation
 
 ### Pipeline Execution
@@ -241,9 +247,9 @@ Signal handlers registered with Node.js event system, actual signal delivery thr
 See [HISTORY.md](HISTORY.md) for detailed information.
 
 Quick overview:
-- SQLite database in `~/.fgshell_history`
+- SQLite database in `~/.fgshell_history.db`
 - Records: command, directory, exit code, timestamp, duration
-- Fuzzy search with Fuse.js
+- Fuzzy search with Fuse.js; Ctrl+R opens the full picker UI
 - JSON/YAML export support
 
 ## Interactive Features
@@ -330,23 +336,30 @@ the age. Off by default.
 
 ## Testing
 
-Test scripts in root directory:
-- `test_control.sh` - if/while/for statements
-- `test_case.sh` - case statement matching
-- `test_func.sh` - function definition and calls
-- `test_array_*.sh` - array operations
-- `test_advanced.sh` - comprehensive feature test
+There is no separate unit-test suite; verification is by running the shell
+by hand plus two harnesses in the repository:
 
-Run with:
-```bash
-./fgsh test_*.sh
-```
+- `test-menu-duplication.py` - PTY harness for the fuzzy completion menu and
+  the Ctrl+R history picker. Spawns `bun src/fgshell.js` under a real pty,
+  replays its output through an ANSI screen model, and asserts the prompt is
+  never duplicated, the menu geometry is correct, and Enter/Escape behave as
+  expected. Run:
+
+  ```bash
+  python3 test-menu-duplication.py   # exit 0 = pass
+  ```
+
+- `src/test-fgshell.js` and `src/test-fgshell2.js` - snapshots of the shell
+  used for manual side-by-side testing (they are complete shells, not test
+  suites; run them the same way as `src/fgshell.js`).
 
 ## Debugging
 
 Enable debug output:
 ```bash
-DEBUG=1 ./fgsh script.sh
+FGSH_DEBUG=1 ./fgsh script.sh    # tokenization, expansion, spawning, signals
+FGSH_DEVEL=1 ./fgsh              # line editor pause/resume and render tracing
+FGSH_LOG=1 ./fgsh                # append startup markers to a debug log file
 ```
 
 This logs:
@@ -396,7 +409,10 @@ formatError('if: syntax error - expected "then"', context, showSnippet)
 
 ## Future Improvements
 
-1. **Complete here-document support** - Pass content to commands
+1. **Here-documents in interactive mode and `-c`** - Scripts, files loaded
+   with `source`, and `~/.fgshrc` work today; interactive/`-c` input,
+   quoted delimiters (`<<'EOF'`), and variable expansion in the body are
+   still pending
 2. **Process substitution** - `<(cmd)` and `>(cmd)` syntax
 3. **Arithmetic conditionals** - `((expr))` syntax
 4. **More builtins** - grep, sed, awk as builtins
