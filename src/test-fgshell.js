@@ -32,10 +32,11 @@ try {
   ptctl = { available: false };
 }
 
-// Version is injected at build time by build script
+// Version comes from package.json (single source of truth; the compiled
+// binary gets it injected at build time by build-fgsh.js via --define)
 let VERSION;
 try {
-  VERSION = "0.0.2a"; // This is set by the build script
+  VERSION = require('../package.json').version;
 } catch (e) {
   VERSION = 'unknown';
 }

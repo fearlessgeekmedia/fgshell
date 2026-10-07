@@ -7,7 +7,7 @@ A Unix shell with modern features like fuzzy history search and interactive file
 `fgshell` is a functional Unix shell implementation written mostly in JavaScript/Bun, with a tiny bit of C. It has many things you expect from a shell (pipes, redirections, job control, scripting) plus some genuinely useful features that bash/zsh don't have out of the box:
 
 - **Interactive file picker** (Ctrl+N) with live preview and Kitty image support
-- **Fuzzy history search** (Ctrl+R) with Fuse.js
+- **Fuzzy history search** (Ctrl+R) with Fuse.js and an OpenTUI two-pane preview UI
 - **SQLite history database** with timestamps, exit codes, and command duration
 - **Customizable prompts** with color support
 
@@ -29,9 +29,10 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 
 ### The Cool Stuff
 - **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories with live preview (includes high-quality image previews in Kitty terminals)
-- **🔍 Fuzzy history search** (Ctrl+R) — search commands by any part of the command, powered by Fuse.js
+- **🔍 Fuzzy history search** (Ctrl+R) — two-pane UI (list plus full-command preview with time, exit code and directory), fuzzy-matching powered by Fuse.js, rendered with OpenTUI
 - **💾 SQLite history database** — persistent history with timestamps, exit codes, and execution duration
 - **🎨 Customizable prompts** — full color support and variable expansion
+- **⚡ Inline command prediction** — ghost text plus a bordered, scrollable menu that completes paths as you type (`cat ~/` lists your home), shows each command's full path on the right, with an optional mtime column (`export FGSH_MENU_MTIME=1` in `~/.fgshrc`)
 - **💻 Embedded JavaScript REPL** — `js` command for quick JavaScript evaluation
 
 ### Standard Shell Features

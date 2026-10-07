@@ -1,10 +1,11 @@
 {
   "name": "fgshell",
-  "version": "0.0.2a",
+  "version": "0.1.0",
   "scripts": {
     "build": "bun run build-fgsh.js"
   },
   "dependencies": {
+    "@opentui/core": "^0.5.14",
     "bun-pty": "^0.4.2",
     "enquirer": "^2.4.1",
     "fuse.js": "^7.1.0",

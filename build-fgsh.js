@@ -1,5 +1,5 @@
 import { spawnSync } from "child_process";
-import { chmodSync, existsSync, statSync } from "fs";
+import { chmodSync, existsSync, statSync, readFileSync } from "fs";
 import { execSync } from "child_process";
 
 // Detect libc type (glibc or musl)
@@ -83,12 +83,20 @@ if (!buildPtctl()) {
 
 // Use bun CLI to compile fgsh
 console.log('Building fgsh...');
+
+// Inject the version from package.json at build time so the compiled
+// binary never needs to read package.json at runtime (single source of truth).
+const pkgVersion = JSON.parse(readFileSync('package.json', 'utf8')).version;
+console.log(`Version: ${pkgVersion}`);
+
 const result = spawnSync('bun', [
   'build',
   '--compile',
   './src/fgshell.js',
   '--outfile',
-  'fgsh'
+  'fgsh',
+  '--define',
+  `FGSH_VERSION=${JSON.stringify(pkgVersion)}`
 ], {
   cwd: process.cwd(),
   stdio: ['pipe', 'pipe', 'pipe']

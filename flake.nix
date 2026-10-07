@@ -14,7 +14,7 @@
       {
         packages.default = pkgs.stdenv.mkDerivation {
           name = "fgshell";
-          version = "0.0.2a";
+          version = (builtins.fromJSON (builtins.readFile ./package.json)).version;
           
           src = builtins.filterSource
             (path: type:

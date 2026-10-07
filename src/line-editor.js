@@ -62,6 +62,10 @@ class LineEditor extends EventEmitter {
     this._menuOpen = false;
     this._menuLines = 0;
     this._menuBase = '';        // input text the menu was built for
+    this._menuNavigated = false; // user picked an entry with Up/Down
+    this._menuScroll = 0;       // index of the first visible entry
+    this._menuMaxRows = 10;     // entries visible before the scrollbar kicks in
+    this._suppressRender = false;
     this._tabHandler = null;    // (line) => string|null
     this._onCtrlN = null;       // shell hook: file picker
     this._onCtrlR = null;       // shell hook: history picker
@@ -85,13 +89,24 @@ class LineEditor extends EventEmitter {
   set line(v) {
     this._line = v == null ? '' : String(v);
     if (this._cursor > this._line.length) this._cursor = this._line.length;
-    this._render();
+    if (!this._suppressRender) this._render();
   }
 
   get cursor() { return this._cursor; }
   set cursor(v) {
     this._cursor = Math.max(0, Math.min(Number(v) || 0, this._line.length));
-    this._render();
+    if (!this._suppressRender) this._render();
+  }
+  
+  /** Temporarily suppress renders for batch updates. Returns a function to restore. */
+  _batchRender(fn) {
+    this._suppressRender = true;
+    try {
+      return fn();
+    } finally {
+      this._suppressRender = false;
+      this._render();
+    }
   }
 
   setPrompt(p) {
@@ -105,24 +120,56 @@ class LineEditor extends EventEmitter {
 
   pause() {
     if (this._paused) return;
+    if (process.env.FGSH_DEVEL) console.error('[DEBUG] rl.pause() -> paused');
     this._paused = true;
-    // Keep raw mode and the data listener attached. The file/history pickers
-    // read keys from stdin while paused, and the shell's own rl.pause() calls
-    // (job control) are paired with resume(), which re-asserts raw mode.
+    // Release stdin completely while paused. When the shell pauses for a
+    // foreground child (job control), the child owns the terminal: keeping
+    // our data listener attached and the stream flowing made the shell race
+    // the child for every input byte and steal its terminal query replies
+    // (e.g. neofetch's \e[14t response), hanging the child until unrelated
+    // input arrived. Raw mode is left alone here — callers that hand the
+    // terminal to a child already switch it to the right mode themselves.
+    // Pickers re-attach via ensureRawMode(); resume()/prompt() re-arm both
+    // the stream and the data listener.
+    if (this.terminal) {
+      if (this._rawModeSet) {
+        try { this.input.off('data', this._onData); } catch (e) { /* ignore */ }
+        this._rawModeSet = false;
+      }
+      try { if (typeof this.input.pause === 'function') this.input.pause(); } catch (e) { /* ignore */ }
+    }
   }
 
   resume() {
-    if (!this._paused) return;
+    if (!this._paused) {
+      if (process.env.FGSH_DEVEL) console.error('[DEBUG] rl.resume() early-return (not paused)');
+      return;
+    }
+    if (process.env.FGSH_DEVEL) console.error('[DEBUG] rl.resume() -> running');
     this._paused = false;
     this._pausedInput = [];
-    // Re-assert raw mode: the shell may have disabled it for a child process.
-    if (this._active) this._setRawMode(true);
-    this._requestGhost();
-    this._render();
+    // Always take stdin back, whatever _active says: pause() released the
+    // stream and the data listener on a terminal, and callers resume in
+    // states where _active is not set yet (e.g. the continuation prompt),
+    // which would otherwise leave input dead until the next prompt().
+    // Pickers that drive the terminal themselves (OpenTUI) pause stdin
+    // and may restore raw mode off on teardown, while _setRawMode
+    // early-returns below because _rawModeSet is still true. Re-assert
+    // both explicitly or the shell never reads another key after Ctrl+R.
+    if (this.terminal && this.input.setRawMode) {
+      try { this.input.setRawMode(true); } catch (e) { /* ignore */ }
+    }
+    try { if (typeof this.input.resume === 'function') this.input.resume(); } catch (e) { /* ignore */ }
+    this._setRawMode(true);
+    // Rendering is caller's responsibility (prompt(), etc.)
   }
 
   prompt() {
-    if (this._paused) return;
+    if (process.env.FGSH_DEVEL) console.error(`[DEBUG] rl.prompt() paused=${this._paused} active=${this._active} terminal=${this.terminal}`);
+    if (this._paused) {
+      if (process.env.FGSH_DEVEL) console.error('[DEBUG] rl.prompt() EARLY RETURN (paused)');
+      return;
+    }
     this._line = '';
     this._cursor = 0;
     this._historyIndex = -1;
@@ -132,6 +179,8 @@ class LineEditor extends EventEmitter {
     this._menuIndex = 0;
     this._menuOpen = false;
     this._menuLines = 0;
+    this._menuScroll = 0;
+    this._menuNavigated = false;
     this._active = true;
     this._setRawMode(true);
     this._render();
@@ -165,7 +214,10 @@ class LineEditor extends EventEmitter {
 
   /**
    * Set the function that produces the fuzzy match list shown in the menu.
-   * @param {(line: string) => string[]} provider
+   * Each item is either a plain string or { text, right } where `right` is
+   * an optional secondary column rendered right-aligned (e.g. a relative
+   * mtime). Only `text` is inserted into the line on accept.
+   * @param {(line: string) => (string | {text: string, right?: string})[]} provider
    */
   setMenuProvider(provider) {
     this._menuProvider = provider;
@@ -229,65 +281,163 @@ class LineEditor extends EventEmitter {
 
   // ---- rendering ----
 
-  /** Erase any previously drawn completion menu. */
+  /**
+   * Erase any previously drawn completion menu.
+   *
+   * Assumes the cursor is on the prompt line: it steps down one row at a
+   * time, clearing each menu row, then steps back up. Clearing must happen
+   * *after* moving down — the old order erased the prompt line itself and
+   * left the last menu row on screen.
+   */
   _clearMenu() {
     if (!this._menuLines) return;
     let out = '';
-    for (let i = 0; i < this._menuLines; i++) out += '\r' + A.clearLine + '\n';
+    for (let i = 0; i < this._menuLines; i++) out += '\n' + '\r' + A.clearLine;
     // move back up to the prompt line
     out += `\x1b[${this._menuLines}A`;
     this._menuLines = 0;
     this._menuOpen = false;
+    this._menuNavigated = false;
     try { this.output.write(out); } catch (e) { /* ignore */ }
   }
 
-  /** Draw the fuzzy completion menu below the prompt line. */
+  /**
+   * Draw the fuzzy completion menu below the prompt line as a bordered box
+   * with a scrollbar, like Flyline's prediction list.
+   *
+   * Layout (border rows are counted in _menuLines so _clearMenu erases
+   * them too):
+   *
+   *   ╭────────────╮
+   *   │ entry      │
+   *   │ selected   │█  <- scrollbar thumb (only when there are more
+   *   │ entry      ││     entries than fit in the window)
+   *   ╰────────────╯
+   */
   _drawMenu() {
     if (!this.terminal || this._paused || !this._active) return;
     if (!this._menuOpen || !this._menuItems || !this._menuItems.length) return;
-    // Erase the previous menu (we are on the prompt line, menu is below it)
-    let out = '';
-    for (let i = 0; i < this._menuLines; i++) out += '\n\r' + A.clearLine;
-    if (this._menuLines) out += `\x1b[${this._menuLines}A`;
-    // Draw the new menu
-    out += '\n';
-    const n = this._menuItems.length;
-    for (let i = 0; i < n; i++) {
-      out += (i === this._menuIndex ? A.rev : '') + this._menuItems[i] + (i === this._menuIndex ? A.reset : '');
-      out += '\n';
+
+    const total = this._menuItems.length;
+    // Visible window: at most _menuMaxRows entries, shrunk on short terminals
+    const termRows = this.output.rows || process.stdout.rows || 24;
+    const maxRows = Math.max(3, Math.min(this._menuMaxRows, termRows - 6));
+    const rows = Math.min(total, maxRows);
+
+    // Keep the highlighted entry inside the window (this is what scrolls)
+    if (this._menuIndex < this._menuScroll) this._menuScroll = this._menuIndex;
+    if (this._menuIndex >= this._menuScroll + rows) this._menuScroll = this._menuIndex - rows + 1;
+    this._menuScroll = Math.max(0, Math.min(this._menuScroll, Math.max(0, total - rows)));
+
+    const window = this._menuItems.slice(this._menuScroll, this._menuScroll + rows);
+    const hasBar = total > rows;
+    const cols = this.output.columns || process.stdout.columns || 80;
+
+    // Optional right-aligned column (command full path, or a relative
+    // mtime), when any visible entry carries one
+    const hasRight = window.some(it => it.right);
+    let rW = 0;
+    if (hasRight) {
+      for (const it of window) rW = Math.max(rW, this._visibleLength(it.right));
+      // Command paths can run long: cap the column at ~40% of the terminal
+      rW = Math.min(rW, Math.max(8, Math.floor(cols * 0.4)));
     }
-    out += `\x1b[${n}A`;
-    this._menuLines = n;
+
+    // Inner text width: widest visible entry, clamped so the box never
+    // wraps onto the next row (which would corrupt the cursor arithmetic)
+    let w = 4;
+    for (const it of window) w = Math.max(w, this._visibleLength(it.text));
+    let maxW = cols - (hasBar ? 5 : 4); // 2 borders + 2 pads + bar + margin
+    if (hasRight) maxW -= rW + 2;       // right column + gutter
+    if (w > maxW) w = Math.max(4, maxW);
+    const inner = w + 2 + (hasRight ? rW + 2 : 0); // 1 pad each side + gutter
+    const boxW = inner + (hasBar ? 1 : 0);  // width between the two borders
+
+    // Scrollbar: thumb sized/positioned proportionally to the window
+    const bar = [];
+    if (hasBar) {
+      const size = Math.max(1, Math.floor((rows * rows) / total));
+      const room = rows - size;
+      const pos = Math.round((room * this._menuScroll) / Math.max(1, total - rows));
+      for (let r = 0; r < rows; r++) {
+        bar.push(r >= pos && r < pos + size ? '█' : '┃');
+      }
+    }
+
+    const G = '\x1b[90m'; // dim structural color (matches the picker separator)
+    const Z = '\x1b[0m';
+    const drawn = [`${G}╭${'─'.repeat(boxW)}╮${Z}`];
+    for (let r = 0; r < rows; r++) {
+      const selected = this._menuScroll + r === this._menuIndex;
+      const item = window[r];
+      let text = item.text;
+      if (this._visibleLength(text) > w) {
+        text = [...text].slice(0, Math.max(1, w - 1)).join('') + '…';
+      }
+      const pad = ' '.repeat(Math.max(0, w - this._visibleLength(text)));
+      let body = ' ' + text + pad;
+      if (hasRight) {
+        let right = item.right;
+        // Long paths keep their tail (the command name) behind an ellipsis
+        if (this._visibleLength(right) > rW) right = '…' + right.slice(-(rW - 1));
+        body += '  ' + right.padStart(rW);
+      }
+      body += ' ';
+      const line = selected ? `\x1b[7m${body}${Z}` : body;
+      drawn.push(`${G}│${Z}${line}${hasBar ? G + bar[r] + Z : ''}${G}│${Z}`);
+    }
+    drawn.push(`${G}╰${'─'.repeat(boxW)}╯${Z}`);
+
+    // Erase the previous box (we are on the prompt line, box is below it)
+    let out = '';
+    for (let i = 0; i < this._menuLines; i++) out += '\n' + '\r' + A.clearLine;
+    if (this._menuLines) out += `\x1b[${this._menuLines}A`;
+    // Draw the new box. Each row is followed by '\n' + '\r' so it starts
+    // at column 0 even when the terminal's ONLCR translation is off (raw
+    // mode). That means the cursor ends up drawn.length+1 rows below the
+    // prompt (one initial newline plus one per row), so we must move back
+    // up by exactly that much — otherwise the repaint lands one row too low
+    // and the prompt is duplicated on every keystroke.
+    out += '\n' + '\r';
+    for (const row of drawn) {
+      out += row + '\n' + '\r';
+    }
+    out += `\x1b[${drawn.length + 1}A`;
+    this._menuLines = drawn.length;
     try { this.output.write(out); } catch (e) { /* ignore */ }
     // Repaint the prompt line and restore the cursor
     this._render();
   }
 
   _render() {
-    if (!this.terminal || this._paused || !this._active) return;
-    const text = this._line;
-    // Ghost text is the suggestion suffix after the cursor
-    let ghost = '';
-    if (this._ghost && this._ghost.startsWith(text)) {
-      ghost = this._ghost.slice(text.length);
+    if (!this.terminal || this._paused || !this._active) {
+      if (process.env.FGSH_DEVEL) console.error(`[DEBUG] _render skip: terminal=${this.terminal} paused=${this._paused} active=${this._active}`);
+      return;
     }
-
-    // Two-pass render:
-    //   1. draw prompt + text + dimmed ghost (cursor ends up at the far right)
-    //   2. redraw without ghost, then move the cursor back to the input position
-    // Using relative cursor-left movement keeps this correct when the line
-    // wraps, which absolute column positioning (CSI n G) does not.
-    let out = '\r' + A.clearLine;
-    out += this.promptText + text;
+    const text = this._line;
+    const cursor = this._cursor;
+    
+    // Build the ghost portion if any
+    let ghost = '';
+    let ghostLen = 0;
+    if (this._ghost && this._ghost.startsWith(text) && this._ghost.length > text.length) {
+      ghost = this._ghost.slice(text.length);
+      ghostLen = ghost.length;
+    }
+    
+    // Calculate how far cursor is from end, plus any ghost length
+    const back = text.length - cursor;
+    const totalBack = back + ghostLen;
+    
+    let out = '\r' + A.clearLine + this.promptText + text;
     if (ghost) {
       out += A.dim + ghost + A.reset;
     }
-    // Second pass: redraw without the ghost
-    out += '\r' + A.clearLine + this.promptText + text;
-    // Cursor is now just past the input text. Move it back to the insert point.
-    const back = text.length - this._cursor;
-    if (back > 0) out += A.cursorLeft(back);
-    try { this.output.write(out); } catch (e) { /* ignore */ }
+    if (totalBack > 0) out += A.cursorLeft(totalBack);
+    
+    try { this.output.write(out); } catch (e) {
+      if (process.env.FGSH_DEVEL) console.error('[DEBUG] _render write failed:', e.message);
+    }
   }
 
   _visibleLength(s) {
@@ -353,27 +503,49 @@ class LineEditor extends EventEmitter {
       const keep = s.slice(s.lastIndexOf(ESC));
       this._pending = keep;
       s = s.slice(0, s.lastIndexOf(ESC));
-      clearTimeout(this._pendingTimer);
-      this._pendingTimer = setTimeout(() => {
-        this._pendingTimer = null;
-        if (!this._pending) return;
-        const lone = this._pending;
-        this._pending = '';
-        this._deliverLoneEscape(lone);
-      }, 40);
+      this._armPendingTimer();
     }
     if (!s) return;
     let i = 0;
     while (i < s.length) {
+      if (this._paused) {
+        // A key earlier in this chunk paused the editor (Ctrl+N/Ctrl+R
+        // open a picker). The rest of the chunk belongs to the picker: queue
+        // it as picker input instead of running it through _handleKey,
+        // where Enter used to be swallowed by _submit() and the picker
+        // never saw it (Ctrl+N+Enter arriving in one read never closed).
+        this._pausedInput.push(Buffer.from(s.slice(i)));
+        this._flushPausedInput();
+        break;
+      }
       const consumed = this._handleKey(s, i);
       i += consumed > 0 ? consumed : 1;
     }
     this._render();
   }
 
+  /** Start (or restart) the flush window for a held partial escape sequence. */
+  _armPendingTimer() {
+    clearTimeout(this._pendingTimer);
+    this._pendingTimer = setTimeout(() => {
+      this._pendingTimer = null;
+      if (!this._pending) return;
+      const lone = this._pending;
+      this._pending = '';
+      this._deliverLoneEscape(lone);
+    }, 40);
+  }
+
   /** A lone ESC survived the flush window: deliver it as a real Escape key. */
   _deliverLoneEscape(lone) {
     if (this._paused) {
+      // While a picker is open Escape must reach it (it cancels the picker).
+      // If the picker hasn't attached its listener yet, queue the byte so it
+      // is replayed as soon as it does.
+      if (!this.listenerCount('keypress')) {
+        this._pausedInput.push(Buffer.from(lone));
+        return;
+      }
       this._emitKeypressFor(lone);
       return;
     }
@@ -384,10 +556,11 @@ class LineEditor extends EventEmitter {
       return;
     }
     if (this._line) {
-      this._line = '';
-      this._cursor = 0;
-      this._ghost = '';
-      this._render();
+      this._batchRender(() => {
+        this._line = '';
+        this._cursor = 0;
+        this._ghost = '';
+      });
     }
   }
 
@@ -399,9 +572,12 @@ class LineEditor extends EventEmitter {
     let s = this._pending + Buffer.concat(queued).toString('utf8');
     this._pending = '';
     if (this._isPartialTail(s)) {
-      // Still incomplete — put it back for the next flush
+      // Still incomplete — put it back for the next flush, and arm the same
+      // 40ms window as the unpaused path so a genuinely lone Escape reaches
+      // the picker instead of being held forever.
       this._pending = s.slice(s.lastIndexOf(ESC));
       s = s.slice(0, s.lastIndexOf(ESC));
+      this._armPendingTimer();
     }
     if (s) this._emitKeypressFor(s);
   }
@@ -442,7 +618,15 @@ class LineEditor extends EventEmitter {
             (m = rest.match(/^\x1b_[\s\S]*?\x1b\\/)) ||
             (m = rest.match(/^\x1bP[\s\S]*?\x1b\\/))) {
           str = m[0];
-          key = { name: arrows[str] || 'escape', ctrl: false, meta: false, shift: false, sequence: str };
+          // The map is keyed without the ESC prefix ('[B'), so strip it —
+          // looking up the full sequence never matched and every arrow key
+          // fell through to 'escape', which made the pickers treat
+          // navigation as "cancel" and close. Also normalize the
+          // application-cursor form (\x1bOB -> \x1b[B).
+          let seq = str.slice(1);
+          if (seq[0] === 'O') seq = '[' + seq.slice(1);
+          const name = arrows[seq] || 'unknown';
+          key = { name, ctrl: false, meta: false, shift: false, sequence: str };
           i += str.length;
           this.emit('keypress', str, key);
           continue;
@@ -465,7 +649,14 @@ class LineEditor extends EventEmitter {
       } else if (ch === '\x12') {
         key = { name: 'r', ctrl: true, meta: false, shift: false, sequence: ch };
       } else if (ch < ' ') {
-        key = { name: ch, ctrl: true, meta: false, shift: false, sequence: ch };
+        // Readline-compatible control-key names: \x06 -> 'f', \x01 -> 'a',
+        // etc. Using the raw byte as the name meant `key.name === 'f'`
+        // never matched, so Ctrl+F never activated the pickers' filter
+        // mode and typed filter text was silently dropped.
+        const letter = (ch >= '\x01' && ch <= '\x1a')
+          ? String.fromCharCode(ch.charCodeAt(0) + 96)
+          : ch;
+        key = { name: letter, ctrl: true, meta: false, shift: false, sequence: ch };
       }
       i += ch.length;
       this.emit('keypress', str, key);
@@ -514,8 +705,12 @@ class LineEditor extends EventEmitter {
     switch (ch) {
       case '\r':
       case '\n':
-        // Enter with a menu open accepts the highlighted entry
-        if (this._menuOpen && this._menuAccept()) return 1;
+        // Enter runs the line as typed. It only accepts a menu entry when
+        // the entry was picked deliberately (moved with Up/Down) or when the
+        // menu holds a single candidate. Without that, typing "ls" + Enter
+        // silently swapped in the highlighted row ("ls -la" from history)
+        // instead of running "ls" — forcing an Escape first.
+        if (this._menuOpen && this._menuAcceptsOnEnter() && this._menuAccept()) return 1;
         this._submit();
         return 1;
 
@@ -639,16 +834,10 @@ class LineEditor extends EventEmitter {
   }
 
   _tab() {
-    // Tab with the menu open: accept the highlighted entry
-    if (this._menuOpen) {
-      if (this._menuAccept()) return;
-      // Only one candidate left and nothing highlighted — take it
-      if (this._menuItems && this._menuItems.length === 1) {
-        this._menuIndex = 0;
-        this._menuAccept();
-        return;
-      }
-    }
+    // Tab with the menu open: accept the highlighted entry. A no-op accept
+    // (the row already is the line) falls through, so Tab can still take
+    // the ghost suggestion or complete via the shell's completer.
+    if (this._menuOpen && this._menuAccept()) return;
     // Tab: accept ghost if present, else insert spaces for indent
     if (this._ghost && this._ghost.startsWith(this._line) && this._ghost.length > this._line.length) {
       this._acceptGhost();
@@ -671,9 +860,11 @@ class LineEditor extends EventEmitter {
   _acceptGhost() {
     if (!this._ghost) return;
     if (this._ghost.startsWith(this._line)) {
-      this._line = this._ghost;
-      this._cursor = this._line.length;
-      this._ghost = '';
+      this._batchRender(() => {
+        this._line = this._ghost;
+        this._cursor = this._line.length;
+        this._ghost = '';
+      });
     }
   }
 
@@ -681,9 +872,12 @@ class LineEditor extends EventEmitter {
     this._ctrlCCount++;
     if (this._ctrlCCount === 1) {
       // Clear the line, show feedback
+      // Repaint without the ghost suggestion first — the aborted line stays
+      // on screen and should show exactly what was typed.
+      this._ghost = '';
+      this._render();
       this._line = '';
       this._cursor = 0;
-      this._ghost = '';
       this._active = false;
       try { this.output.write('\n' + A.clearLine); } catch (e) {}
       this.emit('SIGINT');
@@ -711,19 +905,20 @@ class LineEditor extends EventEmitter {
 
   _submit() {
     const line = this._line;
-    // Erase the menu before the newline so it doesn't scroll into the output
-    if (this._menuOpen) {
-      let out = '';
-      for (let i = 0; i < this._menuLines; i++) out += '\r' + A.clearLine + '\n';
-      out += `\x1b[${this._menuLines}A`;
-      this._menuLines = 0;
-      this._menuOpen = false;
-      try { this.output.write(out); } catch (e) {}
-    }
+    // Erase the menu before the newline so it doesn't scroll into the output.
+    // _clearMenu returns the cursor to the prompt line, which is then left
+    // intact (matching the menu-closed path): the submitted line stays
+    // visible and output starts on the row below it.
+    this._clearMenu();
     this._menuItems = [];
+    // Repaint the prompt row as the plain typed line before leaving it
+    // behind: the ghost suggestion is not part of what was submitted and
+    // must not linger on the executed line ("ls" + Enter used to leave
+    // "ls -la" printed as if it had run).
+    this._ghost = '';
+    this._render();
     this._line = '';
     this._cursor = 0;
-    this._ghost = '';
     this._active = false;
     this._historyIndex = -1;
     this._historyStash = null;
@@ -810,48 +1005,89 @@ class LineEditor extends EventEmitter {
       this._menuItems = [];
       return;
     }
-    let items;
+    let raw;
     try {
-      items = this._menuProvider(input) || [];
+      raw = this._menuProvider(input) || [];
     } catch (e) {
-      items = [];
+      raw = [];
     }
-    items = items.filter(x => typeof x === 'string' && x.length).slice(0, 10);
-    // Don't show the menu when the only match is what the user already typed
-    items = items.filter(x => x !== input);
-    if (!items.length) {
+    // Normalize items: plain strings become { text, right: '' }
+    const items = [];
+    for (const x of raw) {
+      if (items.length >= 50) break;
+      if (typeof x === 'string') {
+        if (x.length) items.push({ text: x, right: '' });
+      } else if (x && typeof x.text === 'string' && x.text.length) {
+        items.push({ text: x.text, right: x.right ? String(x.right) : '' });
+      }
+    }
+    // Don't echo what the user already typed — unless the row carries a
+    // detail (the command's full path) that makes it worth showing
+    const matches = items.filter(it => it.text !== input || it.right);
+    if (!matches.length) {
       if (this._menuOpen) this._clearMenu();
       this._menuItems = [];
       this._menuBase = input;
       return;
     }
-    this._menuItems = items;
+    // Reset selection when the query changed. Compare before overwriting
+    // _menuBase — assigning first made this condition always false, so the
+    // highlight carried over to the new match list instead of resetting.
+    const queryChanged = this._menuBase !== input;
+    this._menuItems = matches;
     this._menuBase = input;
-    // Reset selection when the query changed
-    if (!this._menuOpen || this._menuBase !== input) this._menuIndex = 0;
+    if (!this._menuOpen || queryChanged) {
+      this._menuIndex = 0;
+      this._menuScroll = 0;
+      // Typing resets the selection, so any earlier Up/Down pick is void.
+      this._menuNavigated = false;
+    }
     this._menuOpen = true;
     this._drawMenu();
   }
 
-  /** Move the menu selection. */
+  /** Move the menu selection. Moving marks the choice as deliberate. */
   _menuMove(delta) {
     if (!this._menuOpen || !this._menuItems.length) return;
     const n = this._menuItems.length;
     this._menuIndex = (this._menuIndex + delta + n) % n;
+    this._menuNavigated = true;
     this._drawMenu();
+  }
+
+  /**
+   * Whether Enter should accept the highlighted entry instead of submitting
+   * the typed line: only when the user moved the selection with Up/Down, or
+   * when the menu offers exactly one candidate (an unambiguous completion).
+   */
+  _menuAcceptsOnEnter() {
+    return this._menuNavigated || this._menuItems.length === 1;
   }
 
   /** Put the highlighted menu entry on the command line. */
   _menuAccept() {
     if (!this._menuOpen || !this._menuItems.length) return false;
     const choice = this._menuItems[this._menuIndex];
-    if (!choice) return false;
+    if (!choice || !choice.text) return false;
+    // Replace only the token being completed (the whole line when the
+    // query had no space), so "cat ~/" + ".fgshrc" becomes
+    // "cat ~/.fgshrc" instead of dropping the command. The secondary
+    // column (path/mtime) is display-only and never inserted.
+    let start = this._line.length;
+    while (start > 0 && !/\s/.test(this._line[start - 1])) start--;
+    const line = this._line.slice(0, start) + choice.text;
+    // Highlighted row already IS the line (a command shown for its path):
+    // report "no change" so Enter submits instead of swallowing the key
+    if (line === this._line) return false;
     this._clearMenu();
     this._menuItems = [];
-    this._line = choice;
-    this._cursor = choice.length;
-    this._ghost = '';
-    this._render();
+    this._batchRender(() => {
+      this._ghost = '';
+      this._line = line;
+      this._cursor = line.length;
+    });
+    // A completed directory keeps predicting: show what's inside it
+    if (choice.text.endsWith('/')) this._requestGhost();
     return true;
   }
 

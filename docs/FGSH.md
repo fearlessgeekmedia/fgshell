@@ -250,12 +250,22 @@ Quick overview:
 
 ### Fuzzy History Search (Ctrl+R)
 
-Uses Fuse.js to search historical commands:
-1. User presses Ctrl+R
-2. Display search interface
-3. Filter commands as user types
-4. Show matching commands with context
-5. Execute selected command
+A two-pane search UI over the SQLite history, built with
+[OpenTUI](https://opentui.com) (`@opentui/core`) and Fuse.js:
+1. User presses Ctrl+R — the picker takes over the screen in the
+   alternate buffer, so the prompt and scrollback are untouched
+2. Left pane lists commands (newest first) with timestamp and exit code;
+   the right pane previews the selection: full command, time, exit code,
+   duration and directory
+3. Typing fuzzy-filters the list (Fuse.js, substring fallback)
+4. Up/Down move the selection; the mouse wheel/click work too
+5. Enter inserts the selected command into the prompt line; Escape or
+   Ctrl+C cancels without changing the line (Enter with no matches just
+   closes the picker)
+
+The OpenTUI core is loaded lazily the first time Ctrl+R is pressed, and
+works in the compiled `./fgsh` binary (its native library is embedded by
+`bun build --compile`).
 
 ### File Picker (Ctrl+N)
 
@@ -263,8 +273,44 @@ Custom file browser:
 1. User presses Ctrl+N
 2. Display directory tree
 3. Show live preview of selected file
-4. Navigate with arrow keys
-5. Insert selected path into command line
+4. Navigate with arrow keys: Up/Down move the list, Left goes to the
+   parent directory, Right enters the highlighted directory (the picker
+   browses on its own — it never changes the shell's working directory)
+5. Enter selects the highlighted entry — a file **or a directory** — and
+   closes the picker. The selected path is inserted relative to the
+   shell's cwd (`docs/notes.md` when picked inside `docs/`, a bare
+   `notes.md` when picked in the cwd itself, or the absolute path when the
+   file lives outside the cwd)
+6. Ctrl+F opens filter mode: typed text fuzzy-filters the list, Enter
+   selects the best match
+
+### Command Prediction Menu
+
+The fuzzy prediction box drawn below the prompt while typing:
+
+1. Matches commands/history at the start of a line — each command row
+   shows the executable's full path on the right of the box — path/file
+   candidates for the current token after a space (tilde-expanded, so
+   `cat ~/` lists the home directory), and long options after `--`
+2. Draws a bordered box with a scrollbar once more than 10 entries match
+3. Up/Down move the selection and Tab accepts it; Enter runs the line as
+   you typed it, so `ls` + Enter always runs `ls` — Enter only accepts a
+   menu entry after you picked it with Up/Down (or when the menu holds a
+   single candidate). Escape dismisses
+4. Accepting replaces only the current token: `cat ~/` + `.fgshrc` becomes
+   `cat ~/.fgshrc`; accepting a directory reopens the menu inside it
+5. Inline ghost text previews the best candidate after the cursor
+
+Optional behavior is configured through environment variables set in
+`~/.fgshrc`. To show a right-aligned relative modification time next to
+each file entry (as in Flyline):
+
+```sh
+export FGSH_MENU_MTIME=1
+```
+
+The age column is display-only — accepting an entry inserts the path, never
+the age. Off by default.
 
 ## Performance Considerations
 
