@@ -1,6 +1,6 @@
 # fgshell
 
-A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime.
+A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime. Runs on Linux, macOS, and GhostBSD/FreeBSD.
 
 ## What is this?
 
@@ -62,14 +62,16 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 
 ### Platform Support
 
-**fgshell currently only works on Linux and macOS.** It requires:
-- POSIX-compliant system with proper terminal control (Linux, macOS)
-- [Bun](https://bun.sh) runtime, which is available for Linux and macOS only
-- Not available on Windows or BSD systems (except macOS)
+**fgshell runs on Linux, macOS, and GhostBSD/FreeBSD.** It requires:
+- POSIX-compliant system with proper terminal control (Linux, macOS, GhostBSD/FreeBSD)
+- [Bun](https://bun.sh) runtime — official builds for Linux and macOS; a community FreeBSD x64 build (works on GhostBSD and other FreeBSD systems) is available via the [SourceForge mirror](https://sourceforge.net/projects/bun.mirror/files/)
+- Not available on Windows
+
+GhostBSD/FreeBSD users: see [BUILD_GHOSTBSD.md](BUILD_GHOSTBSD.md) for a detailed build guide.
 
 ### Requirements
 
-- [Bun](https://bun.sh) (JavaScript runtime) - Linux x64, Linux ARM64, macOS (x64 and ARM64)
+- [Bun](https://bun.sh) (JavaScript runtime) - Linux x64, Linux ARM64, macOS (x64 and ARM64), FreeBSD x64 (community build via SourceForge)
 - `make` and `gcc` (for compiling job control FFI bindings)
 - Node.js 18+ or Bun (for package management)
 
@@ -123,6 +125,36 @@ npm install  # or: bun install
 bun run build
 ```
 
+#### Option 4: GhostBSD/FreeBSD
+
+fgshell builds natively on GhostBSD and FreeBSD. The job control code (`ptctl.c`) uses standard POSIX interfaces (termios, `tcsetpgrp`, `TIOCSCTTY`) that FreeBSD provides, so no code changes are needed.
+
+**Prerequisites:**
+
+```bash
+# Install the build toolchain
+sudo pkg install gcc make git unzip
+```
+
+**Get Bun:** FreeBSD builds of Bun are not yet on bun.sh directly — download the community build from the [SourceForge mirror](https://sourceforge.net/projects/bun.mirror/files/):
+
+```bash
+# Download bun-freebsd-x64.zip, then:
+unzip bun-freebsd-x64.zip
+sudo cp bun-freebsd-x64/bun /usr/local/bin/
+bun --version  # verify it runs
+```
+
+**Build:**
+
+```bash
+bun install
+./build-ptctl.sh
+bun run build
+```
+
+See [BUILD_GHOSTBSD.md](BUILD_GHOSTBSD.md) for the full guide, including troubleshooting.
+
 ### Running
 
 ```bash
@@ -145,7 +177,7 @@ bun run build
 | JSON/YAML output from builtins | ✓ | ✗ | ✗ |
 | Basic shell features | ✓ | ✓ | ✓ |
 | POSIX compatibility | ✗ | ✓ | ✓ |
-| Cross-platform (Unix/Linux/macOS) | ✓ | ✓ | ✓ |
+| Cross-platform (Linux/macOS/FreeBSD) | ✓ | ✓ | ✓ |
 
 ## Architecture
 
@@ -168,10 +200,12 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 - [HISTORY.md](docs/HISTORY.md) - Command history system
 - [PROMPT.md](docs/PROMPT.md) - Prompt customization
 - [JAVASCRIPT.md](docs/JAVASCRIPT.md) - Using JavaScript from the shell with the `js` builtin
+- [BUILD_GHOSTBSD.md](BUILD_GHOSTBSD.md) - Building on GhostBSD/FreeBSD
+- [BUILD_CHIMERA.md](BUILD_CHIMERA.md) - Building on Chimera Linux (musl)
 
 ## Known Limitations & Issues
 
-- **Platform support**: Linux and macOS only. Bun is not available on other Unix systems (BSD, etc.)
+- **Platform support**: Linux, macOS, and GhostBSD/FreeBSD. Not available on Windows. On FreeBSD, Bun comes from a community build rather than an official bun.sh release, so it may lag behind the latest version
 - **sudo TTY access**: `sudo` without the `-S` flag fails to read passwords interactively when run inside `fgshell`, regardless of whether `fgshell` is the default shell or a subshell. Workaround: use `sudo -S` to read password from stdin
 - **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
