@@ -41,6 +41,7 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 ### Standard Shell Features
 - **Command execution** with proper process spawning
 - **Pipes and redirection**: `|`, `>`, `>>`, `<`
+- **Clipboard integration**: `ls | clip` copies a command's output to the system clipboard, working on Wayland (`wl-copy`), X11 (`xclip`/`xsel`), and macOS (`pbcopy`)
 - **Background jobs**: `cmd &` and `jobs`, `fg`, `bg` builtins
 - **Environment variables**: `$VAR` and `${VAR}` expansion
 - **Command substitution**: `$(command)` and arithmetic `$((expr))`
@@ -55,7 +56,7 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 - **Here-documents** with `<<EOF` (in scripts, files loaded with `source`, and `~/.fgshrc`)
 - **Signal traps** with `trap` command
 - **Sourcing**: `source file` to run a script in the current shell
-- **Built-in commands**: `cd`, `mkcd`, `pwd`, `clear`, `echo`, `ls`, `cat`, `printf`, `export`, `unset`, `env`, `history`, `alias`, `unalias`, `source`, `declare`, `read`, `test`/`[`, `trap`, `jobs`, `fg`, `bg`, `true`, `false`, `exit`, `js`
+- **Built-in commands**: `cd`, `mkcd`, `pwd`, `clear`, `echo`, `ls`, `cat`, `clip`, `printf`, `export`, `unset`, `env`, `history`, `alias`, `unalias`, `source`, `declare`, `read`, `test`/`[`, `trap`, `jobs`, `fg`, `bg`, `true`, `false`, `exit`, `js`
 - **Helpful error messages** with file:line references and source code snippets in scripts
 
 ## Building

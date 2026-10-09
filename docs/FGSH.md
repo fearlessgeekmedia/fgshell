@@ -167,6 +167,7 @@ Available builtins:
 - `echo` / `printf` - output text
 - `cd` / `mkcd` / `pwd` / `clear` - directory and terminal management
 - `ls` / `cat` - file listing and concatenation
+- `clip` - copy standard input to the system clipboard (Wayland `wl-copy`, X11 `xclip`/`xsel`, or macOS `pbcopy`)
 - `export` / `unset` / `env` - environment variables
 - `declare` - display arrays/variables
 - `alias` / `unalias` - command shortcuts
