@@ -52,6 +52,18 @@ video. It then asserts:
     fuzzy-filters as you type, inserts the selected command on Enter,
     cancels on Escape without touching the line, and leaves the shell
     reading keyboard input afterwards (its teardown pauses stdin)
+  * small windows — the line duplication/distortion regression (TODO.md
+    2026-10-07): on a narrow window the wrapped input line never leaves a
+    stale copy of the prompt on screen (repainting used to start from the
+    last wrapped row, so every keystroke painted the prompt again one row
+    down), a shrunken line clears its old wrapped rows, and on short
+    terminals the fuzzy box survives drawing past the bottom (a scroll)
+    with exactly one box below the live prompt, both borders, and no
+    prompt row inside or below it
+  * a powerline-style prompt ending in a zero-width space (U+200B, as
+    built by fgsh-prompt): the cursor sits on the cell right after the
+    painted text — string length counts the ZWSP as a column and put the
+    cursor one space ahead of the text
 
 Usage:  python3 test-menu-duplication.py
 Exit code 0 = all checks passed, 1 = at least one failure.
@@ -70,6 +82,7 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 
 COLS, ROWS = 100, 40
 PROMPT_MARKER = " > "        # default PS1 is "user:cwd > " (needs bun: bun:sqlite)
@@ -124,6 +137,12 @@ class Screen:
         elif ch == "\t":
             self.col = min(self.cols - 1, (self.col // 8 + 1) * 8)
         elif ch >= " ":
+            # Zero-width codepoints (combining marks, format controls like
+            # the U+200B a powerline prompt ends with, variation selectors)
+            # advance nothing in a real terminal; painting them as cells
+            # would make the model disagree with actual terminals.
+            if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+                return
             if self.col >= self.cols:
                 self.col = 0
                 self.row += 1
@@ -309,7 +328,9 @@ class Screen:
 
 
 # ----------------------------------------------------------------- pty driver
-def spawn(rc_line=None, start_dir=None, kitty=False):
+def spawn(rc_line=None, start_dir=None, kitty=False, cols=None, rows=None):
+    cols = COLS if cols is None else cols
+    rows = ROWS if rows is None else rows
     home = tempfile.mkdtemp(prefix="fgsh-home-")
     # Fixture files: a directory, two plain names, and enough fileNN entries
     # to overflow the menu's 10-row window (which forces the scrollbar).
@@ -336,6 +357,10 @@ def spawn(rc_line=None, start_dir=None, kitty=False):
         "TERM": "xterm-256color",
         "PS1": "",           # force the default colored prompt
         "FGSH_DEBUG": "",
+        # bun drops a .bun cache dir into $HOME on startup, which then
+        # shows up as the picker's first entry and breaks the fixture's
+        # "docs/ is first" expectations — keep it outside the fixture home.
+        "XDG_CACHE_HOME": os.path.join(tempfile.gettempdir(), "fgsh-bun-cache"),
     })
     if kitty:
         env["KITTY_WINDOW_ID"] = "1"  # getImageSupport() => 'kitty'
@@ -347,7 +372,7 @@ def spawn(rc_line=None, start_dir=None, kitty=False):
         # Absolute script path: start_dir may be outside the project.
         os.execvpe("bun", ["bun", os.path.join(PROJECT_DIR, "src", "fgshell.js")], env)
     Screen.reply_fd = fd  # let the screen model answer CPR queries
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     return pid, fd, home
 
 
@@ -569,6 +594,8 @@ def main():
     picker_subdir_session()
     kitty_preview_session()
     history_session()
+    small_window_sessions()
+    cursor_session()
 
     print()
     if failures:
@@ -966,6 +993,215 @@ def history_session():
                 if marker_rows else None)
         check(bool(live) and live.startswith("echo alive"),
               f"hist: line editor still reads keys after the picker ({live!r})")
+    finally:
+        cleanup(pid, fd, home)
+
+
+# ------------------------------------------------ small-window regression
+def _box_geometry_ok(screen):
+    """True when the fuzzy box on screen is sane: at most one box, below
+    the live prompt row, with both borders, entries between them, and no
+    prompt row inside or below it. Also rejects entries without borders
+    (a box whose border rows were scrolled/overwritten away)."""
+    raw = screen.raw_rows()
+    markers = [i for i, r in enumerate(raw) if PROMPT_MARKER in r]
+    live = markers[-1] if markers else -1
+    tops = [i for i, r in enumerate(raw) if "╭" in r]
+    bots = [i for i, r in enumerate(raw) if "╰" in r]
+    entries = [i for i, r in enumerate(raw) if r.lstrip().startswith("│")]
+    if not tops and not bots and not entries:
+        return True          # no menu on screen — nothing to judge
+    if len(tops) != 1 or len(bots) != 1:
+        return False         # duplicated or partially erased box
+    if not entries:
+        return False         # border without content: broken box
+    if tops[0] >= bots[0]:
+        return False         # top/bottom borders out of order
+    if live < 0 or tops[0] <= live:
+        return False         # box overlapping or above the live prompt
+    if any(m > tops[0] for m in markers):
+        return False         # a prompt row inside/after the box
+    return True
+
+
+def narrow_session():
+    """50x40: prompt + line wrap onto three rows while typing.
+
+    Every repaint must return to the prompt's home row. The old code
+    started each repaint where the cursor was — the last wrapped row —
+    so every keystroke painted a fresh copy of the prompt below the
+    previous one (the duplication in duplication-bug.png)."""
+    cols, rows = 50, 40
+    pid, fd, home = spawn(cols=cols, rows=rows)
+    screen = Screen(cols, rows)
+    try:
+        wait_for_prompt(fd, screen)
+        check(len(screen.prompt_rows()) == 1, "narrow: one prompt at startup")
+
+        send(fd, screen, 'echo "line duplication/distortion issue when the wind',
+             "narrow: type until the line wraps")
+        raw = screen.raw_rows()
+        check(len(screen.prompt_rows()) == 1,
+              "narrow: prompt stays single while the line wraps")
+        check(sum(1 for r in raw if "ortion issue" in r) == 1,
+              "narrow: wrapped continuation row exists exactly once")
+
+        send(fd, screen, 'ow is small and the fuzzy box grows',
+             "narrow: keep typing (three wrapped rows)",
+             expect_single_prompt=False)
+        check(len(screen.prompt_rows()) == 1, "narrow: still a single prompt")
+
+        # A line that shrinks below the wrap must clear its old rows
+        send(fd, screen, "\x7f" * 70, "narrow: backspace past the wrap",
+             expect_single_prompt=False)
+        check(len(screen.prompt_rows()) == 1,
+              "narrow: single prompt after the line shrinks")
+        check(not any("ortion issue" in r for r in screen.raw_rows()),
+              "narrow: stale wrapped rows cleared when the line shrinks")
+
+        send(fd, screen, "\x1b[F", "narrow: end of line",
+             expect_single_prompt=False)
+        send(fd, screen, '"', "narrow: close the quote",
+             expect_single_prompt=False)
+        send(fd, screen, "\r", "narrow: submit the wrapped line",
+             expect_single_prompt=False)
+        check(len(screen.prompt_rows()) == 2,
+              "narrow: submitted line + exactly one fresh prompt")
+
+        send(fd, screen, "ec", "narrow: type at the fresh prompt",
+             expect_single_prompt=False)
+        check(len(screen.prompt_rows()) == 2,
+              "narrow: no prompt copies appear while typing again")
+        check(_box_geometry_ok(screen),
+              "narrow: box hangs below the wrapped input, borders intact")
+    finally:
+        cleanup(pid, fd, home)
+
+
+def short_window_session():
+    """100x12: push the live prompt near the bottom, then open the fuzzy
+    box so that prompt + box no longer fit — drawing past the last row
+    scrolls the screen. The old row-by-row erase lost rows during the
+    scroll (the newline scrolled instead of moving the cursor), leaving a
+    corrupted box and duplicated prompt rows."""
+    cols, rows = 100, 12
+    pid, fd, home = spawn(cols=cols, rows=rows)
+    screen = Screen(cols, rows)
+    try:
+        wait_for_prompt(fd, screen)
+        # Four no-output submits stack cmd rows 0-3 and leave the live
+        # prompt on row 4 of 12; the 8-row box then overflows the bottom.
+        for n in range(4):
+            send(fd, screen, "true", f"short: type true #{n + 1}",
+                 expect_single_prompt=False)
+            send(fd, screen, "\r", f"short: submit true #{n + 1}",
+                 expect_single_prompt=False)
+        before = len(screen.prompt_rows())
+        check(before == 5,
+              f"short: four kept lines + one fresh prompt ({before})")
+
+        send(fd, screen, "e", "short: open the menu near the bottom",
+             expect_single_prompt=False)
+        raw = screen.raw_rows()
+        live = [i for i, r in enumerate(raw) if PROMPT_MARKER in r][-1]
+        check(live < rows - 1, f"short: live prompt still visible (row {live})")
+        check(_box_geometry_ok(screen),
+              "short: box intact after drawing past the bottom")
+        check(len(screen.prompt_rows()) <= before,
+              "short: scrolling drops old rows, never adds prompt copies")
+
+        send(fd, screen, "c", "short: refilter the menu",
+             expect_single_prompt=False)
+        check(_box_geometry_ok(screen), "short: box intact after refilter")
+        check(len(screen.prompt_rows()) <= before,
+              "short: no prompt copies after refilter")
+
+        send(fd, screen, "\x1b[B", "short: down arrow",
+             expect_single_prompt=False)
+        check(_box_geometry_ok(screen), "short: box intact after navigation")
+        check(len(screen.prompt_rows()) <= before,
+              "short: no prompt copies after navigation")
+    finally:
+        cleanup(pid, fd, home)
+
+
+def tiny_window_session():
+    """80x6: a six-row terminal. The box's row window used to be floored
+    at three entries (five box rows) regardless of height, so even the
+    prompt-on-top case overflowed; the floor is one entry now, and the
+    scroll-consistent draw keeps the geometry right either way."""
+    cols, rows = 80, 6
+    pid, fd, home = spawn(cols=cols, rows=rows)
+    screen = Screen(cols, rows)
+    try:
+        wait_for_prompt(fd, screen)
+        send(fd, screen, "true", "tiny: type true")
+        send(fd, screen, "\r", "tiny: submit true", expect_single_prompt=False)
+        check(len(screen.prompt_rows()) == 2,
+              "tiny: submitted line + one fresh prompt")
+
+        send(fd, screen, "e", "tiny: open the menu",
+             expect_single_prompt=False)
+        raw = screen.raw_rows()
+        live = [i for i, r in enumerate(raw) if PROMPT_MARKER in r][-1]
+        check(live < rows - 1, f"tiny: live prompt still visible (row {live})")
+        check(_box_geometry_ok(screen),
+              "tiny: box fits the six-row terminal")
+        check(len(screen.prompt_rows()) == 2,
+              "tiny: no prompt copies on a tiny terminal")
+    finally:
+        cleanup(pid, fd, home)
+
+
+def small_window_sessions():
+    """Fresh shells on small windows — the line duplication/distortion
+    regression (TODO.md 'line duplication and distortion when terminal
+    windows are smaller or the fuzzy search is too large')."""
+    narrow_session()
+    short_window_session()
+    tiny_window_session()
+
+
+def cursor_session():
+    r"""Prompt with a zero-width space (U+200B) — the powerline prompt
+    fgsh-prompt builds ends with one.
+
+    String length counts the ZWSP as a column; a terminal paints it in
+    zero cells. If the editor measures the prompt by string length, the
+    edit cursor lands one space ahead of the painted text (the bug with
+    PS1=$(fgsh-prompt \$?)). Width must come from display cells."""
+    cols, rows = 80, 24
+    zwsp = "\u200b"
+    pid, fd, home = spawn(rc_line=f'PS1="e{zwsp}:fgshell > "',
+                          cols=cols, rows=rows)
+    screen = Screen(cols, rows)
+    try:
+        wait_for_prompt(fd, screen)
+        # The .fgshrc prompt is active (it carries 'e:fgshell', which the
+        # default "fearlessgeek:fgshell" prompt does not contain). The ZWSP
+        # itself never appears as a cell — terminals paint it in zero.
+        check(any("e:fgshell" in r for r in screen.raw_rows()),
+              "zwsp: ZWSP prompt from .fgshrc is active")
+        check(len(screen.prompt_rows()) == 1, "zwsp: one prompt at startup")
+
+        send(fd, screen, "true", "zwsp: type 'true'")
+        # Painted prompt width: where the typed text actually starts.
+        painted = screen.raw_rows()[screen.prompt_index()].index("true")
+        check(screen.col == painted + 4,
+              f"zwsp: cursor right after the painted text "
+              f"(col {screen.col}, want {painted + 4})")
+        check(screen.row == screen.prompt_index(),
+              "zwsp: cursor stays on the prompt row")
+
+        send(fd, screen, "\x1b[D", "zwsp: left arrow")
+        check(screen.col == painted + 3,
+              f"zwsp: left arrow moves the cursor one cell "
+              f"(col {screen.col}, want {painted + 3})")
+
+        send(fd, screen, "\x15", "zwsp: ctrl-u clears the line")
+        check(screen.col == painted,
+              f"zwsp: cleared cursor sits after the prompt "
+              f"(col {screen.col}, want {painted})")
     finally:
         cleanup(pid, fd, home)
 
