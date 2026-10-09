@@ -5,7 +5,7 @@
  * - Parse commands with quotes and escapes
  * - Pipes, redirection: >, >>, <
  * - Background jobs with &
- * - Builtins: cd, mkcd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf
+ * - Builtins: cd, mkcd, pwd, exit, export, unset, env, jobs, fg, bg, echo, ls, printf, clip
  * - Environment variable expansion: $VAR
  * - Tab completion for files/dirs
  * - Job control with signal forwarding (SIGINT, SIGTSTP)
@@ -17,9 +17,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const readline = require('readline');
 const os = require('os');
+const util = require('util');
 const glob = require('glob');
 const minimist = require('minimist');
 const SHELL = require('./shell');
@@ -93,6 +94,20 @@ const help = {
 
   Exit status:
   Always successful (0) unless a write error occurs.
+  `,
+  clip: `clip [FILE]...
+  Copy standard input to the system clipboard.
+
+  Reads text from a pipe (or from FILE operands) and places it on the
+  clipboard, working under both Wayland (wl-copy) and X11 (xclip/xsel).
+
+  Usage:
+    ls | clip              copy the output of a command
+    echo "hello" | clip    copy a literal string
+    clip notes.txt         copy the contents of a file
+
+  Exit status:
+  Returns 0 on success, non-zero if no clipboard tool is available.
   `,
   cd: `cd [-L|-P] [DIR]
   Change the shell working directory.
@@ -1766,6 +1781,36 @@ try {
     }
     return 0;
   },
+  clip: async function(args) {
+    if (args.includes('--help')) {
+      console.log(help.clip);
+      return 0;
+    }
+    // Input precedence: explicit FILE operands, then piped stdin, then a
+    // stream redirected directly into the shell.
+    let data;
+    const fileOperands = args.slice(1).filter(a => a !== '--' && !a.startsWith('-'));
+    if (fileOperands.length > 0) {
+      const parts = [];
+      for (const f of fileOperands) {
+        try {
+          parts.push(fs.readFileSync(path.resolve(SHELL.cwd, f)));
+        } catch (e) {
+          console.error(`clip: ${f}: ${e.message}`);
+          return 1;
+        }
+      }
+      data = Buffer.concat(parts);
+    } else if (PIPED_STDIN) {
+      data = PIPED_STDIN;
+    } else if (!process.stdin.isTTY) {
+      data = await collectStream(process.stdin);
+    } else {
+      console.error('clip: no input. Pipe a command, e.g. `ls | clip`');
+      return 1;
+    }
+    return copyToClipboard(data);
+  },
   test: function(args) {
     if (args.includes('--help')) {
       console.log(help.test);
@@ -2226,6 +2271,7 @@ function getCommandOptions(cmd) {
     'chgrp': ['-v', '-c', '-R', '-h', '-L', '-i', '-f', '-r', '-D', '--file', '--directory', '--help', '--version', '--change', '--dereference', '--no-dereference', '--preserve-root', '--reference', '--from'],
     'touch': ['-a', '-c', '-d', '-r', '-t', '-m', '-h', '-A', '-B', '-d', '-t', '-c', '-f', '-h', '--date', '--date-time', '--no-date', '--no-dereference', '--no-time', '--time', '--reference', '--version', '--help'],
     'echo': ['-n', '-e', '-E', '--help', '--version'],
+    'clip': ['--help', '--version'],
     'pwd': ['-L', '-P', '--help', '--version'],
     'printf': ['-v', '-d', '-i', '-n', '--help', '--version'],
     'test': ['-d', '-e', '-f', '-L', '-h', '-S', '-O', '-G', '-w', '-r', '-s', '-g', '-u', '-k', '-x', '-z', '-n', '-t', '-l', '-a', '-o', '--help', '--version', '--'],
@@ -3840,7 +3886,53 @@ process.stdin.on('error', (e) => {
 
 // Builtins that read their input from files rather than a stream: when such
 // a builtin is the target of `< file`, the file path is passed as an operand.
-const STDIN_AS_OPERAND = new Set(['cat']);
+const STDIN_AS_OPERAND = new Set(['cat', 'clip']);
+
+// Builtins that consume piped stdin (rather than producing it). When such a
+// builtin is a non-first pipeline stage, the upstream stage's output is
+// collected and handed over via PIPED_STDIN - these run in-process and have
+// no pipe of their own.
+const STDIN_CONSUMING = new Set(['clip']);
+let PIPED_STDIN = null;
+
+// Collect every byte a readable stream emits into a single Buffer.
+function collectStream(stream) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    stream.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    stream.on('error', () => resolve(Buffer.concat(chunks)));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+// Copy a Buffer to the system clipboard, preferring the tool that matches the
+// active display server (Wayland -> wl-copy, X11 -> xclip/xsel, macOS -> pbcopy).
+function copyToClipboard(data) {
+  const candidates = [];
+  if (process.env.WAYLAND_DISPLAY) candidates.push('wl-copy');
+  if (process.env.DISPLAY) candidates.push('xclip', 'xsel');
+  if (process.platform === 'darwin') candidates.push('pbcopy');
+  // Fall back to trying the common tools even when the env vars are missing
+  // (some setups don't export them but the tools still work).
+  for (const t of ['wl-copy', 'xclip', 'xsel']) {
+    if (!candidates.includes(t)) candidates.push(t);
+  }
+  if (process.platform === 'darwin' && !candidates.includes('pbcopy')) candidates.push('pbcopy');
+
+  for (const tool of candidates) {
+    const exe = resolveExecutable(tool);
+    if (!exe) continue;
+    let toolArgs = [];
+    if (tool === 'xclip') toolArgs = ['-selection', 'clipboard'];
+    else if (tool === 'xsel') toolArgs = ['--clipboard', '--input'];
+    try {
+      const res = spawnSync(exe, toolArgs, { input: data, stdio: ['pipe', 'ignore', 'ignore'] });
+      if (res && res.status === 0) return 0;
+    } catch (e) { /* try the next tool */ }
+  }
+  console.error('clip: no clipboard tool found (install wl-copy, xclip, or xsel)');
+  return 1;
+}
 
 async function executePipeline(cmds) {
   const n = cmds.length;
@@ -3881,6 +3973,17 @@ async function executePipeline(cmds) {
         builtinArgs.push(path.resolve(SHELL.cwd, c.stdin));
       }
       
+      // Builtin filters that consume stdin (e.g. `clip`) have no pipe of their
+      // own, so collect the upstream stage's output and hand it over.
+      if (STDIN_CONSUMING.has(command) && i > 0 && !c.stdin) {
+        let upstream = stageOut[i - 1];
+        if (upstream == null) {
+          const prev = procs[i - 1];
+          upstream = (prev && prev.stdout) ? await collectStream(prev.stdout) : Buffer.alloc(0);
+        }
+        PIPED_STDIN = upstream;
+      }
+      
       let outFd = null;
       if (c.stdout) {
         try {
@@ -3910,6 +4013,19 @@ async function executePipeline(cmds) {
         else if (typeof cb === 'function') cb();
         return true;
       };
+      // Bun's console.log/info write straight to the fd and bypass the
+      // process.stdout.write override above, so builtins that print via
+      // console.log (e.g. ls) would leak into the terminal instead of feeding
+      // the next pipeline stage. Route them through the same capture path.
+      const origLog = console.log;
+      const origInfo = console.info;
+      console.log = (...a) => writeChunk(Buffer.from(util.format(...a) + '\n'));
+      console.info = (...a) => writeChunk(Buffer.from(util.format(...a) + '\n'));
+      // The builtin's output is going to a pipe/file, not a terminal, so any
+      // builtin that checks isTTY (e.g. ls colorizing) should not emit terminal
+      // formatting into the captured stream.
+      const origIsTTY = process.stdout.isTTY;
+      try { process.stdout.isTTY = false; } catch (e) { /* read-only in some runtimes */ }
       
       try {
         const res = builtins[command](builtinArgs);
@@ -3920,6 +4036,10 @@ async function executePipeline(cmds) {
         }
       } finally {
         process.stdout.write = origWrite;
+        console.log = origLog;
+        console.info = origInfo;
+        try { process.stdout.isTTY = origIsTTY; } catch (e) { /* ignore */ }
+        PIPED_STDIN = null;
         if (outFd !== null) { try { fs.closeSync(outFd); } catch (e) { /* ignore */ } }
       }
       
@@ -4321,6 +4441,15 @@ async function executePipeline(cmds) {
   // register job
   const cmdline = cmds.map(c => c.args.join(' ')).join(' | ');
   const background = cmds[cmds.length-1].background;
+  // A trailing stdin-consuming builtin (e.g. `clip`) synchronously drains its
+  // upstream stages, so those children have already exited by the time we get
+  // here. Drop dead pids so we never poll an already-finished job forever.
+  if (!background) {
+    pids = pids.filter(pid => {
+      try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
+    });
+    if (pids.length === 0) return;
+  }
   const job = addJob(pids, cmdline, background);
 
   if (background) {
