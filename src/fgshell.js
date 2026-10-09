@@ -1934,8 +1934,6 @@ if (process.env.FGSH_LOG) {
 let currentReadlineInput = ''; // Track current readline input
 let isLoadingRcFile = false; // Track if we're loading RC file
 let isFilePickerActive = false; // Track if file picker is active
-let filePickerState = null; // { files, selectedIndex, maxVisible }
-let filePickerResolve = null; // Promise resolver for file picker
 let commandStartTime = 0; // Track when command started for duration calculation
 let commandCache = null; // Cached command list for completer
 let commandCacheKeys = null;
@@ -4525,7 +4523,9 @@ function getImageSupport() {
   return 'none';
 }
 
-// Helper to get preview text for a file (text or fallback)
+// Helper to get preview info for a file. Returns a description of the file
+// for the preview pane; the OpenTUI picker renders images via ImageRenderable,
+// so this only reports that an image is present plus its metadata.
 async function getFilePreview(filePath, maxLines = 20, baseDir = SHELL.cwd) {
   try {
     const resolvedPath = path.resolve(baseDir, filePath);
@@ -4540,12 +4540,7 @@ async function getFilePreview(filePath, maxLines = 20, baseDir = SHELL.cwd) {
     const ext = path.extname(resolvedPath).toLowerCase();
     const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.ico'];
     if (imageExts.includes(ext)) {
-      const support = getImageSupport();
-      if (support === 'kitty') {
-        // For Kitty, we'll read the file in renderFilePickerOverlay to send as data
-        return { type: 'image', protocol: 'kitty', path: resolvedPath, sizeStr };
-      }
-      return { type: 'text', content: '[Image: ' + sizeStr + ']' };
+      return { type: 'image', path: resolvedPath, sizeStr };
     }
     
     // Skip preview for very large files
@@ -4585,500 +4580,268 @@ async function getFilePreview(filePath, maxLines = 20, baseDir = SHELL.cwd) {
   }
 }
 
-// A kitty graphics placement lives on a layer of its own: ESC[0J erases text
-// cells but leaves the image on screen, so navigating away from an image
-// preview — or closing the picker — has to delete the placement explicitly
-// via the graphics protocol (otherwise the image lingers until the user runs
-// a full-screen clear). d=c removes every placement intersecting the cursor's
-// cell, which is exactly the cell the preview image was placed at, so images
-// placed elsewhere on screen by other programs are left alone. On entry the
-// cursor must be on the overlay anchor (saved with ESC 7); it is restored to
-// that anchor before returning.
-function removeKittyPreviewImage() {
-  if (!filePickerState || !filePickerState.imageShown) return;
-  filePickerState.imageShown = false;
-  const pos = filePickerState.imagePos;
-  if (!pos) return;
-  if (pos.down > 0) process.stdout.write(`\x1b[${pos.down}B`);
-  if (pos.right > 0) process.stdout.write(`\x1b[${pos.right}C`);
-  process.stdout.write('\x1b_Ga=d,d=c\x1b\\'); // delete placements under the cursor
-  process.stdout.write('\x1b8');               // back to the anchor
-}
-
-let isPickerRendering = false;
-let pickerRenderQueued = false;
-async function renderFilePickerOverlay() {
-  if (!isFilePickerActive || !filePickerState) return;
-  if (isPickerRendering) {
-    // A render is already in flight (e.g. a burst of filter keystrokes).
-    // Dropping this request left the overlay showing a stale query, so
-    // remember to repaint once the current render finishes.
-    pickerRenderQueued = true;
-    return;
-  }
-  isPickerRendering = true;
-
-  try {
-    const { files, selectedIndex, filterMode, filterQuery } = filePickerState;
-    const displayFiles = files;
-    const terminalCols = process.stdout.columns || 80;
-    const terminalRows = process.stdout.rows || 24;
-    
-    // Recalculate maxVisible based on current terminal size
-    const maxVisible = Math.min(Math.floor(terminalRows * 0.6), terminalRows - 5);
-
-    // The overlay lives BELOW the prompt line: the first render steps down
-    // one row, saves that position as an anchor (ESC 7) and starts there.
-    // Every later render returns to the anchor and erases downward, so the
-    // prompt row itself is never touched (the old clear loop wiped it,
-    // dropping the prompt from the screen while navigating) and no stale
-    // rows survive when the picker closes.
-    if (filePickerState.firstRender) {
-      filePickerState.firstRender = false;
-      process.stdout.write('\n');    // step below the prompt line...
-      process.stdout.write('\r');    // ...to column 0
-      process.stdout.write('\x1b7'); // remember that anchor
-      filePickerState.anchored = true;
-    } else {
-      process.stdout.write('\x1b8');   // back to the anchor
-      removeKittyPreviewImage();       // ESC[0J below only erases text: drop the
-                                       // old image preview before repainting
-      process.stdout.write('\x1b[0J'); // erase the previous overlay
-    }
-
-    // Get preview for selected item
-    let previewLines = [];
-    let previewImage = null;
-    const selected = displayFiles[selectedIndex];
-    if (selected) {
-      if (selected.isDirectory) {
-        previewLines = ['[Directory]'];
-      } else {
-        const previewResult = await getFilePreview(selected.name, maxVisible, filePickerState.browseDir);
-        if (previewResult.type === 'image') {
-          previewImage = previewResult;
-          previewLines = [`[Image: ${previewResult.sizeStr}]`];
-          // Fill remaining lines with empty strings to reserve space
-          while (previewLines.length < maxVisible) previewLines.push('');
-        } else {
-          const content = previewResult.content || previewResult;
-          if (typeof content === 'string') {
-            previewLines = content.split('\n').map(l => l.replace(/\t/g, '    '));
-          } else {
-             previewLines = ['[Error]'];
-          }
-        }
-      }
-    }
-
-    // Build output
-    let output = '';
-    let lineCount = 0;
-
-    const modeIndicator = filterMode ? ' [FILTER MODE]' : '';
-    output += `\x1b[1mSelect file from ${filePickerState.browseDir}\x1b[0m${modeIndicator}\n`;
-    lineCount++;
-    
-    output += `(Ctrl+F: filter, arrows: navigate, \u2192: enter dir, Enter: select, Esc: cancel)\n`;
-    lineCount++;
-    
-    if (filterMode) {
-      output += `Filter: ${filterQuery}\n`;
-      lineCount++;
-    }
-    
-    output += '-'.repeat(Math.min(80, terminalCols)) + '\n';
-    lineCount++;
-
-    const listWidth = Math.floor(terminalCols * 0.4);
-    const previewWidth = terminalCols - listWidth - 4; // 4 for margin/separator
-
-    const startIdx = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayFiles.length - maxVisible));
-    const endIdx = Math.min(startIdx + maxVisible, displayFiles.length);
-
-    if (displayFiles.length === 0) {
-      output += '(no files)\n';
-      lineCount++;
-    } else {
-      for (let i = 0; i < maxVisible; i++) {
-        let line = '';
-        const fileIdx = startIdx + i;
-        
-        // List part
-        if (fileIdx < endIdx) {
-          const item = displayFiles[fileIdx];
-          const isSelected = fileIdx === selectedIndex;
-          const prefix = isSelected ? '> ' : '  ';
-          const icon = item.isDirectory ? '[D] ' : '[F] ';
-          let fileName = item.name;
-          
-          let fileLine = `${prefix}${icon}${fileName}`;
-          if (fileLine.length > listWidth) {
-            fileLine = fileLine.slice(0, listWidth - 3) + '...';
-          } else {
-            fileLine = fileLine.padEnd(listWidth);
-          }
-          
-          if (isSelected) {
-            line += `\x1b[7m${fileLine}\x1b[0m`;
-          } else {
-            line += fileLine;
-          }
-        } else {
-          line += ' '.repeat(listWidth);
-        }
-
-        line += ' \x1b[90m│\x1b[0m '; // Separator
-
-        // Preview part
-        if (i < previewLines.length) {
-          let previewLine = previewLines[i];
-          if (previewLine.length > previewWidth) {
-            previewLine = previewLine.slice(0, previewWidth - 3) + '...';
-          }
-          line += previewLine;
-        }
-
-        output += line + '\n';
-        lineCount++;
-      }
-    }
-
-    // Write all at once and track line count
-    process.stdout.write(output);
-    
-    // Draw Image Overlays
-    if (previewImage) {
-      const headerHeight = 3 + (filterMode ? 1 : 0);
-      const moveUp = lineCount;
-      const moveDown = headerHeight;
-      const moveRight = listWidth + 3;
-      
-      // Save cursor
-      process.stdout.write('\x1b7');
-      
-      // Move to position
-      process.stdout.write(`\x1b[${moveUp}A`); // Go up to top
-      process.stdout.write(`\x1b[${moveDown}B`); // Go down past header
-      process.stdout.write(`\x1b[${moveRight}C`); // Go right
-      
-      if (previewImage.protocol === 'kitty') {
-        try {
-          // Read file and send as base64 inline data (t=d) to avoid path issues
-          const data = await fs.promises.readFile(previewImage.path);
-          const base64 = data.toString('base64');
-          const chunkSize = 4096;
-          let offset = 0;
-          let isFirstChunk = true;
-          
-          // Determine format
-          const ext = path.extname(previewImage.path).toLowerCase();
-          let formatParam = '';
-          if (ext === '.png') {
-            formatParam = ',f=100'; // f=100 is PNG
-          }
-          // JPG doesn't have a standard code in 't=d' mode usually, relying on raw data or other means,
-          // but for now we'll send without 'f' for others and hope Kitty auto-detects or handles it.
-          
-          while (offset < base64.length) {
-            const remaining = base64.length - offset;
-            const currentChunkSize = Math.min(remaining, chunkSize);
-            const chunk = base64.slice(offset, offset + currentChunkSize);
-            offset += currentChunkSize;
-            
-            const m = offset < base64.length ? 1 : 0;
-            
-            if (isFirstChunk) {
-               // a=T (transmit and display), t=d (direct), c/r (scale to cells)
-               // q=2 (quiet - suppress response)
-               process.stdout.write(`\x1b_Ga=T,t=d${formatParam},m=${m},c=${previewWidth},r=${maxVisible},q=2;${chunk}\x1b\\`);
-               isFirstChunk = false;
-            } else {
-               process.stdout.write(`\x1b_Gm=${m};${chunk}\x1b\\`);
-            }
-          }
-
-          // The placement is live: remember where it landed (relative to the
-          // overlay anchor) so the next repaint and the final clear can
-          // delete it again with a graphics delete command.
-          filePickerState.imageShown = true;
-          filePickerState.imagePos = { down: headerHeight, right: moveRight };
-        } catch (e) {
-          // Failed to read or send, ignore
-        }
-      }
-      
-      // Restore cursor
-      process.stdout.write('\x1b8');
-    }
-
-    // Return to the overlay's top and re-save the anchor for the next
-    // repaint. This runs after the image overlay on purpose: its own
-    // ESC 7 / ESC 8 would otherwise clobber the saved anchor position.
-    process.stdout.write(`\x1b[${lineCount}A`);
-    process.stdout.write('\r');
-    process.stdout.write('\x1b7');
-
-    filePickerState.lastLineCount = lineCount;
-  } finally {
-    isPickerRendering = false;
-    if (pickerRenderQueued) {
-      pickerRenderQueued = false;
-      if (isFilePickerActive && filePickerState) {
-        renderFilePickerOverlay().catch(e => console.error('Picker render error:', e));
-      }
-    }
-  }
-}
-
-function clearFilePickerOverlay() {
-  if (!filePickerState || !filePickerState.anchored) return;
-  // Return to the anchor saved just below the prompt row, erase the whole
-  // overlay from there down, then move back up onto the prompt row. The
-  // shell repaints the prompt itself when it resumes the line editor.
-  process.stdout.write('\x1b8');    // 1. back to the anchor (below the prompt)
-  removeKittyPreviewImage();        // 2. delete any image preview placement
-                                    //    (a plain text erase leaves it on screen)
-  process.stdout.write('\x1b[0J');  // 3. erase overlay + everything below
-  process.stdout.write('\x1b[1A');  // 4. up onto the prompt row
-  process.stdout.write('\r');       // 5. column 0 for the prompt repaint
-}
-
-async function handleFilePickerKey(str, key) {
-  if (!filePickerState) return;
-  const { files } = filePickerState;
-
-  // Handle filter mode
-  if (filePickerState.filterMode) {
-    if (key.name === 'escape') {
-      filePickerState.filterMode = false;
-      filePickerState.filterQuery = '';
-      filePickerState.files = [...filePickerState.allFiles];
-      filePickerState.selectedIndex = 0;
-      await renderFilePickerOverlay();
-      return;
-    }
-    
-    if (key.name === 'backspace') {
-      if (filePickerState.filterQuery.length > 0) {
-        filePickerState.filterQuery = filePickerState.filterQuery.slice(0, -1);
-      }
-      // Refilter with updated query using fuzzy search with fallback
-      if (filePickerState.filterQuery.length > 0) {
-        const Fuse = require('fuse.js');
-        const fuse = new Fuse(filePickerState.allFiles, {
-          keys: ['name'],
-          threshold: 0.3,
-        });
-        let results = fuse.search(filePickerState.filterQuery).map(r => r.item);
-        
-        // Fallback to substring match if fuzzy search finds nothing
-        if (results.length === 0) {
-          const lowerQuery = filePickerState.filterQuery.toLowerCase();
-          results = filePickerState.allFiles.filter(f => 
-            f.name.toLowerCase().includes(lowerQuery)
-          );
-        }
-        filePickerState.files = results;
-      } else {
-        filePickerState.files = [...filePickerState.allFiles];
-      }
-      filePickerState.selectedIndex = 0;
-      await renderFilePickerOverlay();
-      return;
-    }
-    
-    if (key.name === 'return') {
-      // Enter always selects the highlighted entry (file OR directory) and
-      // closes the picker — "Enter: select", as the header promises. Right
-      // is the key that descends into a directory.
-      const selected = filePickerState.files[filePickerState.selectedIndex];
-      if (!selected) {
-        // Empty list (bare directory or no filter matches): there is
-        // nothing to select, but Enter must still close the picker.
-        if (filePickerResolve) filePickerResolve(null);
-        return;
-      }
-      if (filePickerResolve) filePickerResolve(path.resolve(filePickerState.browseDir, selected.name));
-      return;
-    }
-    
-    // Navigation first: arrows carry a str ("\x1b[B"), so they must not
-    // fall into the text branch below and end up inside the filter query.
-    if (key && (key.name === 'up' || key.name === 'down' || key.name === 'right')) {
-      if (key.name === 'up') {
-        filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
-      } else if (key.name === 'down') {
-        filePickerState.selectedIndex = Math.max(0, Math.min(files.length - 1, filePickerState.selectedIndex + 1));
-      } else {
-        // Right descends into a directory from filter mode as well (Enter
-        // selects instead of descending), then drops back to normal mode.
-        const selected = files[filePickerState.selectedIndex];
-        if (selected && selected.isDirectory) {
-          filePickerState.browseDir = path.resolve(filePickerState.browseDir, selected.name);
-          try {
-            const newFiles = await readDirAsync(filePickerState.browseDir);
-            filePickerState.files = newFiles;
-            filePickerState.allFiles = newFiles;
-            filePickerState.filterQuery = '';
-            filePickerState.filterMode = false;
-            filePickerState.selectedIndex = 0;
-          } catch (e) {
-            return; // unreadable directory: stay put
-          }
-        }
-      }
-      await renderFilePickerOverlay();
-      return;
-    }
-
-    // Handle regular character input in filter mode. Only printable text is
-    // appended: control bytes and escape sequences (arrows, terminal
-    // replies) must never leak into the query.
-    if (str && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(str)) {
-      filePickerState.filterQuery += str;
-      // Fuzzy search using Fuse.js with fallback to substring match
-      if (filePickerState.filterQuery.length > 0) {
-        const Fuse = require('fuse.js');
-        const fuse = new Fuse(filePickerState.allFiles, {
-          keys: ['name'],
-          threshold: 0.3,
-        });
-        let results = fuse.search(filePickerState.filterQuery).map(r => r.item);
-        
-        // Fallback to substring match if fuzzy search finds nothing
-        if (results.length === 0) {
-          const lowerQuery = filePickerState.filterQuery.toLowerCase();
-          results = filePickerState.allFiles.filter(f => 
-            f.name.toLowerCase().includes(lowerQuery)
-          );
-        }
-        filePickerState.files = results;
-      } else {
-        filePickerState.files = [...filePickerState.allFiles];
-      }
-      filePickerState.selectedIndex = 0;
-      await renderFilePickerOverlay();
-      return;
-    }
-    return;
-  }
-
-  // Normal mode
-  if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
-    if (filePickerResolve) filePickerResolve(null);
-    return;
-  }
-  
-  if (key.ctrl && key.name === 'f') {
-    filePickerState.filterMode = true;
-    filePickerState.filterQuery = '';
-    filePickerState.allFiles = [...files];
-    await renderFilePickerOverlay();
-    return;
-  }
-
-  if (key.name === 'up') {
-    filePickerState.selectedIndex = Math.max(0, filePickerState.selectedIndex - 1);
-    await renderFilePickerOverlay();
-  } else if (key.name === 'down') {
-    filePickerState.selectedIndex = Math.max(0, Math.min(filePickerState.files.length - 1, filePickerState.selectedIndex + 1));
-    await renderFilePickerOverlay();
-  } else if (key.name === 'left') {
-    const parentDir = path.dirname(filePickerState.browseDir);
-    if (parentDir !== filePickerState.browseDir) {
-      filePickerState.browseDir = parentDir;
-      try {
-        const newFiles = await readDirAsync(filePickerState.browseDir);
-        filePickerState.files = newFiles;
-        filePickerState.allFiles = newFiles;
-        filePickerState.selectedIndex = 0;
-        await renderFilePickerOverlay();
-      } catch (e) {
-        // Handle error
-      }
-    }
-  } else if (key.name === 'right' || key.name === 'return') {
-    const selected = filePickerState.files[filePickerState.selectedIndex];
-    if (!selected) {
-      // Empty list: Enter closes the picker (nothing to select), Right
-      // does nothing.
-      if (key.name === 'return' && filePickerResolve) filePickerResolve(null);
-      return;
-    }
-    // Enter selects the highlighted entry (file or directory) and closes
-    // the picker. Right descends into a directory; on a file it selects.
-    if (key.name === 'right' && selected.isDirectory) {
-      filePickerState.browseDir = path.resolve(filePickerState.browseDir, selected.name);
-      try {
-        const newFiles = await readDirAsync(filePickerState.browseDir);
-        filePickerState.files = newFiles;
-        filePickerState.allFiles = newFiles;
-        filePickerState.filterQuery = '';
-        filePickerState.selectedIndex = 0;
-        await renderFilePickerOverlay();
-      } catch (e) {
-        // Handle error
-      }
-    } else {
-      if (filePickerResolve) filePickerResolve(path.resolve(filePickerState.browseDir, selected.name));
-    }
-  }
-}
-
+// OpenTUI file picker: two-pane browser with fuzzy filter and live preview.
+// Mirrors showHistoryPicker's structure (lazily imported renderer, one
+// renderer per invocation, idempotent finish) but adds directory navigation
+// and inline image previews. Resolves to the absolute path of the selected
+// file/directory, or null on cancel.
 async function showFilePicker() {
   if (isFilePickerActive || !process.stdin.isTTY) {
     return null;
   }
   isFilePickerActive = true;
 
-  let files;
+  let browseDir = SHELL.cwd;
+  let allFiles = [];
   try {
-    files = await readDirAsync(SHELL.cwd);
+    allFiles = await readDirAsync(browseDir);
   } catch (e) {
     isFilePickerActive = false;
     return null;
   }
+  let filteredFiles = [...allFiles];
+  let searchQuery = '';
 
-  const terminalRows = process.stdout.rows || 24;
-  const maxVisible = Math.min(Math.floor(terminalRows * 0.6), terminalRows - 5);
+  let renderer = null;
+  let done = false;
+  let resolvePromise = null;
+  const promise = new Promise((resolve) => { resolvePromise = resolve; });
 
-  filePickerState = {
-    files,
-    allFiles: files,
-    // Directory the picker is browsing. Kept separate from SHELL.cwd so
-    // navigating inside the picker never changes the shell's directory;
-    // selections are resolved against this and inserted relative to
-    // SHELL.cwd (see the onCtrlN handler).
-    browseDir: SHELL.cwd,
-    selectedIndex: 0,
-    maxVisible,
-    filterMode: false,
-    filterQuery: '',
-    firstRender: true,
-    anchored: false,
-    lastLineCount: 0,
-    imageShown: false,
-    imagePos: null,
+  // Every exit path tears down the renderer, clears the shared picker flag
+  // and settles the promise exactly once.
+  const finish = (result) => {
+    if (done) return;
+    done = true;
+    try { if (renderer) renderer.destroy(); } catch (e) { /* ignore */ }
+    isFilePickerActive = false;
+    resolvePromise(result);
   };
 
-  return new Promise((resolve) => {
-    filePickerResolve = (result) => {
-      isFilePickerActive = false;
-      rl.removeAllListeners('keypress');
-      clearFilePickerOverlay(); // Clear before nulling state for maximum compatibility
-      filePickerState = null;
-      filePickerResolve = null;
-      resolve(result);
-    };
+  try {
+    // Loaded lazily so the shell only pays for the native core when the
+    // user actually opens the picker. useKittyKeyboard stays off: the line
+    // editor parses stdin itself once the picker closes, and kitty-encoded
+    // keys (e.g. Enter as CSI-u) would not be understood by it.
+    const { createCliRenderer, BoxRenderable, TextRenderable, SelectRenderable, ImageRenderable } =
+      await import('@opentui/core');
 
-    // The line editor emits readline-compatible 'keypress' events while paused.
-    rl.on('keypress', (str, key) => {
-      handleFilePickerKey(str, key).catch(e => console.error('Picker error:', e));
+    renderer = await createCliRenderer({
+      exitOnCtrlC: false,  // Ctrl+C cancels the picker, it never kills the shell
+      useKittyKeyboard: null,
+      useMouse: true,      // wheel/click scrolling and selection in the list
+      targetFps: 30,
     });
 
-    renderFilePickerOverlay().catch(e => console.error('Picker render error:', e));
-  });
+    const toOption = (file) => ({
+      name: (file.isDirectory ? '[D] ' : '[F] ') + file.name + (file.isDirectory ? '/' : ''),
+      value: file,
+    });
+
+    const title = new TextRenderable(renderer, {
+      content: 'File Picker  (type to filter, ←: parent dir, →: enter dir, Enter: select, Esc: cancel)',
+      fg: '#FFFFFF',
+    });
+    const dirText = new TextRenderable(renderer, { content: '', fg: '#AAAAAA' });
+    const select = new SelectRenderable(renderer, {
+      options: filteredFiles.map(toOption),
+      width: '60%',
+      height: '100%',
+      showSelectionIndicator: true,
+      wrapSelection: false,
+      selectedBackgroundColor: '#3A60C0',
+    });
+    const previewMeta = new TextRenderable(renderer, { content: '', fg: '#8A8A9A' });
+    const previewBody = new TextRenderable(renderer, {
+      content: '', fg: '#FFFFFF', wrapMode: 'word',
+    });
+    // Inline image preview. Only shown for terminals where getImageSupport()
+    // detects Kitty (the same gate the old picker used); OpenTUI handles
+    // transmission, scaling to the pane, and cleanup on destroy. We pin the
+    // protocol to 'kitty' rather than leaving it at the default 'auto',
+    // because 'auto' resolves to 'blocks' unless the renderer's async
+    // kitty_graphics capability probe is answered — which KITTY_WINDOW_ID
+    // already implies but the probe cannot confirm inside a bare pty.
+    const imagePreview = new ImageRenderable(renderer, {
+      width: '100%',
+      flexGrow: 1,
+      fit: 'fit',
+      protocol: 'kitty',
+      visible: false,
+    });
+    const previewPane = new BoxRenderable(renderer, {
+      width: '40%',
+      height: '100%',
+      flexDirection: 'column',
+      paddingX: 1,
+      gap: 1,
+    });
+    previewPane.add(previewMeta);
+    previewPane.add(previewBody);
+    previewPane.add(imagePreview);
+
+    const body = new BoxRenderable(renderer, {
+      width: '100%',
+      flexGrow: 1,
+      flexDirection: 'row',
+    });
+    body.add(select);
+    body.add(previewPane);
+
+    const column = new BoxRenderable(renderer, {
+      width: '100%',
+      height: '100%',
+      flexDirection: 'column',
+      padding: 1,
+      gap: 1,
+    });
+    column.add(title);
+    column.add(dirText);
+    column.add(body);
+    renderer.root.add(column);
+
+    // getFilePreview is async, so a burst of arrow presses can have several
+    // previews in flight at once; the token drops any that resolve after
+    // the selection moved on.
+    let previewToken = 0;
+
+    const updatePreview = async () => {
+      const token = ++previewToken;
+      const option = select.getSelectedOption();
+      const file = option ? option.value : null;
+      if (!file) {
+        previewMeta.content = '';
+        previewBody.content = filteredFiles.length === 0 ? '(no files)' : '';
+        imagePreview.visible = false;
+        return;
+      }
+      const fullPath = path.resolve(browseDir, file.name);
+      if (file.isDirectory) {
+        if (token !== previewToken) return;
+        previewMeta.content = fullPath;
+        previewBody.content = '[Directory]';
+        imagePreview.visible = false;
+        return;
+      }
+      let stat = null;
+      try { stat = await fs.promises.stat(fullPath); } catch (e) { /* unreadable */ }
+      if (token !== previewToken) return;
+      const sizeStr = stat ? (stat.size / 1024).toFixed(1) + ' KB' : '';
+      const mtimeStr = stat ? stat.mtime.toLocaleString() : '';
+      const preview = await getFilePreview(file.name, 40, browseDir);
+      if (token !== previewToken) return;
+      if (preview.type === 'image' && getImageSupport() === 'kitty') {
+        previewMeta.content = `${fullPath}  ${sizeStr}  ${mtimeStr}`;
+        previewBody.content = '';
+        imagePreview.source = preview.path;
+        imagePreview.visible = true;
+      } else {
+        previewMeta.content = `${fullPath}${sizeStr ? '  ' + sizeStr : ''}`;
+        imagePreview.visible = false;
+        previewBody.content = preview.type === 'image'
+          ? `[Image: ${preview.sizeStr}]`   // terminal can't show images
+          : (preview.content || '');
+      }
+    };
+
+    const applyFilter = () => {
+      if (searchQuery.length === 0) {
+        filteredFiles = [...allFiles];
+      } else {
+        const Fuse = require('fuse.js');
+        const fuse = new Fuse(allFiles, {
+          keys: ['name'],
+          threshold: 0.3,
+        });
+        const results = fuse.search(searchQuery).map(r => r.item);
+        // Fall back to a substring match when fuzzy search finds nothing,
+        // like the history picker does for commands.
+        filteredFiles = results.length > 0 ? results
+          : allFiles.filter(f =>
+              f.name.toLowerCase().includes(searchQuery.toLowerCase())
+            );
+      }
+      select.options = filteredFiles.map(toOption);
+      select.selectedIndex = 0;
+      dirText.content = browseDir + (searchQuery ? `  Filter: ${searchQuery}` : '');
+      updatePreview();
+    };
+
+    // Load a new directory into the list. Unreadable directories are
+    // ignored (stay put), matching the old picker's behavior.
+    const changeDir = async (newDir) => {
+      let newFiles;
+      try {
+        newFiles = await readDirAsync(newDir);
+      } catch (e) {
+        return;
+      }
+      browseDir = newDir;
+      allFiles = newFiles;
+      searchQuery = '';
+      applyFilter();
+    };
+
+    select.on('selectionChanged', updatePreview);
+    select.on('itemSelected', (_index, option) => {
+      finish(option && option.value ? path.resolve(browseDir, option.value.name) : null);
+    });
+
+    renderer.keyInput.on('keypress', (key) => {
+      if (done || !key) return;
+      if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        finish(null);
+        return;
+      }
+      // Enter selects the highlighted entry — file OR directory — and
+      // closes the picker, handled here (not via the Select's own binding)
+      // so the behavior is the same whatever key encoding the terminal
+      // uses. An empty list closes with nothing selected. Right is the
+      // key that descends into a directory.
+      if (key.name === 'return' || key.name === 'enter') {
+        const option = select.getSelectedOption();
+        finish(option && option.value ? path.resolve(browseDir, option.value.name) : null);
+        return;
+      }
+      if (key.name === 'left') {
+        const parent = path.dirname(browseDir);
+        if (parent !== browseDir) {
+          changeDir(parent).catch(() => {});
+        }
+        return;
+      }
+      if (key.name === 'right') {
+        const option = select.getSelectedOption();
+        if (option && option.value && option.value.isDirectory) {
+          changeDir(path.resolve(browseDir, option.value.name)).catch(() => {});
+        }
+        return;
+      }
+      if (key.name === 'backspace') {
+        if (searchQuery.length > 0) {
+          searchQuery = searchQuery.slice(0, -1);
+          applyFilter();
+        }
+        return;
+      }
+      // Printable characters extend the filter query. Prefer the raw
+      // sequence; fall back to single-character key names (e.g. space).
+      // Up/down are left to the Select's own bindings.
+      const ch = (key.sequence && key.sequence.length === 1)
+        ? key.sequence
+        : (key.name && key.name.length === 1 ? key.name : null);
+      if (ch && !key.ctrl && !key.meta && ch >= '\x20' && ch <= '\x7e') {
+        searchQuery += ch;
+        applyFilter();
+      }
+    });
+
+    applyFilter();
+    select.focus();
+  } catch (e) {
+    console.error('File picker error:', e);
+    finish(null);
+  }
+  return promise;
 }
 
 async function showHistoryPicker() {

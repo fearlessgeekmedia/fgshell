@@ -82,7 +82,15 @@
 - [ ] Return values from functions (beyond exit codes)
 
 ### Job Control
-- [ ] Proper Ctrl+Z terminal state handling (edge cases remain)
+- [ ] Ctrl+Z edge cases beyond single foreground commands
+  - Basic suspend/resume for single foreground commands works (fixed in commits 01bb6b0, 419b34b)
+  - Pipelines/compound commands: the SIGTSTP handler only acts when `currentChild` is set,
+    which happens only in the single-command interactive path (src/fgshell.js:4044), so
+    Ctrl+Z is effectively a no-op there
+  - Stop-detection polls `/proc/<pid>/stat` (src/fgshell.js:910, :4124) — Linux-only;
+    on macOS/GhostBSD the shell relies solely on the SIGTSTP signal-handler path
+  - Degrades without libptctl.so: signal forwarding still works, terminal handoff doesn't
+    (see CTRL_Z_IMPLEMENTATION.md → Known Limitations)
 - [ ] More robust signal handling
 - [ ] Disown command for detaching jobs
 
@@ -94,6 +102,9 @@
 ## TODO - Medium Priority
 
 ### Features
+- [ ] `exec` builtin (like bash: replace the shell process with a command, e.g. `exec vim`;
+      must not replace the shell when running in the interactive line-handler loop —
+      evaluate whether to support `exec` with builtins/functions or external commands only)
 - [ ] Process substitution (`<(cmd)` and `>(cmd)`)
 - [ ] Arithmetic conditionals (`((expr))`)
 - [ ] String manipulation builtins (substring, pattern replace)
@@ -151,9 +162,21 @@
 ## Known Issues to Fix
 
 1. **Here-documents** - File-based input works (scripts, `source`, `.fgshrc`; content delivered via temp file); interactive/`-c` mode and quoted delimiters still pending
-2. **Ctrl+Z handling** - Edge cases with terminal state
+2. **Ctrl+Z handling** - Works for single foreground commands; pipelines and non-Linux
+   (/proc-less) platforms still have edge cases (see Job Control above)
 3. **sudo password input** - Requires `-S` flag to read from stdin
 4. **Performance** - JS/Bun slower than native C shells (quantified 2026-10-07: `fgsh -c` ≈ 27× bash — see "Performance Benchmarks" below)
+5. **`SHELL.prompt` is undefined** - src/fgshell.js:5472 calls `rl.setPrompt(SHELL.prompt)`,
+   but SHELL (src/shell.js:29-37) has no `prompt` property; `setPrompt` turns it into `''`
+   (src/line-editor.js:141) and `prompt()` overwrites it right after, so mostly harmless —
+   but it briefly clears the prompt and the line handler relies on an undefined property
+6. **`ls -1` scope error** - In the `argv['1']` branch (src/fgshell.js:1222-1225), the
+   `for (const name of names)` loop references `f.stat.ino`/`f.stat.size`, but `f` only
+   exists inside the earlier `.map`; `ls -1 -i` or `ls -1 -s` throws a ReferenceError
+   (plain `ls -1` is fine because the ternary short-circuits)
+7. **Stale snapshots** - `src/test-fgshell.js` and `src/test-fgshell2.js` are old copies of
+   `src/fgshell.js` (headers still say "SIGINT only after removal of SIGTSTP"), not tests;
+   they lag the main file by ~1,600 lines and should be deleted or archived
 
 ## Performance Benchmarks (measured 2026-10-07)
 

@@ -29,7 +29,7 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 ## Features
 
 ### The Cool Stuff
-- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories with live preview (includes high-quality image previews in Kitty terminals)
+- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories in a two-pane UI (list plus live preview with size and date), fuzzy-filters as you type, and renders inline image previews in Kitty terminals; built on OpenTUI like the history search
 - **🔍 Fuzzy history search** (Ctrl+R) — two-pane UI (list plus full-command preview with time, exit code and directory), fuzzy-matching powered by Fuse.js, rendered with OpenTUI
 - **💾 SQLite history database** — persistent history with timestamps, exit codes, and execution duration
 - **🎨 Customizable prompts** — full color support and variable expansion

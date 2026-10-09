@@ -275,10 +275,16 @@ works in the compiled `./fgsh` binary (its native library is embedded by
 
 ### File Picker (Ctrl+N)
 
-Custom file browser:
+An OpenTUI app (same stack as the history picker) drawn on the alternate
+screen, with a two-pane layout: a scrollable list on the left and a live
+preview on the right:
 1. User presses Ctrl+N
-2. Display directory tree
-3. Show live preview of selected file
+2. Display directory tree, rooted at the shell's cwd
+3. Show live preview of selected file — file contents and metadata in the
+   right pane; on Kitty terminals an image file is transmitted as an actual
+   inline image (the picker pins OpenTUI's ImageRenderable to the kitty
+   protocol rather than its default 'auto', whose async capability probe a
+   bare pty never answers)
 4. Navigate with arrow keys: Up/Down move the list, Left goes to the
    parent directory, Right enters the highlighted directory (the picker
    browses on its own — it never changes the shell's working directory)
@@ -287,8 +293,13 @@ Custom file browser:
    shell's cwd (`docs/notes.md` when picked inside `docs/`, a bare
    `notes.md` when picked in the cwd itself, or the absolute path when the
    file lives outside the cwd)
-6. Ctrl+F opens filter mode: typed text fuzzy-filters the list, Enter
-   selects the best match
+6. Typing filters the list directly (fuzzy, with a substring fallback) —
+   the same interaction as the history picker, with no separate filter
+   mode to enter
+
+Because the picker attaches its key listener asynchronously after Ctrl+N is
+handled, an Enter delivered in the same read as Ctrl+N is not consumed by
+the picker; send the keys as separate writes.
 
 ### Command Prediction Menu
 
