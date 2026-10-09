@@ -207,14 +207,14 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 
 - **Platform support**: Linux, macOS, and GhostBSD/FreeBSD. Not available on Windows. On FreeBSD, Bun comes from a community build rather than an official bun.sh release, so it may lag behind the latest version
 - **sudo TTY access**: `sudo` without the `-S` flag fails to read passwords interactively when run inside `fgshell`, regardless of whether `fgshell` is the default shell or a subshell. Workaround: use `sudo -S` to read password from stdin
-- **Ctrl+Z job suspension**: Terminal state management with tcsetpgrp has edge cases
+- **Ctrl+Z job suspension**: Works for single foreground commands; edge cases remain for pipelines/compound commands, and stop-detection polls `/proc` (Linux-only), so behavior is less robust on macOS/GhostBSD (tracked in TODO.md)
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads
 - **POSIX compliance**: Not fully POSIX-compliant; designed for interactive use
 - **Here-documents**: Work whenever the input comes from a file — scripts, files loaded with `source`, and `~/.fgshrc` (content is delivered through a temporary file) — but not yet in interactive mode or with `-c`. Quoted delimiters (`<<'EOF'`) and variable expansion inside the body are not supported yet
 
 ## Roadmap
 
-- [ ] Proper Ctrl+Z terminal state handling
+- [x] Ctrl+Z job suspension with terminal state management (fixed for single foreground commands; pipeline and non-Linux edge cases tracked in TODO.md)
 - [x] Here-documents in scripts, `source`, and `~/.fgshrc` (content delivery complete)
 - [ ] Here-documents in interactive mode and `-c`, with quoted delimiters and variable expansion
 - [ ] Plugin system for extending commands
