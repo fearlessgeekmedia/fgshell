@@ -343,7 +343,9 @@ by hand plus two harnesses in the repository:
   the Ctrl+R history picker. Spawns `bun src/fgshell.js` under a real pty,
   replays its output through an ANSI screen model, and asserts the prompt is
   never duplicated, the menu geometry is correct, and Enter/Escape behave as
-  expected. Run:
+  expected. It also runs small-window sessions (50x40, 100x12, 80x6) that
+  reproduce the line duplication/distortion regression on unpatched code.
+  Run:
 
   ```bash
   python3 test-menu-duplication.py   # exit 0 = pass

@@ -21,6 +21,7 @@ const A = {
   clearLine: '\x1b[2K',
   clearToEnd: '\x1b[0J',
   cursorLeft: n => (n > 0 ? `\x1b[${n}D` : ''),
+  cursorUp: n => (n > 0 ? `\x1b[${n}A` : ''),
   cursorRight: n => (n > 0 ? `\x1b[${n}C` : ''),
   cursorTo: n => `\x1b[${n + 1}G`,
   saveCursor: '\x1b7',
@@ -31,6 +32,25 @@ const A = {
   reset: '\x1b[0m',
   rev: '\x1b[7m',
 };
+
+// Codepoints a terminal paints in zero cells: C0/C1 controls, combining
+// marks (main blocks), and invisible/format controls — notably the
+// zero-width space (U+200B) that powerline prompts like fgsh-prompt end
+// with. String length counts these as one and would put the edit cursor
+// one cell ahead of the painted text.
+const ZERO_WIDTH = /[\u0000-\u001f\u007f-\u009f\u0300-\u036f\u0483-\u0489\u0591-\u05bd\u05bf\u05c1-\u05c2\u05c4-\u05c5\u05c7\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e4\u06e7-\u06e8\u06ea-\u06ed\u0711\u0730-\u074a\u07a6-\u07b0\u07eb-\u07f3\u0816-\u0819\u081b-\u0823\u0825-\u0827\u0829-\u082d\u0859-\u085b\u08e3-\u0902\u093a\u093c\u0941-\u0948\u094d\u0951-\u0957\u0962-\u0963\u1ab0-\u1aff\u1dc0-\u1dff\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\u20d0-\u20ff\u2cef-\u2cf1\u302a-\u302f\u3099-\u309a\ufe00-\ufe0f\ufe20-\ufe2f\ufeff\ufff9-\ufffb]/u;
+
+// Codepoints painted in two cells: East Asian wide/fullwidth ranges and
+// common emoji planes. Private-use glyphs (Nerd Font icons) stay at one.
+const WIDE = /[\u1100-\u115f\u2329-\u232a\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]|[\u{1f000}-\u{1faff}\u{20000}-\u{3fffd}]/u;
+
+// Display width of a single codepoint.
+function cpWidth(cp) {
+  const ch = String.fromCodePoint(cp);
+  if (ZERO_WIDTH.test(ch)) return 0;
+  if (WIDE.test(ch)) return 2;
+  return 1;
+}
 
 class LineEditor extends EventEmitter {
   constructor(options = {}) {
@@ -65,6 +85,14 @@ class LineEditor extends EventEmitter {
     this._menuNavigated = false; // user picked an entry with Up/Down
     this._menuScroll = 0;       // index of the first visible entry
     this._menuMaxRows = 10;     // entries visible before the scrollbar kicks in
+    this._menuDirty = false;    // menu must be redrawn after the next _render
+    // Anchor of the last paint (see _render): the rows it occupied and the
+    // edit cursor's cell inside it, both relative to the prompt's home row
+    // (top-left of the prompt). Every rendering operation starts and ends
+    // on that edit cell, so each one can walk back to the home row first.
+    this._paintedRows = 0;
+    this._cursorRow = 0;
+    this._editCol = 0;
     this._suppressRender = false;
     this._tabHandler = null;    // (line) => string|null
     this._onCtrlN = null;       // shell hook: file picker
@@ -181,6 +209,10 @@ class LineEditor extends EventEmitter {
     this._menuLines = 0;
     this._menuScroll = 0;
     this._menuNavigated = false;
+    this._menuDirty = false;
+    this._paintedRows = 0;   // this prompt starts a fresh anchor at the
+    this._cursorRow = 0;     // cursor's current position
+    this._editCol = 0;
     this._active = true;
     this._setRawMode(true);
     this._render();
@@ -284,20 +316,42 @@ class LineEditor extends EventEmitter {
   /**
    * Erase any previously drawn completion menu.
    *
-   * Assumes the cursor is on the prompt line: it steps down one row at a
-   * time, clearing each menu row, then steps back up. Clearing must happen
-   * *after* moving down — the old order erased the prompt line itself and
-   * left the last menu row on screen.
+   * The box lives on the rows directly below the input's last painted
+   * row, so erasing is one ESC[0J from that row — see _eraseBoxBelow().
+   * The cursor ends back on the edit cell so the _render() anchor stays
+   * valid.
    */
   _clearMenu() {
     if (!this._menuLines) return;
-    let out = '';
-    for (let i = 0; i < this._menuLines; i++) out += '\n' + '\r' + A.clearLine;
-    // move back up to the prompt line
-    out += `\x1b[${this._menuLines}A`;
+    this._eraseBoxBelow();
     this._menuLines = 0;
     this._menuOpen = false;
     this._menuNavigated = false;
+    this._menuDirty = false;
+  }
+
+  /**
+   * Erase everything from the row below the input down to the bottom of
+   * the screen, then return to the edit cell (where _render() left the
+   * cursor).
+   *
+   * Row moves use '\n' rather than CUD: at the bottom row a newline
+   * scrolls the screen while CUD would clamp in place. Scrolling shifts
+   * the screen content and the cursor by the same amount, so the matching
+   * cursorUp() on the way back lands on the edit cell whether or not a
+   * scroll happened — and ESC[0J is a single operation that cannot lose
+   * rows the way stepping down one newline at a time did on short
+   * terminals (the old clear loop scrolled instead of moving, leaving
+   * stale menu rows behind).
+   */
+  _eraseBoxBelow() {
+    const down = Math.max(1, this._paintedRows - this._cursorRow);
+    let out = '';
+    for (let i = 0; i < down; i++) out += '\n' + '\r';
+    out += '\x1b[0J';
+    out += A.cursorUp(down);
+    out += '\r';
+    if (this._editCol > 0) out += A.cursorTo(this._editCol);
     try { this.output.write(out); } catch (e) { /* ignore */ }
   }
 
@@ -313,15 +367,26 @@ class LineEditor extends EventEmitter {
    *   │ selected   │█  <- scrollbar thumb (only when there are more
    *   │ entry      ││     entries than fit in the window)
    *   ╰────────────╯
+   *
+   * The box is hung off the input's anchor (the row below the input's
+   * last painted row), never off the cursor: with a wrapped line the
+   * cursor sits mid-display, and hanging the box there pushed it up into
+   * the input on every redraw.
    */
   _drawMenu() {
     if (!this.terminal || this._paused || !this._active) return;
     if (!this._menuOpen || !this._menuItems || !this._menuItems.length) return;
+    if (!this._paintedRows) return; // no anchor yet — nowhere to hang the box
 
     const total = this._menuItems.length;
-    // Visible window: at most _menuMaxRows entries, shrunk on short terminals
+    // Visible window: a fixed size for this terminal — at most
+    // _menuMaxRows entries, shrunk only by the terminal's height. It
+    // deliberately does NOT depend on how long the typed command is or
+    // how many rows its wrap occupies; when input + box exceed the space
+    // left, the draw sequence below scrolls the screen cleanly (content
+    // and cursor shift together) instead of corrupting rows.
     const termRows = this.output.rows || process.stdout.rows || 24;
-    const maxRows = Math.max(3, Math.min(this._menuMaxRows, termRows - 6));
+    const maxRows = Math.max(1, Math.min(this._menuMaxRows, termRows - 6));
     const rows = Math.min(total, maxRows);
 
     // Keep the highlighted entry inside the window (this is what scrolls)
@@ -388,27 +453,52 @@ class LineEditor extends EventEmitter {
     }
     drawn.push(`${G}╰${'─'.repeat(boxW)}╯${Z}`);
 
-    // Erase the previous box (we are on the prompt line, box is below it)
-    let out = '';
-    for (let i = 0; i < this._menuLines; i++) out += '\n' + '\r' + A.clearLine;
-    if (this._menuLines) out += `\x1b[${this._menuLines}A`;
-    // Draw the new box. Each row is followed by '\n' + '\r' so it starts
-    // at column 0 even when the terminal's ONLCR translation is off (raw
-    // mode). That means the cursor ends up drawn.length+1 rows below the
-    // prompt (one initial newline plus one per row), so we must move back
-    // up by exactly that much — otherwise the repaint lands one row too low
-    // and the prompt is duplicated on every keystroke.
-    out += '\n' + '\r';
-    for (const row of drawn) {
-      out += row + '\n' + '\r';
+    // From the edit cell: back to the anchor's home row, down to the row
+    // below the input, and erase whatever the previous box left there.
+    let out = A.cursorUp(this._cursorRow) + '\r';
+    for (let i = 0; i < this._paintedRows; i++) out += '\n' + '\r';
+    out += '\x1b[0J';
+    // Draw the new box starting on that row. Every subsequent row is
+    // preceded by '\n' + '\r' so it starts at column 0 with ONLCR off
+    // (raw mode). A newline written at the bottom row scrolls the screen
+    // instead of moving the cursor down — that is fine: the scroll shifts
+    // the content and the cursor together, and the return path below moves
+    // by the exact same row count, so the cursor lands on the edit cell
+    // whether or not a scroll happened.
+    for (let r = 0; r < drawn.length; r++) {
+      if (r > 0) out += '\n' + '\r';
+      out += drawn[r];
     }
-    out += `\x1b[${drawn.length + 1}A`;
+    // Back from (home + _paintedRows + drawn.length - 1) to the edit cell.
+    out += A.cursorUp(this._paintedRows + drawn.length - 1 - this._cursorRow);
+    out += '\r';
+    if (this._editCol > 0) out += A.cursorTo(this._editCol);
     this._menuLines = drawn.length;
     try { this.output.write(out); } catch (e) { /* ignore */ }
-    // Repaint the prompt line and restore the cursor
-    this._render();
+    // The input rows are untouched and the cursor is restored, so there is
+    // nothing to repaint here (the old trailing _render() did that work
+    // twice).
   }
 
+  /**
+   * Repaint the prompt line (prompt + typed text + ghost) in place.
+   *
+   * The paint is anchored on the prompt's home row: _paintedRows/
+   * _cursorRow/_editCol record where the previous paint ended, and every
+   * rendering operation starts and ends on that edit cell, so a repaint
+   * can always walk back up to the home row and clear exactly the rows
+   * the old paint covered.
+   *
+   * This is what fixes the duplication seen on small windows (or with a
+   * long command): the old code repainted from wherever the cursor
+   * happened to be — once the line wrapped, that was the *last* wrapped
+   * row — so every keystroke painted a fresh copy of the prompt one row
+   * down and left the stale one above it. It also cleared only the row
+   * under the cursor, so a line that shrank kept its old wrapped rows.
+   * Row moves are '\n'/cursor-up pairs whose counts cancel even when
+   * writing past the bottom row scrolls the screen, so the geometry also
+   * holds when the input plus menu is taller than a short terminal.
+   */
   _render() {
     if (!this.terminal || this._paused || !this._active) {
       if (process.env.FGSH_DEVEL) console.error(`[DEBUG] _render skip: terminal=${this.terminal} paused=${this._paused} active=${this._active}`);
@@ -416,33 +506,94 @@ class LineEditor extends EventEmitter {
     }
     const text = this._line;
     const cursor = this._cursor;
-    
+    const cols = this.output.columns || process.stdout.columns || 80;
+
     // Build the ghost portion if any
     let ghost = '';
     let ghostLen = 0;
     if (this._ghost && this._ghost.startsWith(text) && this._ghost.length > text.length) {
       ghost = this._ghost.slice(text.length);
-      ghostLen = ghost.length;
+      ghostLen = this._visibleLength(ghost);
     }
-    
-    // Calculate how far cursor is from end, plus any ghost length
-    const back = text.length - cursor;
-    const totalBack = back + ghostLen;
-    
-    let out = '\r' + A.clearLine + this.promptText + text;
-    if (ghost) {
-      out += A.dim + ghost + A.reset;
+
+    // Visible display: prompt (ANSI stripped) + text + ghost — all in
+    // terminal cells, not string length (a combining char or ZWSP paints
+    // narrower than it counts).
+    const promptLen = this._visibleLength(this.promptText);
+    const textW = this._visibleLength(text);
+    const visible = promptLen + textW + ghostLen;
+
+    // Row counts relative to the home row. A V-column display occupies
+    // floor((V-1)/cols)+1 rows: terminals defer the wrap after the last
+    // column, so a display ending exactly on the boundary still sits on
+    // the previous row.
+    const endRow = visible > 0 ? Math.floor((visible - 1) / cols) : 0;
+    const newRows = endRow + 1;
+
+    // Where the edit cursor goes: prompt + the display width of the text
+    // before the cursor (cursor is a string index; wide/zero-width chars
+    // make index and column differ).
+    const editIdx = promptLen + this._visibleLength(text.slice(0, cursor));
+    let editRow = Math.floor(editIdx / cols);
+    let editCol = editIdx % cols;
+    if (editIdx === visible && visible > 0 && visible % cols === 0) {
+      // Cursor at the very end of a display ending on a wrap boundary:
+      // the terminal sits on the previous row with the wrap pending.
+      editRow = visible / cols - 1;
+      editCol = cols - 1;
     }
-    if (totalBack > 0) out += A.cursorLeft(totalBack);
-    
+
+    let out = '';
+    if (this._paintedRows > 0) {
+      // Back to the home row of the previous paint...
+      out += A.cursorUp(this._cursorRow) + '\r';
+      // ...and erase exactly the rows it covered — not just the row under
+      // the cursor, or a shrunken line left its old wrapped rows behind.
+      for (let i = 0; i < this._paintedRows; i++) {
+        out += A.clearLine;
+        if (i < this._paintedRows - 1) out += '\n' + '\r';
+      }
+      out += A.cursorUp(this._paintedRows - 1) + '\r';
+    } else {
+      out += '\r';
+    }
+
+    // Paint from the home row; the terminal wraps it as needed. (The menu
+    // box below is deliberately not touched: 2K per input row leaves it
+    // intact, and _drawMenu re-hangs it below the new last row right
+    // after this when the input grew.)
+    out += this.promptText + text;
+    if (ghost) out += A.dim + ghost + A.reset;
+
+    // Place the edit cursor relative to the end of the paint. Never walk
+    // backwards with CUB across rows — cursorBack stops at column 0.
+    out += A.cursorUp(endRow - editRow);
+    out += '\r';
+    if (editCol > 0) out += A.cursorTo(editCol);
+
+    this._paintedRows = newRows;
+    this._cursorRow = editRow;
+    this._editCol = editCol;
+
     try { this.output.write(out); } catch (e) {
       if (process.env.FGSH_DEVEL) console.error('[DEBUG] _render write failed:', e.message);
     }
   }
 
   _visibleLength(s) {
-    // Strip ANSI sequences for width calculation
-    return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').length;
+    // Terminal display width: strip ANSI sequences (CSI, OSC, and the
+    // two-character escapes _escapeLen knows), then sum per-codepoint
+    // cell widths. Plain .length is wrong for prompts like the powerline
+    // fgsh-prompt — its trailing zero-width space counts as one character
+    // but paints in zero cells, which put the cursor one space ahead.
+    const plain = String(s)
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z@`~]/g, '')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b_[\s\S]*?\x1b\\/g, '')
+      .replace(/\x1b[@-Z\\^_]/g, '');
+    let w = 0;
+    for (const ch of plain) w += cpWidth(ch.codePointAt(0));
+    return w;
   }
 
   // ---- input parsing ----
@@ -521,7 +672,15 @@ class LineEditor extends EventEmitter {
       const consumed = this._handleKey(s, i);
       i += consumed > 0 ? consumed : 1;
     }
+    // Repaint first, then (re)draw the menu against the fresh anchor —
+    // drawing before the repaint positioned the box against stale
+    // geometry whenever the keystroke changed how many rows the line
+    // wrapped into.
     this._render();
+    if (this._menuDirty) {
+      this._menuDirty = false;
+      this._drawMenu();
+    }
   }
 
   /** Start (or restart) the flush window for a held partial escape sequence. */
@@ -830,6 +989,13 @@ class LineEditor extends EventEmitter {
 
   _clearScreen() {
     try { this.output.write('\x1b[2J\x1b[H'); } catch (e) {}
+    // The screen — and any box below the input — is gone and the cursor
+    // is at the top-left: start a fresh anchor instead of walking back
+    // up to rows that no longer exist.
+    this._paintedRows = 0;
+    this._cursorRow = 0;
+    this._editCol = 0;
+    this._menuLines = 0;
     this._render();
   }
 
@@ -989,6 +1155,8 @@ class LineEditor extends EventEmitter {
         if (this._line === gen) {
           this._ghost = s || '';
           this._render();
+          // The ghost can add a wrapped row: re-hang the box below it.
+          if (this._menuOpen) this._drawMenu();
         }
       }).catch(() => {});
     } else {
@@ -1043,7 +1211,9 @@ class LineEditor extends EventEmitter {
       this._menuNavigated = false;
     }
     this._menuOpen = true;
-    this._drawMenu();
+    // Defer the draw until after _render(): the box must hang below the
+    // freshly painted input rows, not the previous ones.
+    this._menuDirty = true;
   }
 
   /** Move the menu selection. Moving marks the choice as deliberate. */

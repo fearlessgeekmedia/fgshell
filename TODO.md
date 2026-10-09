@@ -59,9 +59,18 @@
   - Script parser now tracks line numbers for all blocks
   - Error messages show file:line-end format with source snippet
   - Examples: `script.sh:12-14: error: if: syntax error - expected "then"`
-- [ ] Fix line diplucation and distortion when terminal windows are smaller or
+- [x] Fix line diplucation and distortion when terminal windows are smaller or
       the fuzzy search is too large. Preferrably, we need a set size that doesn't
       fluctuate based on the command's length.
+  - `src/line-editor.js` now repaints from a tracked anchor (painted rows /
+    cursor row) instead of from the raw cursor position, so wrapped lines no
+    longer leave a copy of the prompt behind, and stale wrapped rows are
+    cleared when the line shrinks
+  - The fuzzy menu box is drawn below the anchor with a fixed cap
+    (`min(10, rows-6)`), independent of the command's length, and erased
+    with scroll-consistent movement
+  - Regression coverage: `test-menu-duplication.py` `small_window_sessions()`
+    (50x40, 100x12, 80x6)
 - [ ] Improve quote escaping for `js` command and other builtins
   - Currently requires manual escape sequences for nested quotes
   - Consider context-aware quote handling for JavaScript code blocks

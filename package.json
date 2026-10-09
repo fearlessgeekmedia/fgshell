@@ -1,6 +1,6 @@
 {
   "name": "fgshell",
-  "version": "0.1.0",
+  "version": "0.1.1b",
   "scripts": {
     "build": "bun run build-fgsh.js"
   },
