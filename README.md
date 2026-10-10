@@ -1,6 +1,6 @@
 # fgshell
 
-A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime. Runs on Linux, macOS, and GhostBSD/FreeBSD.
+A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime. Runs on Linux, macOS, and GhostBSD/FreeBSD. Note that certain TUI components of the shell do not run on GhostBSD or FreeBSD currently. This is in the process of being fixed.
 
 ## What is this?
 
