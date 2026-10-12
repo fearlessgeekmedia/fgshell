@@ -167,7 +167,7 @@ Available builtins:
 - `echo` / `printf` - output text
 - `cd` / `mkcd` / `pwd` / `clear` - directory and terminal management
 - `ls` / `cat` - file listing and concatenation
-- `clip` - copy standard input to the system clipboard (Wayland `wl-copy`, X11 `xclip`/`xsel`, or macOS `pbcopy`)
+- `clip` - copy standard input to the system clipboard (see [clip](#clip))
 - `export` / `unset` / `env` - environment variables
 - `declare` - display arrays/variables
 - `alias` / `unalias` - command shortcuts
@@ -180,6 +180,72 @@ Available builtins:
 - `true` / `false` - test commands
 - `exit` - leave the shell
 - `js` - JavaScript evaluation
+
+#### clip
+
+`clip` copies input to the system clipboard, so a command's output can be
+pasted elsewhere without a temporary file:
+
+```
+clip [FILE]...
+```
+
+**Input sources and precedence.** `clip` takes its input from the first of:
+
+1. **FILE operands** - the contents of each named file, concatenated in
+   argument order (`clip a.txt b.txt` puts both files on the clipboard).
+   Paths are resolved relative to the shell's working directory.
+2. **Piped stdin** - the output of the previous pipeline stage
+   (`ls | clip`, `echo "hello" | clip`). `clip` runs in-process as a
+   pipeline builtin, so the upstream stage's output is collected and handed
+   over directly.
+3. **Redirected stdin** - a stream redirected into the shell
+   (`clip < notes.txt`); with a bare `< file` redirect and no other
+   operands, the redirect target is passed to `clip` as a file operand.
+
+If none of these is available (run at an interactive prompt with no pipe
+and no operands), it fails with:
+
+```
+clip: no input. Pipe a command, e.g. `ls | clip`
+```
+
+**Clipboard backend.** `clip` shells out to whichever clipboard tool
+matches the environment:
+
+| Platform / display server | Tool | Invocation |
+|---|---|---|
+| Wayland (`WAYLAND_DISPLAY` set) | `wl-copy` | `wl-copy` |
+| X11 (`DISPLAY` set) | `xclip` | `xclip -selection clipboard` |
+| X11 (`DISPLAY` set) | `xsel` | `xsel --clipboard --input` |
+| macOS | `pbcopy` | `pbcopy` |
+
+The environment variables are only a preference hint: when they are unset
+(e.g. a session that doesn't export them but the tools still work), the
+tools are tried in the order `wl-copy`, `xclip`, `xsel`, `pbcopy`. The first
+resolvable tool that exits 0 wins; failures fall through to the next
+candidate. If no tool succeeds:
+
+```
+clip: no clipboard tool found (install wl-copy, xclip, or xsel)
+```
+
+**Examples:**
+
+```sh
+ls | clip              # copy the output of a command
+echo "hello" | clip    # copy a literal string
+clip notes.txt         # copy the contents of a file
+clip a.txt b.txt       # concatenate several files onto the clipboard
+clip < notes.txt       # copy via an input redirect
+```
+
+**Options:** `--help` prints the usage summary. `--` is accepted and
+ignored (useful to stop option parsing before file operands); any other
+argument starting with `-` is skipped as well.
+
+**Exit status:** 0 on success; 1 if no input is available, a FILE cannot
+be read (`clip: FILE: ...`), or no clipboard tool is available.
 
 ### Pipeline Execution
 
