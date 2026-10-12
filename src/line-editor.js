@@ -38,6 +38,14 @@ const A = {
 // zero-width space (U+200B) that powerline prompts like fgsh-prompt end
 // with. String length counts these as one and would put the edit cursor
 // one cell ahead of the painted text.
+//
+// U+200B's width here is measured against real terminals, not fonts:
+// the cell a terminal reserves is decided by its own width tables, which
+// put U+200B (Cf, zero-width) at 0 — verified 2026-10-09 in a tmux pane
+// (print A+ZWSP+B, read the cursor: 2 cells) and by the editor's cursor
+// sitting one cell past the painted prompt whenever this class counted
+// the ZWSP as one. A font's .notdef glyph rendering the ZWSP visibly in
+// one cell does not move the terminal's cursor — it stays at zero.
 const ZERO_WIDTH = /[\u0000-\u001f\u007f-\u009f\u0300-\u036f\u0483-\u0489\u0591-\u05bd\u05bf\u05c1-\u05c2\u05c4-\u05c5\u05c7\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e4\u06e7-\u06e8\u06ea-\u06ed\u0711\u0730-\u074a\u07a6-\u07b0\u07eb-\u07f3\u0816-\u0819\u081b-\u0823\u0825-\u0827\u0829-\u082d\u0859-\u085b\u08e3-\u0902\u093a\u093c\u0941-\u0948\u094d\u0951-\u0957\u0962-\u0963\u1ab0-\u1aff\u1dc0-\u1dff\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\u20d0-\u20ff\u2cef-\u2cf1\u302a-\u302f\u3099-\u309a\ufe00-\ufe0f\ufe20-\ufe2f\ufeff\ufff9-\ufffb]/u;
 
 // Codepoints painted in two cells: East Asian wide/fullwidth ranges and
@@ -94,6 +102,34 @@ class LineEditor extends EventEmitter {
     this._cursorRow = 0;
     this._editCol = 0;
     this._suppressRender = false;
+    // Self-calibration of the prompt's painted width (see _beginPromptProbe).
+    // Terminals disagree about cell widths for zero-width and private-use
+    // codepoints (U+200B in the powerline prompt, nerd-font glyphs), so
+    // instead of trusting our per-codepoint table everywhere, the editor
+    // measures the prompt against this terminal's own cursor-position
+    // report once per prompt and uses the measured width for geometry.
+    this._promptPaintWidth = null; // measured width; null = use the table
+    this._rowEndShift = 0;         // measured row drop of a paint that ends
+    // exactly on a wrap boundary (0 = terminal keeps the wrap pending;
+    // 1 = its trailing zero-width char resolves the wrap — see _handleCpr)
+    this._lastEditRow = 0;         // model edit row / boundary flag of the
+    this._lastBoundary = false;    // last paint, for _handleCpr's re-anchor
+    this._cprStage = 0;            // 0 idle, 1 home reply pending, 2 end
+    this._cprHome = null;          // [row, col] where the prompt starts
+    this._cprTimer = null;
+    this._cprHold = 0;             // extra flush windows for slow replies
+    // Input that arrived while the prompt-width probe was still resolving.
+    // Rendering it against the un-measured anchor is what stacked copies of
+    // the prompt on boundary-width prompts: on terminals where the paint's
+    // trailing ZWSP resolves the pending wrap (kitty, pyte), the real cursor
+    // sat one row below the model's anchor, so the first repaint anchored
+    // one row low and left a stale prompt copy above it on every prompt.
+    // Held bytes are replayed through _onData once the probe adopts the
+    // real geometry (or gives up) — see _flushProbeHold.
+    this._probeHold = [];          // Buffer[] held during the probe window
+    this._probeExtends = 0;        // extra probe windows granted for held input
+    this._cprLate = false;         // probe timed out; still adopting replies
+    this._cprLateTimer = null;
     this._tabHandler = null;    // (line) => string|null
     this._onCtrlN = null;       // shell hook: file picker
     this._onCtrlR = null;       // shell hook: history picker
@@ -139,6 +175,7 @@ class LineEditor extends EventEmitter {
 
   setPrompt(p) {
     this.promptText = p == null ? '' : String(p);
+    this._promptPaintWidth = null; // prompt text changed: re-measure
     if (this._active) this._render();
   }
   getPrompt() { return this.promptText; }
@@ -215,6 +252,7 @@ class LineEditor extends EventEmitter {
     this._editCol = 0;
     this._active = true;
     this._setRawMode(true);
+    this._beginPromptProbe();
     this._render();
   }
 
@@ -300,6 +338,8 @@ class LineEditor extends EventEmitter {
   }
 
   _cleanup() {
+    clearTimeout(this._cprTimer);
+    this._cprStage = 0;
     this._setRawMode(false);
     try { this.output.write(A.showCursor); } catch (e) { /* ignore */ }
     try { this.input.off('exit', this._onExit); } catch (e) { /* ignore */ }
@@ -518,32 +558,62 @@ class LineEditor extends EventEmitter {
 
     // Visible display: prompt (ANSI stripped) + text + ghost — all in
     // terminal cells, not string length (a combining char or ZWSP paints
-    // narrower than it counts).
-    const promptLen = this._visibleLength(this.promptText);
+    // narrower than it counts). The prompt's width is the value measured
+    // against this terminal when available — see _beginPromptProbe.
+    const promptLen = this._promptPaintWidth != null
+      ? this._promptPaintWidth
+      : this._visibleLength(this.promptText);
     const textW = this._visibleLength(text);
     const visible = promptLen + textW + ghostLen;
 
-    // Row counts relative to the home row. A V-column display occupies
-    // floor((V-1)/cols)+1 rows: terminals defer the wrap after the last
-    // column, so a display ending exactly on the boundary still sits on
-    // the previous row.
-    const endRow = visible > 0 ? Math.floor((visible - 1) / cols) : 0;
+    // Row counts relative to the home row. The display can carry embedded
+    // newlines (a multi-line ghost — history completions include whole
+    // pasted function definitions), and each one drops a row that a flat
+    // cell count cannot see: every repaint then erased a row short and
+    // re-anchored below the previous paint, stacking fresh copies of the
+    // prompt (measured in the faithful harness 2026-10-11 with the
+    // "function conspiracy-hacker-cow()" ghost). Walk the layout instead;
+    // for single-line displays this is exactly the old
+    // floor((visible-1)/cols) arithmetic.
+    const laid = this._layoutRows(promptLen, text + ghost);
+    // When the paint's *last cell* lands exactly on the wrap boundary,
+    // terminals disagree about where the cursor ends up: most keep the
+    // wrap pending on the previous row, but a zero-width character
+    // written there — the trailing U+200B of the powerline prompt — can
+    // resolve the pending wrap and drop the cursor to the next row
+    // (measured in pyte 2026-10-10; this is what stacked copies of the
+    // prompt on narrow windows: every repaint erased one row short).
+    // _rowEndShift is the row delta the CPR probe measured for this
+    // terminal (see _handleCpr) and applies only to a boundary-ending
+    // paint; a graphic's last cell wraps the same way everywhere.
+    const boundaryEnd = laid.col === cols;
+    const endRow = laid.row + (boundaryEnd ? this._rowEndShift : 0);
+    // Rows the paint covers: the rows its cells occupy plus — when the
+    // cursor itself ends one row below them (boundary + measured shift)
+    // — that cursor row, so the next erase and the menu's anchor cover
+    // everything the terminal really shows.
     const newRows = endRow + 1;
 
-    // Where the edit cursor goes: prompt + the display width of the text
-    // before the cursor (cursor is a string index; wide/zero-width chars
-    // make index and column differ).
-    const editIdx = promptLen + this._visibleLength(text.slice(0, cursor));
-    let editRow = Math.floor(editIdx / cols);
-    let editCol = editIdx % cols;
-    if (editIdx === visible && visible > 0 && visible % cols === 0) {
+    // Where the edit cursor goes: walk the text before the cursor (a
+    // string index; wide/zero-width chars and newlines make index and
+    // row/column differ).
+    const cur = this._layoutRows(promptLen, text.slice(0, cursor));
+    let editRow = cur.row;
+    let editCol = cur.col;
+    if (editCol >= cols) editCol = cols - 1; // wrap pending on this row
+    if (boundaryEnd && cursor === text.length && !ghost) {
       // Cursor at the very end of a display ending on a wrap boundary:
-      // the terminal sits on the previous row with the wrap pending.
-      editRow = visible / cols - 1;
+      // the terminal sits on the previous row with the wrap pending (or,
+      // on this terminal, one row lower — endRow carries the measured
+      // shift). Either way sit one cell short of the boundary column:
+      // parked at the boundary, the next keystroke would fire the pending
+      // wrap and drop the paint yet another row down.
+      editRow = endRow;
       editCol = cols - 1;
     }
 
     let out = '';
+    const prevPainted = this._paintedRows;
     if (this._paintedRows > 0) {
       // Back to the home row of the previous paint...
       out += A.cursorUp(this._cursorRow) + '\r';
@@ -563,7 +633,18 @@ class LineEditor extends EventEmitter {
     // intact, and _drawMenu re-hangs it below the new last row right
     // after this when the input grew.)
     out += this.promptText + text;
-    if (ghost) out += A.dim + ghost + A.reset;
+    // The ghost can be multi-line: paint its newlines as CR LF so each
+    // line starts at column 0 (raw-mode '\n' alone keeps the column),
+    // matching what _layoutRows counted.
+    if (ghost) out += A.dim + ghost.replace(/\r?\n/g, '\r\n') + A.reset;
+
+    // While the prompt-width probe is armed, ask for the cursor position
+    // again right after the paint: the two replies bracket the painted
+    // prompt and give its true width in this terminal's own width tables.
+    if (this._cprStage === 1) {
+      out += '\x1b[6n';
+      this._cprStage = 2;
+    }
 
     // Place the edit cursor relative to the end of the paint. Never walk
     // backwards with CUB across rows — cursorBack stops at column 0.
@@ -574,6 +655,27 @@ class LineEditor extends EventEmitter {
     this._paintedRows = newRows;
     this._cursorRow = editRow;
     this._editCol = editCol;
+    // Remember this paint's model so the prompt-width probe can re-anchor
+    // it when the terminal's real cursor row disagrees (see _handleCpr).
+    this._lastEditRow = editRow;
+    this._lastBoundary = boundaryEnd;
+
+    if (process.env.FGSH_ANCHOR_DEBUG) {
+      // One stamp per process, so a log read back later (cat /tmp/anchor.log)
+      // can always be attributed to the session that wrote it.
+      let head = '';
+      if (!this._anchorStamped) {
+        this._anchorStamped = true;
+        head = `[SESSION] pid=${process.pid} started=${new Date().toISOString()} ` +
+          `cols=${cols} promptCells=${this._visibleLength(this.promptText)}\n`;
+      }
+      const line = head +
+        `[ANCHOR] cols=${cols} visible=${visible} promptLen=${promptLen} ` +
+        `ghostLen=${ghostLen} endRow=${endRow} newRows=${newRows} ` +
+        `editRow=${editRow} editCol=${editCol} prevPainted=${prevPainted} ` +
+        `endShift=${this._rowEndShift} boundary=${boundaryEnd}\n`;
+      try { require('fs').appendFileSync(process.env.FGSH_ANCHOR_DEBUG, line); } catch (e) {}
+    }
 
     try { this.output.write(out); } catch (e) {
       if (process.env.FGSH_DEVEL) console.error('[DEBUG] _render write failed:', e.message);
@@ -594,6 +696,226 @@ class LineEditor extends EventEmitter {
     let w = 0;
     for (const ch of plain) w += cpWidth(ch.codePointAt(0));
     return w;
+  }
+
+  /**
+   * Layout walk: where painting `s` after `startCol` cells on the home row
+   * leaves the cursor — { row, col } relative to that row.
+   *
+   * Handles what a flat cell count cannot:
+   * - embedded newlines ('\n' drops a row keeping the column, '\r' returns
+   *   to column 0 — the raw-mode semantics our own writes have): a
+   *   multi-line ghost occupies one row per line, and counting only its
+   *   cells made every repaint erase rows short and stack copies of the
+   *   prompt;
+   * - the terminal's deferred wrap: a display ending on the last column
+   *   keeps the wrap pending on that row (col === cols), which is what
+   *   _render's boundary/_rowEndShift logic keys off.
+   *
+   * For a single-line display this is exactly floor((startCol+V-1)/cols).
+   */
+  _layoutRows(startCol, s) {
+    const cols = this.output.columns || process.stdout.columns || 80;
+    let row = 0, col = startCol;
+    if (startCol > 0) {
+      // The prompt's cells can wrap when it is wider than the terminal
+      // (cols=40 with a 55-cell powerline): start on the row where
+      // startCol cells really leave the cursor — deferred wrap means
+      // exactly-on-the-boundary still sits on the previous row.
+      row = Math.floor((startCol - 1) / cols);
+      col = startCol - row * cols;
+    }
+    for (const ch of s) {
+      if (ch === '\n') { row++; continue; }          // raw LF: down, column kept
+      if (ch === '\r') { col = 0; continue; }
+      const w = cpWidth(ch.codePointAt(0));
+      if (w <= 0) continue;
+      if (col >= cols) { row++; col = 0; }           // deferred wrap fires
+      col += w;
+      if (col > cols) { row++; col -= cols; }        // wide char crossed the edge
+    }
+    return { row, col };
+  }
+
+  /**
+   * Measure the prompt's painted width against the live terminal.
+   *
+   * Our per-codepoint width table cannot be right for every emulator:
+   * tmux paints U+200B in zero cells (measured 2026-10-09), while the
+   * duplication users still see in kitty/zellij-sized windows shows other
+   * hosts disagreeing somewhere in the powerline prompt's private-use and
+   * zero-width glyphs. A one-cell disagreement is enough to make the
+   * repaint anchor drift — stacking copies of the prompt on narrow
+   * windows — and to land the edit cursor a cell off.
+   *
+   * So, once per prompt, the first paint is bracketed by two cursor-
+   * position reports (ESC[6n — written by _render while _cprStage === 1)
+   * and the reported delta becomes the prompt's width (_promptPaintWidth).
+   * Terminals that never answer simply keep using the table (250ms
+   * timeout), so behaviour is unchanged where CPR is unavailable.
+   */
+  _beginPromptProbe() {
+    this._promptPaintWidth = null;
+    this._cprLate = false;
+    clearTimeout(this._cprLateTimer);
+    this._probeExtends = 0;
+    if (!this.terminal || this._closed || !this._active) return;
+    clearTimeout(this._cprTimer);
+    this._cprStage = 1;
+    this._cprHome = null;
+    this._cprHold = 0;
+    try {
+      // The prompt is about to be painted from column 0 of this row:
+      // record that cell as the probe's baseline.
+      this.output.write('\r\x1b[6n');
+    } catch (e) {
+      this._cprStage = 0;
+      return;
+    }
+    this._armCprTimeout();
+  }
+
+  /**
+   * Arm the prompt-width probe's timeout.
+   *
+   * When input is being held for the probe (_probeHold non-empty), the
+   * window is extended instead of dropping the stage: a terminal that
+   * answers at all answers within a round trip, but a multiplexer
+   * forwarding the reply (zellij) can push it past 250ms, and releasing
+   * the hold early would render against the un-measured anchor again —
+   * the duplication this probe exists to prevent. Only when nothing is
+   * waiting, or the extensions run out, does the probe give up: the stage
+   * drops, held input flushes with the table geometry (the pre-probe
+   * behaviour), and a reply that still arrives is adopted late if it
+   * passes the plausibility guard (_cprLate).
+   */
+  _armCprTimeout() {
+    clearTimeout(this._cprTimer);
+    this._cprTimer = setTimeout(() => {
+      if (this._probeHold.length && this._probeExtends < 2) {
+        this._probeExtends++;
+        this._armCprTimeout();
+        return;
+      }
+      this._cprStage = 0;
+      // Keep collecting a late reply for this prompt: adoption is guarded
+      // by the same width plausibility check, and by requiring that this
+      // prompt never adopted one (so a reply from an earlier prompt cannot
+      // be re-applied here).
+      this._cprLate = !this._promptPaintWidth;
+      if (this._cprLate) {
+        clearTimeout(this._cprLateTimer);
+        this._cprLateTimer = setTimeout(() => {
+          this._cprLate = false;
+          this._cprHome = null;
+        }, 600);
+      }
+      this._flushProbeHold();
+    }, 250);
+  }
+
+  /** Replay input held while the prompt-width probe was resolving. */
+  _flushProbeHold() {
+    if (!this._probeHold.length) return;
+    const held = this._probeHold;
+    this._probeHold = [];
+    for (const b of held) this._onData(b);
+  }
+
+  /** Handle one ESC[row;colR reply for the prompt-width probe. */
+  _handleCpr(m) {
+    const row = parseInt(m[1], 10);
+    const col = parseInt(m[2], 10);
+    if (!(row > 0) || !(col > 0)) return;
+    if (this._cprStage === 0 && !this._cprLate) {
+      return; // stale reply from a finished probe
+    }
+    if (!this._cprHome) {
+      // First reply = the baseline (where the prompt's paint starts).
+      // Both queries are already queued when the first reply arrives, so
+      // the stage cannot order them — the presence of the baseline can.
+      this._cprHome = [row, col];
+      return;
+    }
+    clearTimeout(this._cprTimer);
+    this._cprStage = 0;
+    const cols = this.output.columns || process.stdout.columns || 80;
+    const [r0, c0] = this._cprHome;
+    const model = this._visibleLength(this.promptText);
+    let width;
+    if (col !== cols) {
+      width = (row - r0) * cols + (col - c0);
+    } else {
+      // Paint ended on the last column: the reply alone cannot distinguish
+      // "ended here" from "ended exactly on a wrap boundary" (both report
+      // the last column). Pick the candidate closest to the table's
+      // estimate — real disagreements are a cell or two, never half a
+      // line — so a prompt that lands on the boundary still resolves.
+      const atLastCol = (row - r0) * cols + cols - 1;
+      const atBoundary = (row - r0 + 1) * cols;
+      width = Math.abs(atLastCol - model) <= Math.abs(atBoundary - model)
+        ? atLastCol : atBoundary;
+    }
+    // Guard against a mis-sequenced baseline. The two probe replies can be
+    // reordered (or a stale reply captured) when the paint itself crosses a
+    // wrap boundary, yielding a width inflated by whole rows (measured: 109
+    // for a 55-cell prompt). The editor's per-codepoint table is only wrong
+    // by a cell or two on real terminals, so a measurement that disagrees by
+    // more than a small tolerance — or that puts the prompt on more rows than
+    // the table ever could — is spurious: keep the table rather than adopt
+    // geometry that would make every repaint erase the wrong rows (stacking
+    // copies of the prompt on narrow windows).
+    const plausible = width > 0 && Math.abs(width - model) <= 2;
+    if (!plausible) {
+      if (process.env.FGSH_DEVEL) {
+        console.error(`[DEBUG] prompt width: rejected implausible ${width} ` +
+          `(table said ${model}); keeping table`);
+      }
+      return;
+    }
+    // Measure the paint's END ROW as well as its width. The width above
+    // is derived from columns and cannot distinguish two terminals that
+    // both report a plausible value: one where the prompt's final cell
+    // leaves the wrap pending on the last row, and one where the trailing
+    // zero-width ZWSP resolves the pending wrap and the cursor drops a
+    // row (pyte measured 2026-10-10; both report 55 for a 55-cell
+    // prompt). The second case anchored every repaint one row low and
+    // stacked copies of the prompt — the reply's row delta can tell them
+    // apart, so adopt it.
+    const endRowModel = model > 0 ? Math.floor((model - 1) / cols) : 0;
+    const rowFix = (row - r0) - endRowModel;
+    const prevShift = this._rowEndShift;
+    if (rowFix === 1) this._rowEndShift = 1;
+    else if (rowFix === 0) this._rowEndShift = 0;
+    // (Bigger disagreements are implausible — whole-row garbage from a
+    // mis-sequenced baseline, which the width guard already rejected —
+    // so keep whatever was measured before.)
+    // Re-anchor before re-rendering: the last paint's cursor really ended
+    // rowFix rows below where a shift-less model would place it — minus
+    // the shift that model already applied (prevShift) — when that paint
+    // ended on a boundary. The corrective repaint erases relative to the
+    // stored anchor, so stale values would make the fix paint yet another
+    // copy instead of clearing the old rows.
+    const prevCursorRow = this._cursorRow;
+    this._cursorRow = this._lastEditRow +
+      (this._lastBoundary ? rowFix - prevShift : 0);
+    this._paintedRows = Math.max(this._paintedRows,
+      this._cursorRow + 1, (row - r0) + 1);
+    this._promptPaintWidth = width;
+    if (process.env.FGSH_DEVEL) {
+      console.error(`[DEBUG] prompt width: terminal painted ${width} cells, ` +
+        `table said ${model}; boundary row shift ${this._rowEndShift}`);
+    }
+    this._cprLate = false;
+    clearTimeout(this._cprLateTimer);
+    // Adopt the measured geometry whenever it differs from the model.
+    if (width !== model || this._rowEndShift !== prevShift ||
+        this._cursorRow !== prevCursorRow) {
+      this._render();
+    }
+    // The probe resolved: replay input that arrived while it was pending,
+    // now against the measured anchor.
+    this._flushProbeHold();
   }
 
   // ---- input parsing ----
@@ -656,6 +978,30 @@ class LineEditor extends EventEmitter {
       s = s.slice(0, s.lastIndexOf(ESC));
       this._armPendingTimer();
     }
+    // Cursor-position replies (ESC[row;colR) answer the prompt-width
+    // probe; they are terminal output, never user input, so consume them
+    // before key parsing.
+    if (this._cprStage || this._cprLate) {
+      // Both replies can arrive in one read — consume each one in order.
+      let cpr;
+      while ((cpr = s.match(/\x1b\[(\d+);(\d+)R/))) {
+        this._handleCpr(cpr);
+        s = s.slice(0, cpr.index) + s.slice(cpr.index + cpr[0].length);
+        if (!this._cprStage) break; // probe done; rest are stray replies
+      }
+    }
+    if (this._cprStage) {
+      // The probe is still resolving: hold this input instead of rendering
+      // it against the un-measured anchor. On a terminal whose cursor sits
+      // one row below the model's after a boundary-ending paint (kitty,
+      // pyte — the trailing ZWSP resolves the pending wrap), such a paint
+      // anchored one row low and stacked a fresh copy of the prompt under
+      // the stale one — the residue seen in kitty/zellij when prompt width
+      // equals window width. The probe's completion (or timeout) replays
+      // the held bytes through _onData, preserving their order.
+      if (s) this._probeHold.push(Buffer.from(s, 'utf8'));
+      return;
+    }
     if (!s) return;
     let i = 0;
     while (i < s.length) {
@@ -689,6 +1035,24 @@ class LineEditor extends EventEmitter {
     this._pendingTimer = setTimeout(() => {
       this._pendingTimer = null;
       if (!this._pending) return;
+      // A slow cursor-position reply can be split across reads; while
+      // the prompt-width probe is waiting, keep holding the fragment
+      // instead of mistaking it for the Escape key (which would clear
+      // the line), then drop it once it is clear no reply is coming.
+      if (this._cprStage && /^\x1b\[[0-9;]*$/.test(this._pending)) {
+        if (++this._cprHold < 6) { this._armPendingTimer(); return; }
+        this._pending = '';
+        this._cprHold = 0;
+        return;
+      }
+      if (this._cprStage || this._cprLate) {
+        // The probe is still resolving: these bytes belong with the input
+        // held for it — delivering an Escape now would clear the line
+        // against the un-measured anchor.
+        this._probeHold.push(Buffer.from(this._pending, 'utf8'));
+        this._pending = '';
+        return;
+      }
       const lone = this._pending;
       this._pending = '';
       this._deliverLoneEscape(lone);
@@ -1042,6 +1406,10 @@ class LineEditor extends EventEmitter {
       // on screen and should show exactly what was typed.
       this._ghost = '';
       this._render();
+      // Erase the completion menu before moving on: the newline below
+      // steps into the rows the box occupies, and the next prompt would
+      // paint over its first row while the rest of the box lingered.
+      this._clearMenu();
       this._line = '';
       this._cursor = 0;
       this._active = false;
@@ -1179,14 +1547,19 @@ class LineEditor extends EventEmitter {
     } catch (e) {
       raw = [];
     }
-    // Normalize items: plain strings become { text, right: '' }
+    // Normalize items: plain strings become { text, right: '' }.
+    // History items can be multi-line (pasted function definitions): a raw
+    // newline inside the box adds an uncounted row and breaks the box's
+    // clear/erase arithmetic — rows of the old box lingered after the
+    // menu closed. Show them flattened.
+    const flatten = s => s.replace(/[\r\n]+/g, ' ');
     const items = [];
     for (const x of raw) {
       if (items.length >= 50) break;
       if (typeof x === 'string') {
-        if (x.length) items.push({ text: x, right: '' });
+        if (x.length) items.push({ text: flatten(x), right: '' });
       } else if (x && typeof x.text === 'string' && x.text.length) {
-        items.push({ text: x.text, right: x.right ? String(x.right) : '' });
+        items.push({ text: flatten(x.text), right: x.right ? String(x.right) : '' });
       }
     }
     // Don't echo what the user already typed — unless the row carries a

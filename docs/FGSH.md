@@ -274,6 +274,55 @@ The OpenTUI core is loaded lazily the first time Ctrl+R is pressed, and
 works in the compiled `./fgsh` binary (its native library is embedded by
 `bun build --compile`).
 
+**Fallback pickers (no OpenTUI):** `@opentui/core` ships prebuilt native
+binaries only for Linux, macOS and Windows, so on FreeBSD/GhostBSD — where
+an OpenTUI port is still in progress upstream — its core cannot load yet.
+When the import (or the renderer creation) fails, Ctrl+R and Ctrl+N
+automatically switch to plain-ANSI fallback pickers: the same two-pane
+layout, fuzzy filter, keys and behavior, drawn with ANSI on the alternate
+screen and driven by the line editor's readline-style `keypress` events
+instead of OpenTUI's key input. The inline completion menu on the command
+line was never an OpenTUI component (it is drawn by `src/line-editor.js`),
+which is why it already worked on those platforms.
+
+`FGSH_TUI` overrides the detection:
+- `FGSH_TUI=ansi` — always use the plain-ANSI pickers (handy for testing
+  them on Linux)
+- `FGSH_TUI=opentui` — require OpenTUI and report an error instead of
+  falling back
+
+### Prompt Width Calibration
+
+The line editor repaints the prompt from a tracked anchor, so it must know
+exactly how many terminal cells the prompt occupies. That width cannot be
+computed from a static per-codepoint table, because terminals genuinely
+disagree about zero-width and private-use codepoints (U+200B in powerline
+prompts, nerd-font glyphs): tmux was measured painting U+200B in zero
+cells, while other hosts (kitty, zellij) show the one- or two-cell
+disagreements that used to stack copies of the prompt on narrow windows
+and put the edit cursor a cell off.
+
+So on every `prompt()` the first paint is bracketed by two cursor-position
+reports (`ESC[6n` — the standard query every terminal answers) and the
+reported delta becomes the prompt's width for that prompt. Terminals that
+never answer fall back to the static table after a 250ms timeout, so
+behaviour is unchanged where the query is unavailable. A reply split
+across reads is buffered rather than mistaken for the Escape key.
+
+The probe also calibrates the paint's **end row**, not just its width.
+When the prompt's last cell lands exactly on a wrap boundary (prompt
+width a multiple of the terminal width), terminals disagree about the
+trailing U+200B: some keep the wrap pending on the last row, others let
+the zero-width character resolve the pending wrap and drop the cursor to
+the next row. Both report a plausible *width*, so the column delta alone
+cannot tell them apart — only the reply's row delta can (measured 2026-10-10
+in a pyte emulator: a 55-cell prompt on a 55-column window ends its paint
+one row lower, which anchored every repaint a row low and stacked copies
+of the prompt; the same mechanism explains the kitty/zellij reports where
+the probe logged "55 == 55" yet the screen duplicated). The editor adopts
+that row delta (`_rowEndShift`) for boundary-ending paints, so the anchor
+matches whatever the real terminal does.
+
 ### File Picker (Ctrl+N)
 
 An OpenTUI app (same stack as the history picker) drawn on the alternate

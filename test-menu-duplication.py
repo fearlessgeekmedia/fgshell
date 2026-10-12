@@ -58,6 +58,11 @@ video. It then asserts:
     fuzzy-filters as you type, inserts the selected command on Enter,
     cancels on Escape without touching the line, and leaves the shell
     reading keyboard input afterwards (its teardown pauses stdin)
+  * the plain-ANSI fallback pickers (FGSH_TUI=ansi — what FreeBSD/GhostBSD
+    get, because OpenTUI ships no native binary for those platforms yet)
+    run the same Ctrl+R/Ctrl+N flows: alternate screen, fuzzy filter,
+    arrow navigation, Enter selects, Escape cancels, and the line editor
+    still reads keys afterwards
   * small windows — the line duplication/distortion regression (TODO.md
     2026-10-07): on a narrow window the wrapped input line never leaves a
     stale copy of the prompt on screen (repainting used to start from the
@@ -111,8 +116,17 @@ def check(cond, msg):
 class Screen:
     # Set by spawn() so the screen model can answer terminal queries the
     # same way a real terminal would (OpenTUI asks for the cursor position
-    # before taking over the screen and restores it on teardown).
+    # before taking over the screen and restores it on teardown; the line
+    # editor brackets its first prompt paint with cursor-position reports
+    # to measure the prompt's true width in this terminal).
     reply_fd = None
+
+    # Cells the model paints for U+200B. Terminals genuinely disagree
+    # (tmux: 0 — measured 2026-10-09; kitty/zellij hosts show a
+    # disagreement too), so a session can set this to 1 to simulate a
+    # host whose width differs from the editor's static table: the editor
+    # must calibrate to the terminal, not to its table.
+    zwsp_width = 0
 
     def __init__(self, cols=COLS, rows=ROWS):
         self.cols, self.rows = cols, rows
@@ -146,8 +160,14 @@ class Screen:
             # Zero-width codepoints (combining marks, format controls like
             # the U+200B a powerline prompt ends with, variation selectors)
             # advance nothing in a real terminal; painting them as cells
-            # would make the model disagree with actual terminals.
-            if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            # would make the model disagree with actual terminals. ZWSP's
+            # width is configurable via Screen.zwsp_width because real
+            # terminals disagree about it (tmux: 0 — measured in a pane
+            # 2026-10-09 by printing A+ZWSP+B and reading the cursor back).
+            if ch == "\u200b":
+                if Screen.zwsp_width == 0:
+                    return
+            elif unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
                 return
             if self.col >= self.cols:
                 self.col = 0
@@ -365,7 +385,7 @@ class Screen:
 
 
 # ----------------------------------------------------------------- pty driver
-def spawn(rc_line=None, start_dir=None, kitty=False, cols=None, rows=None):
+def spawn(rc_line=None, start_dir=None, kitty=False, cols=None, rows=None, env_extra=None):
     cols = COLS if cols is None else cols
     rows = ROWS if rows is None else rows
     home = tempfile.mkdtemp(prefix="fgsh-home-")
@@ -401,6 +421,8 @@ def spawn(rc_line=None, start_dir=None, kitty=False, cols=None, rows=None):
     })
     if kitty:
         env["KITTY_WINDOW_ID"] = "1"  # getImageSupport() => 'kitty'
+    if env_extra:
+        env.update(env_extra)
     if start_dir == "HOME":
         start_dir = home
     pid, fd = pty.fork()
@@ -634,8 +656,11 @@ def main():
     picker_subdir_session()
     kitty_preview_session()
     history_session()
+    fallback_history_session()
+    fallback_picker_session()
     small_window_sessions()
     cursor_session()
+    zwsp_disagreement_session()
 
     print()
     if failures:
@@ -710,7 +735,7 @@ def mtime_session():
         cleanup(pid, fd, home)
 
 
-def picker_session():
+def picker_session(env_extra=None):
     """Fresh shell: Ctrl+N file picker navigation.
 
     Arrow keys must move the selection while the picker stays open. They
@@ -718,7 +743,7 @@ def picker_session():
     without the ESC prefix and never matched), so the first arrow quit the
     picker and dropped the user back at the prompt.
     """
-    pid, fd, home = spawn()
+    pid, fd, home = spawn(env_extra=env_extra)
     screen = Screen()
     try:
         wait_for_prompt(fd, screen)
@@ -971,7 +996,7 @@ def kitty_preview_session():
         cleanup(pid, fd, home)
 
 
-def history_session():
+def history_session(env_extra=None):
     """Fresh shell: the Ctrl+R history picker (an OpenTUI app).
 
     It must open over the alternate screen, fuzzy-filter as you type,
@@ -979,7 +1004,7 @@ def history_session():
     without altering the line, and — because OpenTUI pauses stdin on
     teardown — leave the line editor reading keyboard input again.
     """
-    pid, fd, home = spawn()
+    pid, fd, home = spawn(env_extra=env_extra)
     screen = Screen()
     try:
         wait_for_prompt(fd, screen)
@@ -1043,6 +1068,26 @@ def history_session():
               f"hist: line editor still reads keys after the picker ({live!r})")
     finally:
         cleanup(pid, fd, home)
+
+
+def fallback_history_session():
+    """Same flow as history_session(), but with FGSH_TUI=ansi.
+
+    OpenTUI's native core has no FreeBSD/GhostBSD build, so the shell falls
+    back to a plain-ANSI history picker there. The fallback must offer the
+    same behavior: alternate-screen list, fuzzy filter, Enter inserts the
+    selection, Escape cancels, and the line editor keeps reading keys.
+    """
+    history_session(env_extra={"FGSH_TUI": "ansi"})
+
+
+def fallback_picker_session():
+    """Same flow as picker_session(), but with FGSH_TUI=ansi.
+
+    Exercises the plain-ANSI fallback file picker that FreeBSD/GhostBSD
+    get when @opentui/core cannot load.
+    """
+    picker_session(env_extra={"FGSH_TUI": "ansi"})
 
 
 # ------------------------------------------------ small-window regression
@@ -1210,25 +1255,36 @@ def small_window_sessions():
     tiny_window_session()
 
 
-def cursor_session():
+def cursor_session(zwsp_width=0):
     r"""Prompt with a zero-width space (U+200B) — the powerline prompt
     fgsh-prompt builds ends with one.
 
     String length counts the ZWSP as a column; a terminal paints it in
     zero cells. If the editor measures the prompt by string length, the
     edit cursor lands one space ahead of the painted text (the bug with
-    PS1=$(fgsh-prompt \$?)). Width must come from display cells."""
+    PS1=$(fgsh-prompt \$?)). Width must come from display cells.
+
+    `zwsp_width` selects how many cells THIS terminal paints the ZWSP in
+    (0 = tmux-measured behaviour, 1 = a host that disagrees with the
+    editor's static table): either way the cursor must land on the cell
+    right after the painted text, which is what the editor's terminal
+    calibration (_beginPromptProbe) is for.
+    """
     cols, rows = 80, 24
     zwsp = "\u200b"
+    prev_width = Screen.zwsp_width
+    Screen.zwsp_width = zwsp_width
     pid, fd, home = spawn(rc_line=f'PS1="e{zwsp}:fgshell > "',
                           cols=cols, rows=rows)
     screen = Screen(cols, rows)
     try:
         wait_for_prompt(fd, screen)
-        # The .fgshrc prompt is active (it carries 'e:fgshell', which the
+        # The .fgshrc prompt is active (it carries 'e…:fgshell', which the
         # default "fearlessgeek:fgshell" prompt does not contain). The ZWSP
-        # itself never appears as a cell — terminals paint it in zero.
-        check(any("e:fgshell" in r for r in screen.raw_rows()),
+        # may or may not occupy a cell depending on this session's
+        # zwsp_width, so match the segments around it.
+        check(any(":fgshell" in r for r in screen.raw_rows())
+              and not any("fearlessgeek" in r for r in screen.raw_rows()),
               "zwsp: ZWSP prompt from .fgshrc is active")
         check(len(screen.prompt_rows()) == 1, "zwsp: one prompt at startup")
 
@@ -1252,6 +1308,16 @@ def cursor_session():
               f"(col {screen.col}, want {painted})")
     finally:
         cleanup(pid, fd, home)
+        Screen.zwsp_width = prev_width
+
+
+def zwsp_disagreement_session():
+    """Terminal paints U+200B in one cell while the editor's static table
+    says zero — the kitty/zellij-style disagreement that kept restacking
+    the prompt. The editor measures the prompt against the terminal's own
+    cursor-position report, so the cursor must still land right after the
+    painted text and the line must never duplicate."""
+    cursor_session(zwsp_width=1)
 
 
 if __name__ == "__main__":

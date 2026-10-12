@@ -1,6 +1,6 @@
 # fgshell
 
-A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime. Runs on Linux, macOS, and GhostBSD/FreeBSD. Note that certain TUI components of the shell do not run on GhostBSD or FreeBSD currently. This is in the process of being fixed.
+A modern Unix shell with fuzzy history search, an interactive file picker, and inline command prediction — written in JavaScript on the Bun runtime. Runs on Linux, macOS, and GhostBSD/FreeBSD. The Ctrl+R/Ctrl+N pickers are built on OpenTUI, which does not ship a FreeBSD/GhostBSD build yet — on those systems fgshell automatically falls back to a plain-ANSI version of both pickers (`FGSH_TUI=ansi` forces the fallback anywhere, `FGSH_TUI=opentui` disables it).
 
 ## What is this?
 
@@ -29,8 +29,8 @@ If you need POSIX compliance, use bash or sh. fgshell is for developers who want
 ## Features
 
 ### The Cool Stuff
-- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories in a two-pane UI (list plus live preview with size and date), fuzzy-filters as you type, and renders inline image previews in Kitty terminals; built on OpenTUI like the history search
-- **🔍 Fuzzy history search** (Ctrl+R) — two-pane UI (list plus full-command preview with time, exit code and directory), fuzzy-matching powered by Fuse.js, rendered with OpenTUI
+- **📂 Interactive file picker** (Ctrl+N) — visually browse files and directories in a two-pane UI (list plus live preview with size and date), fuzzy-filters as you type, and renders inline image previews in Kitty terminals; built on OpenTUI like the history search, with a plain-ANSI fallback picker on platforms OpenTUI does not support yet (FreeBSD/GhostBSD)
+- **🔍 Fuzzy history search** (Ctrl+R) — two-pane UI (list plus full-command preview with time, exit code and directory), fuzzy-matching powered by Fuse.js, rendered with OpenTUI (plain-ANSI fallback where OpenTUI cannot load)
 - **💾 SQLite history database** — persistent history with timestamps, exit codes, and execution duration
 - **🎨 Customizable prompts** — full color support and variable expansion
 - **⚡ Inline command prediction** — ghost text plus a bordered, scrollable menu that completes paths as you type (`cat ~/` lists your home), shows each command's full path on the right, with an optional mtime column (`export FGSH_MENU_MTIME=1` in `~/.fgshrc`)
@@ -207,6 +207,7 @@ fgshell uses FFI bindings to access low-level job control syscalls that aren't e
 ## Known Limitations & Issues
 
 - **Platform support**: Linux, macOS, and GhostBSD/FreeBSD. Not available on Windows. On FreeBSD, Bun comes from a community build rather than an official bun.sh release, so it may lag behind the latest version
+- **OpenTUI pickers**: Ctrl+R (history) and Ctrl+N (file picker) use OpenTUI, which ships native binaries for Linux/macOS/Windows only. fgshell detects this and falls back to plain-ANSI pickers with the same layout, fuzzy filter, and keys, so both features keep working on FreeBSD/GhostBSD until an OpenTUI port lands
 - **sudo TTY access**: `sudo` without the `-S` flag fails to read passwords interactively when run inside `fgshell`, regardless of whether `fgshell` is the default shell or a subshell. Workaround: use `sudo -S` to read password from stdin
 - **Ctrl+Z job suspension**: Works for single foreground commands; edge cases remain for pipelines/compound commands, and stop-detection polls `/proc` (Linux-only), so behavior is less robust on macOS/GhostBSD (tracked in TODO.md)
 - **Performance**: Written in JavaScript/Bun—not as fast as native shells for heavy workloads

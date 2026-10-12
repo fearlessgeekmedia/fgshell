@@ -3742,8 +3742,41 @@ async function executeSubshell(cmd, context) {
   }
 }
 
-async function runSingle(line, context) {
+/**
+ * Peel a leading run of bash-style `NAME=value` words off a command line.
+ *
+ * Each value may be bare (`A=1`), double-quoted (`A="x y"`), or
+ * single-quoted (`A='x y'`). Returns `{ assigns, rest }` where `rest` is
+ * whatever follows the last assignment word (empty for a bare assignment
+ * with no command). Used to support `FGSH_DEVEL=1 ./fgsh` — a temporary
+ * assignment scoped to one command — without disturbing the plain
+ * `VAR=value` case, which the existing assignMatch branch still owns.
+ */
+function peelLeadingAssignments(line) {
+  // The bare-value alternative must not stop at whitespace INSIDE a
+  // command substitution: PS1=$(fgsh-prompt \$?) used to split at the
+  // space inside $(), and the leftover \$?) was then executed as a
+  // command ("0): command not found" on every startup). Bare values may
+  // therefore contain $( … ) groups with one level of nested parens.
+  const SUBST = '\\$\\((?:[^()]*(?:\\([^()]*\\))?)*\\)';
+  const BARE = `(?:${SUBST}|[^\\s])+`;
+  const ASSIGN = new RegExp(
+    `^\\s*([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|${BARE})`);
+  const assigns = [];
+  let s = line;
+  for (;;) {
+    const m = s.match(ASSIGN);
+    if (!m) break;
+    assigns.push({ name: m[1], value: m[2] });
+    s = s.slice(m[0].length);
+  }
+  return { assigns, rest: s.trim() };
+}
+
+async function runSingle(line, context, opts) {
   // context: { startLine, endLine, filename, content } - optional, used for error reporting
+  // opts: { noHistory } - set for recursive runs (a prefix-assignment's
+  //   command) so the peeled command isn't logged to history a second time.
   
   // Expand history shortcuts before tokenization so sequences like "a; !!" 
   // see the history populated by earlier commands in the same line.
@@ -3753,7 +3786,7 @@ async function runSingle(line, context) {
   
   // Track in history for history expansion (skip history/exit)
   const isBuiltinCommand = !trimmedLine.startsWith('history') && !trimmedLine.startsWith('exit');
-  if (isBuiltinCommand && trimmedLine) {
+  if (isBuiltinCommand && trimmedLine && !(opts && opts.noHistory)) {
     if (rl && rl.history) {
       rl.history.push(trimmedLine);
     }
@@ -3772,6 +3805,32 @@ async function runSingle(line, context) {
       return;
     }
     
+    // Bash-style temporary assignment: `VAR=value cmd` (e.g. FGSH_DEVEL=1
+    // ./fgsh) sets VAR only for that command. Peel the leading NAME=value
+    // words; if a command remains, run it with the vars merged into the
+    // environment for its duration, then restore. With nothing left over it
+    // is a plain assignment, which the assignMatch branch below still owns.
+    const peeled = peelLeadingAssignments(line);
+    if (peeled.assigns.length && peeled.rest) {
+      const saved = {};
+      try {
+        for (const { name, value } of peeled.assigns) {
+          saved[name] = { had: name in SHELL.env, old: SHELL.env[name] };
+          // Strip one layer of matching quotes, then expand, so
+          // `MSG="a b" cmd` passes `a b` (not "a b") to the command.
+          const v = (/^".*"$|^'.*'$/.test(value)) ? value.slice(1, -1) : value;
+          SHELL.env[name] = expandVars(v);
+        }
+        await runSingle(peeled.rest, context, { noHistory: true });
+      } finally {
+        for (const name of Object.keys(saved)) {
+          if (saved[name].had) SHELL.env[name] = saved[name].old;
+          else delete SHELL.env[name];
+        }
+      }
+      return;
+    }
+
     // Check for variable assignment (VAR=value)
     const assignMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
     if (assignMatch) {
@@ -4709,6 +4768,41 @@ async function getFilePreview(filePath, maxLines = 20, baseDir = SHELL.cwd) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// OpenTUI availability
+//
+// @opentui/core ships prebuilt native binaries only for Linux, macOS and
+// Windows (its optionalDependencies are core-{darwin,linux,win32}-x64/arm64
+// packages). On FreeBSD/GhostBSD — and anywhere else the Zig core cannot
+// load — importing it throws, which used to take the Ctrl+R history search
+// and the Ctrl+N file picker down with it. The pickers probe it once here
+// and fall back to the plain-ANSI implementations below when it is missing.
+//
+// FGSH_TUI overrides the probe: `ansi` always uses the fallback pickers
+// (handy for testing them on Linux), `opentui` requires OpenTUI and reports
+// an error instead of falling back. The fuzzy completion menu on the
+// command line itself is NOT an OpenTUI component — it is drawn by
+// src/line-editor.js — which is why it keeps working on FreeBSD/GhostBSD.
+let _opentuiProbe = null;
+function pickerTUIMode() {
+  const mode = (SHELL.env.FGSH_TUI || process.env.FGSH_TUI || 'auto').toLowerCase();
+  return mode === 'ansi' ? 'ansi' : mode === 'opentui' ? 'opentui' : 'auto';
+}
+async function loadOpenTUI() {
+  if (_opentuiProbe) return _opentuiProbe;
+  if (pickerTUIMode() === 'ansi') {
+    _opentuiProbe = { ok: false, reason: 'FGSH_TUI=ansi' };
+    return _opentuiProbe;
+  }
+  try {
+    const mod = await import('@opentui/core');
+    _opentuiProbe = { ok: true, mod };
+  } catch (e) {
+    _opentuiProbe = { ok: false, err: e };
+  }
+  return _opentuiProbe;
+}
+
 // OpenTUI file picker: two-pane browser with fuzzy filter and live preview.
 // Mirrors showHistoryPicker's structure (lazily imported renderer, one
 // renderer per invocation, idempotent finish) but adds directory navigation
@@ -4717,6 +4811,17 @@ async function getFilePreview(filePath, maxLines = 20, baseDir = SHELL.cwd) {
 async function showFilePicker() {
   if (isFilePickerActive || !process.stdin.isTTY) {
     return null;
+  }
+  // No OpenTUI on this platform (FreeBSD/GhostBSD today): run the plain-ANSI
+  // picker instead of dying on the import.
+  const ot = await loadOpenTUI();
+  if (!ot.ok) {
+    if (pickerTUIMode() === 'opentui') {
+      console.error('File picker: @opentui/core unavailable:' +
+        (ot.err ? ' ' + ot.err.message : ' ' + ot.reason));
+      return null;
+    }
+    return showFilePickerFallback();
   }
   isFilePickerActive = true;
 
@@ -4747,12 +4852,12 @@ async function showFilePicker() {
   };
 
   try {
-    // Loaded lazily so the shell only pays for the native core when the
-    // user actually opens the picker. useKittyKeyboard stays off: the line
-    // editor parses stdin itself once the picker closes, and kitty-encoded
-    // keys (e.g. Enter as CSI-u) would not be understood by it.
-    const { createCliRenderer, BoxRenderable, TextRenderable, SelectRenderable, ImageRenderable } =
-      await import('@opentui/core');
+    // Loaded lazily (see loadOpenTUI) so the shell only pays for the
+    // native core when the user actually opens the picker. useKittyKeyboard
+    // stays off: the line editor parses stdin itself once the picker closes,
+    // and kitty-encoded keys (e.g. Enter as CSI-u) would not be understood
+    // by it.
+    const { createCliRenderer, BoxRenderable, TextRenderable, SelectRenderable, ImageRenderable } = ot.mod;
 
     renderer = await createCliRenderer({
       exitOnCtrlC: false,  // Ctrl+C cancels the picker, it never kills the shell
@@ -4967,6 +5072,17 @@ async function showFilePicker() {
     applyFilter();
     select.focus();
   } catch (e) {
+    if (!renderer) {
+      // The native core failed before any UI existed (e.g. its binary does
+      // not exist for this platform): fall back unless OpenTUI was forced.
+      if (pickerTUIMode() === 'opentui') {
+        console.error('File picker error:', e.message || e);
+        isFilePickerActive = false;
+        return null;
+      }
+      isFilePickerActive = false;
+      return showFilePickerFallback();
+    }
     console.error('File picker error:', e);
     finish(null);
   }
@@ -4976,6 +5092,17 @@ async function showFilePicker() {
 async function showHistoryPicker() {
   if (isFilePickerActive || !process.stdin.isTTY) {
     return null;
+  }
+  // No OpenTUI on this platform (FreeBSD/GhostBSD today): run the plain-ANSI
+  // picker instead of dying on the import.
+  const ot = await loadOpenTUI();
+  if (!ot.ok) {
+    if (pickerTUIMode() === 'opentui') {
+      console.error('History picker: @opentui/core unavailable:' +
+        (ot.err ? ' ' + ot.err.message : ' ' + ot.reason));
+      return null;
+    }
+    return showHistoryPickerFallback();
   }
   isFilePickerActive = true;
 
@@ -5005,12 +5132,12 @@ async function showHistoryPicker() {
   };
 
   try {
-    // Loaded lazily so the shell only pays for the native core when the
-    // user actually opens the picker. useKittyKeyboard stays off: the line
-    // editor parses stdin itself once the picker closes, and kitty-encoded
-    // keys (e.g. Enter as CSI-u) would not be understood by it.
-    const { createCliRenderer, BoxRenderable, TextRenderable, SelectRenderable } =
-      await import('@opentui/core');
+    // Loaded lazily (see loadOpenTUI) so the shell only pays for the
+    // native core when the user actually opens the picker. useKittyKeyboard
+    // stays off: the line editor parses stdin itself once the picker closes,
+    // and kitty-encoded keys (e.g. Enter as CSI-u) would not be understood
+    // by it.
+    const { createCliRenderer, BoxRenderable, TextRenderable, SelectRenderable } = ot.mod;
 
     renderer = await createCliRenderer({
       exitOnCtrlC: false,  // Ctrl+C cancels the picker, it never kills the shell
@@ -5153,10 +5280,377 @@ async function showHistoryPicker() {
     updatePreview();
     select.focus();
   } catch (e) {
+    if (!renderer) {
+      // The native core failed before any UI existed (e.g. its binary does
+      // not exist for this platform): fall back unless OpenTUI was forced.
+      if (pickerTUIMode() === 'opentui') {
+        console.error('History picker error:', e.message || e);
+        isFilePickerActive = false;
+        return null;
+      }
+      isFilePickerActive = false;
+      return showHistoryPickerFallback();
+    }
     console.error('History picker error:', e);
     finish(null);
   }
   return promise;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback pickers (plain ANSI, no OpenTUI)
+//
+// Same behavior as the OpenTUI pickers above — fuzzy filter, two-pane
+// layout, arrows to move, Enter to select, Esc to cancel — but drawn with
+// plain ANSI on the alternate screen and driven by the line editor's
+// readline-style 'keypress' events. The line editor buffers stdin while
+// paused and replays it once a listener attaches, so keys pressed in the
+// same read as Ctrl+R/Ctrl+N are not lost. They work on any POSIX terminal,
+// which makes Ctrl+R/Ctrl+N usable on FreeBSD/GhostBSD until OpenTUI ships
+// a native build for those platforms.
+
+/** Strip ANSI sequences — fallback content is plain single-width text. */
+function ansiVisible(s) {
+  return String(s).replace(/\x1b\[[0-9;?]*[a-zA-Z@`~]/g, '');
+}
+
+/** Clip to w cells, adding an ellipsis when it doesn't fit. */
+function ansiClip(s, w) {
+  const plain = ansiVisible(s);
+  if (w <= 0) return '';
+  if (plain.length <= w) return plain;
+  return plain.slice(0, w - 1) + '…';
+}
+
+/** Pad (or clip) to exactly w cells. */
+function ansiPad(s, w) {
+  const c = ansiClip(s, w);
+  return c + ' '.repeat(Math.max(0, w - ansiVisible(c).length));
+}
+
+/**
+ * Minimal picker shell shared by the fallbacks: alternate screen, redraw on
+ * every key, keys delivered as readline-style (str, key) pairs from the
+ * line editor. draw(state, rows, cols) returns the lines to paint;
+ * handleKey(state, str, key, ctl) mutates the state and calls ctl.render()
+ * or ctl.finish(value).
+ */
+function runAnsiPicker(state, draw, handleKey) {
+  return new Promise((resolve) => {
+    let done = false;
+    const out = process.stdout;
+
+    const render = () => {
+      if (done) return;
+      const rows = out.rows || 24;
+      const cols = out.columns || 80;
+      let lines;
+      try {
+        lines = draw(state, rows, cols);
+      } catch (e) {
+        lines = ['(picker render error: ' + (e.message || e) + ')'];
+      }
+      let buf = '\x1b[H\x1b[2J';
+      for (let i = 0; i < Math.min(lines.length, rows); i++) buf += lines[i] + '\r\n';
+      try { out.write(buf); } catch (e) { /* ignore */ }
+    };
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      try { out.write('\x1b[?25h\x1b[?1049l'); } catch (e) { /* ignore */ }
+      rl.removeListener('keypress', onKeypress);
+      state._render = null;
+      isFilePickerActive = false;
+      resolve(result);
+    };
+
+    const onKeypress = (str, key) => {
+      if (done || !key) return;
+      try {
+        handleKey(state, str, key, { render, finish });
+      } catch (e) {
+        if (process.env.FGSH_DEVEL) console.error('[picker] key error:', e.message || e);
+      }
+    };
+
+    // Async preview loads re-render through this hook once they land.
+    state._render = render;
+    try { out.write('\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l'); } catch (e) { /* ignore */ }
+    // Attaching the listener also flushes any keys the line editor buffered
+    // while the picker was starting up.
+    rl.on('keypress', onKeypress);
+    render();
+  });
+}
+
+/** Move the selection, clamped to the list. */
+function ansiPickerMove(state, delta) {
+  if (!state.filtered.length) return;
+  state.sel = Math.max(0, Math.min(state.filtered.length - 1, state.sel + delta));
+}
+
+/** Shared list windowing for the two-pane layout. */
+function ansiPickerWindow(state, listRows) {
+  if (state.sel < state.scroll) state.scroll = state.sel;
+  if (state.sel >= state.scroll + listRows) state.scroll = state.sel - listRows + 1;
+  state.scroll = Math.max(0, Math.min(state.scroll, Math.max(0, state.filtered.length - listRows)));
+  return state.filtered.slice(state.scroll, state.scroll + listRows);
+}
+
+/** Fuzzy-filter helper: Fuse first, substring match as a fallback. */
+function ansiPickerFilter(all, query, keys) {
+  if (!query.length) return [...all];
+  const Fuse = require('fuse.js');
+  const fuse = new Fuse(all, { keys, threshold: 0.3 });
+  const results = fuse.search(query).map(r => r.item);
+  return results.length > 0 ? results
+    : all.filter(item => keys.some(k =>
+        String(item[k]).toLowerCase().includes(query.toLowerCase())));
+}
+
+// Ctrl+R fallback: history search with a preview pane. Inserts the selected
+// command on Enter, cancels on Escape without touching the line.
+async function showHistoryPickerFallback() {
+  let allEntries = [];
+  try {
+    allEntries = historyDB.getAll(500);
+  } catch (e) {
+    return null;
+  }
+  isFilePickerActive = true;
+
+  const state = { all: allEntries, filtered: [...allEntries], query: '', sel: 0, scroll: 0 };
+
+  const applyFilter = () => {
+    state.filtered = ansiPickerFilter(state.all, state.query, ['command']);
+    state.sel = 0;
+    state.scroll = 0;
+  };
+
+  const draw = (st, rows, cols) => {
+    const listW = Math.max(24, Math.floor(cols * 0.6));
+    const prevW = Math.max(10, cols - listW - 1);
+    const listRows = Math.max(1, rows - 3);
+    const win = ansiPickerWindow(st, listRows);
+    const entry = st.filtered[st.sel] || null;
+    const meta = entry
+      ? `${new Date(entry.timestamp * 1000).toLocaleString()}  exit ` +
+        `${entry.exit_code === null ? '-' : entry.exit_code}  ${entry.duration}ms  ${entry.cwd || ''}`
+      : (st.filtered.length === 0 ? '(no commands found)' : '');
+
+    const lines = [];
+    lines.push('\x1b[1mHistory Search\x1b[0m  (type to filter, arrows: move, Enter: insert, Esc: cancel)');
+    lines.push(`Filter: ${st.query}`);
+    for (let i = 0; i < listRows; i++) {
+      const idx = st.scroll + i;
+      const item = win[i];
+      const text = ansiPad(item ? item.command : '', listW - 3);
+      const left = item
+        ? (idx === st.sel ? `\x1b[7m▶ ${text}\x1b[0m` : `  ${text}`)
+        : '';
+      let right = '';
+      if (i === 0) right = meta;
+      else if (i === 1 && entry) right = entry.command;
+      lines.push(left + '\x1b[90m│\x1b[0m' + ansiPad(right, prevW));
+    }
+    return lines;
+  };
+
+  const handleKey = (st, str, key, ctl) => {
+    if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+      ctl.finish(null);
+      return;
+    }
+    if (key.name === 'return' || key.name === 'enter') {
+      const entry = st.filtered[st.sel];
+      ctl.finish(entry ? entry.command : null);
+      return;
+    }
+    if (key.name === 'up' || (key.ctrl && key.name === 'p')) {
+      ansiPickerMove(st, -1); ctl.render(); return;
+    }
+    if (key.name === 'down' || (key.ctrl && key.name === 'n')) {
+      ansiPickerMove(st, 1); ctl.render(); return;
+    }
+    if (key.name === 'pageup') { ansiPickerMove(st, -10); ctl.render(); return; }
+    if (key.name === 'pagedown') { ansiPickerMove(st, 10); ctl.render(); return; }
+    if (key.name === 'home') { st.sel = 0; ctl.render(); return; }
+    if (key.name === 'end') { ansiPickerMove(st, st.filtered.length); ctl.render(); return; }
+    if (key.name === 'backspace') {
+      if (st.query.length > 0) {
+        st.query = st.query.slice(0, -1);
+        applyFilter();
+        ctl.render();
+      }
+      return;
+    }
+    const ch = (key.sequence && key.sequence.length === 1)
+      ? key.sequence
+      : (key.name && key.name.length === 1 ? key.name : null);
+    if (ch && !key.ctrl && !key.meta && ch >= '\x20' && ch <= '\x7e') {
+      st.query += ch;
+      applyFilter();
+      ctl.render();
+    }
+  };
+
+  return runAnsiPicker(state, draw, handleKey);
+}
+
+// Ctrl+N fallback: file browser with a preview pane. ← goes to the parent
+// directory, → descends into the highlighted directory, Enter selects the
+// highlighted entry (file or directory), Esc cancels. The browsed
+// directory stays inside the picker — the shell's cwd never changes.
+async function showFilePickerFallback() {
+  let allFiles;
+  try {
+    allFiles = await readDirAsync(SHELL.cwd);
+  } catch (e) {
+    return null;
+  }
+  isFilePickerActive = true;
+
+  const state = {
+    browseDir: SHELL.cwd, all: allFiles, filtered: [...allFiles],
+    query: '', sel: 0, scroll: 0,
+    previewMeta: '', previewBody: '', previewToken: 0,
+  };
+
+  const applyFilter = () => {
+    state.filtered = ansiPickerFilter(state.all, state.query, ['name']);
+    state.sel = 0;
+    state.scroll = 0;
+  };
+
+  // Previews are async (file reads); the token drops results that arrive
+  // after the selection moved on.
+  const loadPreview = async () => {
+    const st = state;
+    const token = ++st.previewToken;
+    const item = st.filtered[st.sel];
+    if (!item) {
+      st.previewMeta = '';
+      st.previewBody = st.filtered.length === 0 ? '(no files)' : '';
+      if (st._render) st._render();
+      return;
+    }
+    const full = path.resolve(st.browseDir, item.name);
+    if (item.isDirectory) {
+      st.previewMeta = full;
+      st.previewBody = '[Directory]';
+      if (st._render) st._render();
+      return;
+    }
+    let stat = null;
+    try { stat = await fs.promises.stat(full); } catch (e) { /* unreadable */ }
+    if (token !== st.previewToken) return;
+    const sizeStr = stat ? (stat.size / 1024).toFixed(1) + ' KB' : '';
+    const preview = await getFilePreview(item.name, 40, st.browseDir);
+    if (token !== st.previewToken) return;
+    st.previewMeta = full + (sizeStr ? '  ' + sizeStr : '');
+    st.previewBody = preview.type === 'image'
+      ? `[Image: ${preview.sizeStr}]`
+      : (preview.content || '');
+    if (st._render) st._render();
+  };
+
+  const draw = (st, rows, cols) => {
+    const listW = Math.max(24, Math.floor(cols * 0.6));
+    const prevW = Math.max(10, cols - listW - 1);
+    const listRows = Math.max(1, rows - 4);
+    const win = ansiPickerWindow(st, listRows);
+
+    const lines = [];
+    lines.push('\x1b[1mFile Picker\x1b[0m  (type to filter, ←: parent dir, →: enter dir, Enter: select, Esc: cancel)');
+    lines.push(`\x1b[90m${ansiClip(st.browseDir, cols - 2)}\x1b[0m` +
+      (st.query ? `  Filter: ${st.query}` : ''));
+    for (let i = 0; i < listRows; i++) {
+      const idx = st.scroll + i;
+      const item = win[i];
+      let left = '';
+      if (item) {
+        const kind = item.isDirectory ? '[D] ' : '[F] ';
+        const name = item.name + (item.isDirectory ? '/' : '');
+        const text = ansiPad(kind + name, listW - 2);
+        left = idx === st.sel ? `\x1b[7m▶ ${text}\x1b[0m` : `  ${text}`;
+      }
+      const right = i === 0 ? ansiClip(st.previewMeta, prevW)
+        : (i >= 2 ? ansiClip(st.previewBody.split('\n')[i - 2] || '', prevW) : '');
+      lines.push(left + '\x1b[90m│\x1b[0m' + ansiPad(right, prevW));
+    }
+    return lines;
+  };
+
+  const changeDir = async (newDir) => {
+    let newFiles;
+    try {
+      newFiles = await readDirAsync(newDir);
+    } catch (e) {
+      return; // unreadable: stay put, like the OpenTUI picker
+    }
+    state.browseDir = newDir;
+    state.all = newFiles;
+    state.query = '';
+    applyFilter();
+    loadPreview();
+    if (state._render) state._render();
+  };
+
+  const handleKey = (st, str, key, ctl) => {
+    if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+      ctl.finish(null);
+      return;
+    }
+    if (key.name === 'return' || key.name === 'enter') {
+      const item = st.filtered[st.sel];
+      ctl.finish(item ? path.resolve(st.browseDir, item.name) : null);
+      return;
+    }
+    if (key.name === 'left') {
+      const parent = path.dirname(st.browseDir);
+      if (parent !== st.browseDir) changeDir(parent).catch(() => {});
+      return;
+    }
+    if (key.name === 'right') {
+      const item = st.filtered[st.sel];
+      if (item && item.isDirectory) {
+        changeDir(path.resolve(st.browseDir, item.name)).catch(() => {});
+      }
+      return;
+    }
+    if (key.name === 'up' || (key.ctrl && key.name === 'p')) {
+      ansiPickerMove(st, -1); loadPreview(); ctl.render(); return;
+    }
+    if (key.name === 'down' || (key.ctrl && key.name === 'n')) {
+      ansiPickerMove(st, 1); loadPreview(); ctl.render(); return;
+    }
+    if (key.name === 'pageup') { ansiPickerMove(st, -10); loadPreview(); ctl.render(); return; }
+    if (key.name === 'pagedown') { ansiPickerMove(st, 10); loadPreview(); ctl.render(); return; }
+    if (key.name === 'home') { st.sel = 0; loadPreview(); ctl.render(); return; }
+    if (key.name === 'end') { ansiPickerMove(st, st.filtered.length); loadPreview(); ctl.render(); return; }
+    if (key.name === 'backspace') {
+      if (st.query.length > 0) {
+        st.query = st.query.slice(0, -1);
+        applyFilter();
+        loadPreview();
+        ctl.render();
+      }
+      return;
+    }
+    const ch = (key.sequence && key.sequence.length === 1)
+      ? key.sequence
+      : (key.name && key.name.length === 1 ? key.name : null);
+    if (ch && !key.ctrl && !key.meta && ch >= '\x20' && ch <= '\x7e') {
+      st.query += ch;
+      applyFilter();
+      loadPreview();
+      ctl.render();
+    }
+  };
+
+  loadPreview(); // fill the preview pane for the initial selection
+  return runAnsiPicker(state, draw, handleKey);
 }
 
 // Handle Ctrl+N for file picker and Ctrl+R for history picker
