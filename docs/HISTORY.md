@@ -68,6 +68,11 @@ the left pane lists commands newest-first, the right pane previews the
 selection with time, exit code, duration, and directory. Typing fuzzy-filters
 the list; Enter inserts the selected command into the prompt line.
 
+On platforms where OpenTUI has no native build yet (FreeBSD/GhostBSD), the
+picker automatically switches to a plain-ANSI implementation with the same
+layout and keys — see docs/FGSH.md → "Fallback pickers". `FGSH_TUI=ansi`
+forces the fallback everywhere; `FGSH_TUI=opentui` disables it.
+
 ## Future Features
 
 Planned enhancements:

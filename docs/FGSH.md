@@ -167,6 +167,7 @@ Available builtins:
 - `echo` / `printf` - output text
 - `cd` / `mkcd` / `pwd` / `clear` - directory and terminal management
 - `ls` / `cat` - file listing and concatenation
+- `clip` - copy standard input to the system clipboard (see [clip](#clip))
 - `export` / `unset` / `env` - environment variables
 - `declare` - display arrays/variables
 - `alias` / `unalias` - command shortcuts
@@ -179,6 +180,72 @@ Available builtins:
 - `true` / `false` - test commands
 - `exit` - leave the shell
 - `js` - JavaScript evaluation
+
+#### clip
+
+`clip` copies input to the system clipboard, so a command's output can be
+pasted elsewhere without a temporary file:
+
+```
+clip [FILE]...
+```
+
+**Input sources and precedence.** `clip` takes its input from the first of:
+
+1. **FILE operands** - the contents of each named file, concatenated in
+   argument order (`clip a.txt b.txt` puts both files on the clipboard).
+   Paths are resolved relative to the shell's working directory.
+2. **Piped stdin** - the output of the previous pipeline stage
+   (`ls | clip`, `echo "hello" | clip`). `clip` runs in-process as a
+   pipeline builtin, so the upstream stage's output is collected and handed
+   over directly.
+3. **Redirected stdin** - a stream redirected into the shell
+   (`clip < notes.txt`); with a bare `< file` redirect and no other
+   operands, the redirect target is passed to `clip` as a file operand.
+
+If none of these is available (run at an interactive prompt with no pipe
+and no operands), it fails with:
+
+```
+clip: no input. Pipe a command, e.g. `ls | clip`
+```
+
+**Clipboard backend.** `clip` shells out to whichever clipboard tool
+matches the environment:
+
+| Platform / display server | Tool | Invocation |
+|---|---|---|
+| Wayland (`WAYLAND_DISPLAY` set) | `wl-copy` | `wl-copy` |
+| X11 (`DISPLAY` set) | `xclip` | `xclip -selection clipboard` |
+| X11 (`DISPLAY` set) | `xsel` | `xsel --clipboard --input` |
+| macOS | `pbcopy` | `pbcopy` |
+
+The environment variables are only a preference hint: when they are unset
+(e.g. a session that doesn't export them but the tools still work), the
+tools are tried in the order `wl-copy`, `xclip`, `xsel`, `pbcopy`. The first
+resolvable tool that exits 0 wins; failures fall through to the next
+candidate. If no tool succeeds:
+
+```
+clip: no clipboard tool found (install wl-copy, xclip, or xsel)
+```
+
+**Examples:**
+
+```sh
+ls | clip              # copy the output of a command
+echo "hello" | clip    # copy a literal string
+clip notes.txt         # copy the contents of a file
+clip a.txt b.txt       # concatenate several files onto the clipboard
+clip < notes.txt       # copy via an input redirect
+```
+
+**Options:** `--help` prints the usage summary. `--` is accepted and
+ignored (useful to stop option parsing before file operands); any other
+argument starting with `-` is skipped as well.
+
+**Exit status:** 0 on success; 1 if no input is available, a FILE cannot
+be read (`clip: FILE: ...`), or no clipboard tool is available.
 
 ### Pipeline Execution
 
@@ -273,12 +340,67 @@ The OpenTUI core is loaded lazily the first time Ctrl+R is pressed, and
 works in the compiled `./fgsh` binary (its native library is embedded by
 `bun build --compile`).
 
+**Fallback pickers (no OpenTUI):** `@opentui/core` ships prebuilt native
+binaries only for Linux, macOS and Windows, so on FreeBSD/GhostBSD — where
+an OpenTUI port is still in progress upstream — its core cannot load yet.
+When the import (or the renderer creation) fails, Ctrl+R and Ctrl+N
+automatically switch to plain-ANSI fallback pickers: the same two-pane
+layout, fuzzy filter, keys and behavior, drawn with ANSI on the alternate
+screen and driven by the line editor's readline-style `keypress` events
+instead of OpenTUI's key input. The inline completion menu on the command
+line was never an OpenTUI component (it is drawn by `src/line-editor.js`),
+which is why it already worked on those platforms.
+
+`FGSH_TUI` overrides the detection:
+- `FGSH_TUI=ansi` — always use the plain-ANSI pickers (handy for testing
+  them on Linux)
+- `FGSH_TUI=opentui` — require OpenTUI and report an error instead of
+  falling back
+
+### Prompt Width Calibration
+
+The line editor repaints the prompt from a tracked anchor, so it must know
+exactly how many terminal cells the prompt occupies. That width cannot be
+computed from a static per-codepoint table, because terminals genuinely
+disagree about zero-width and private-use codepoints (U+200B in powerline
+prompts, nerd-font glyphs): tmux was measured painting U+200B in zero
+cells, while other hosts (kitty, zellij) show the one- or two-cell
+disagreements that used to stack copies of the prompt on narrow windows
+and put the edit cursor a cell off.
+
+So on every `prompt()` the first paint is bracketed by two cursor-position
+reports (`ESC[6n` — the standard query every terminal answers) and the
+reported delta becomes the prompt's width for that prompt. Terminals that
+never answer fall back to the static table after a 250ms timeout, so
+behaviour is unchanged where the query is unavailable. A reply split
+across reads is buffered rather than mistaken for the Escape key.
+
+The probe also calibrates the paint's **end row**, not just its width.
+When the prompt's last cell lands exactly on a wrap boundary (prompt
+width a multiple of the terminal width), terminals disagree about the
+trailing U+200B: some keep the wrap pending on the last row, others let
+the zero-width character resolve the pending wrap and drop the cursor to
+the next row. Both report a plausible *width*, so the column delta alone
+cannot tell them apart — only the reply's row delta can (measured 2026-10-10
+in a pyte emulator: a 55-cell prompt on a 55-column window ends its paint
+one row lower, which anchored every repaint a row low and stacked copies
+of the prompt; the same mechanism explains the kitty/zellij reports where
+the probe logged "55 == 55" yet the screen duplicated). The editor adopts
+that row delta (`_rowEndShift`) for boundary-ending paints, so the anchor
+matches whatever the real terminal does.
+
 ### File Picker (Ctrl+N)
 
-Custom file browser:
+An OpenTUI app (same stack as the history picker) drawn on the alternate
+screen, with a two-pane layout: a scrollable list on the left and a live
+preview on the right:
 1. User presses Ctrl+N
-2. Display directory tree
-3. Show live preview of selected file
+2. Display directory tree, rooted at the shell's cwd
+3. Show live preview of selected file — file contents and metadata in the
+   right pane; on Kitty terminals an image file is transmitted as an actual
+   inline image (the picker pins OpenTUI's ImageRenderable to the kitty
+   protocol rather than its default 'auto', whose async capability probe a
+   bare pty never answers)
 4. Navigate with arrow keys: Up/Down move the list, Left goes to the
    parent directory, Right enters the highlighted directory (the picker
    browses on its own — it never changes the shell's working directory)
@@ -287,8 +409,13 @@ Custom file browser:
    shell's cwd (`docs/notes.md` when picked inside `docs/`, a bare
    `notes.md` when picked in the cwd itself, or the absolute path when the
    file lives outside the cwd)
-6. Ctrl+F opens filter mode: typed text fuzzy-filters the list, Enter
-   selects the best match
+6. Typing filters the list directly (fuzzy, with a substring fallback) —
+   the same interaction as the history picker, with no separate filter
+   mode to enter
+
+Because the picker attaches its key listener asynchronously after Ctrl+N is
+handled, an Enter delivered in the same read as Ctrl+N is not consumed by
+the picker; send the keys as separate writes.
 
 ### Command Prediction Menu
 

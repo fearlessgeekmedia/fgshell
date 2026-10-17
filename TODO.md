@@ -69,8 +69,58 @@
   - The fuzzy menu box is drawn below the anchor with a fixed cap
     (`min(10, rows-6)`), independent of the command's length, and erased
     with scroll-consistent movement
+  - Character widths come from terminal-measured cell counts, not string
+    length. U+200B (the zero-width space the powerline fgsh-prompt ends
+    with) paints in **zero** cells — verified in a real tmux pane
+    (2026-10-09: print A+ZWSP+B, read the cursor back → 2 cells). An
+    earlier attempt counted it as one cell (reasoning from font .notdef
+    glyphs, which terminals do not consult for cursor math); that put the
+    edit cursor one cell past the painted text and, on narrow windows,
+    made each repaint drift a row — stacking copies of the prompt
+    (duplication-bug.png)
+  - Because terminals genuinely disagree about these codepoints (kitty /
+    zellij hosts kept reproducing the stack even with a correct table),
+    the editor now **calibrates against the live terminal**: every
+    `prompt()` brackets its first paint with two cursor-position reports
+    (`ESC[6n`) and adopts the reported width (`_beginPromptProbe` in
+    `src/line-editor.js`); no answer within 250ms falls back to the table.
+    Adversarial coverage: `zwsp_disagreement_session()` runs the cursor
+    session against a terminal that paints U+200B in one cell (the
+    editor's table says zero) — it fails without calibration and passes
+    with it
+  - Follow-up fix (2026-10-10): width alone is not enough at the exact
+    wrap boundary. When the prompt's last cell lands on the row boundary,
+    some emulators (pyte measured; kitty/zellij reports match) let the
+    trailing U+200B **resolve the pending wrap** and drop the cursor a
+    row, while the width probe still reports a plausible value ("55 ==
+    55") — every repaint then erased one row short and stacked a copy of
+    the prompt. The probe now also adopts the reply's **row delta**
+    (`_rowEndShift` in `src/line-editor.js`) and applies it to
+    boundary-ending paints, so the anchor matches the real terminal.
+    Verified in a pyte emulator with a realistic CPR-answering pty
+    harness: 55-cell prompt on a 55-column window (prompt exactly fills
+    the row) went from stacked copies at rows 0/1/3 to a single prompt
+    row; the same harness reproduces the stack with the row adoption
+    disabled (A/B), and `test-menu-duplication.py` stays at 224/224
   - Regression coverage: `test-menu-duplication.py` `small_window_sessions()`
-    (50x40, 100x12, 80x6)
+    (50x40, 100x12, 80x6), `cursor_session()` (ZWSP prompt),
+    `zwsp_disagreement_session()`, plus real-terminal verification in tmux
+    across 42–100-column panes, including exact wrap boundaries, a
+    wrapping powerline prompt, and the ghost-suggestion path with the
+    fuzzy menu open
+- [x] FreeBSD/GhostBSD fallback for the OpenTUI pickers (Ctrl+R history,
+      Ctrl+N file picker) — OpenTUI ships native binaries for
+      Linux/macOS/Windows only
+  - `loadOpenTUI()` in `src/fgshell.js` probes the import once; on failure
+    (or `FGSH_TUI=ansi`) both pickers switch to plain-ANSI implementations
+    that draw the same two-pane layout on the alternate screen and read
+    keys through the line editor's `keypress` events
+  - `FGSH_TUI=opentui` disables the fallback (error instead)
+  - Note: the fuzzy completion menu on the command line itself is not an
+    OpenTUI component (drawn by `src/line-editor.js`), which is why it
+    already worked on FreeBSD/GhostBSD
+  - Regression coverage: `test-menu-duplication.py`
+    `fallback_history_session()` / `fallback_picker_session()`
 - [ ] Improve quote escaping for `js` command and other builtins
   - Currently requires manual escape sequences for nested quotes
   - Consider context-aware quote handling for JavaScript code blocks
@@ -82,7 +132,15 @@
 - [ ] Return values from functions (beyond exit codes)
 
 ### Job Control
-- [ ] Proper Ctrl+Z terminal state handling (edge cases remain)
+- [ ] Ctrl+Z edge cases beyond single foreground commands
+  - Basic suspend/resume for single foreground commands works (fixed in commits 01bb6b0, 419b34b)
+  - Pipelines/compound commands: the SIGTSTP handler only acts when `currentChild` is set,
+    which happens only in the single-command interactive path (src/fgshell.js:4044), so
+    Ctrl+Z is effectively a no-op there
+  - Stop-detection polls `/proc/<pid>/stat` (src/fgshell.js:910, :4124) — Linux-only;
+    on macOS/GhostBSD the shell relies solely on the SIGTSTP signal-handler path
+  - Degrades without libptctl.so: signal forwarding still works, terminal handoff doesn't
+    (see CTRL_Z_IMPLEMENTATION.md → Known Limitations)
 - [ ] More robust signal handling
 - [ ] Disown command for detaching jobs
 
@@ -94,6 +152,9 @@
 ## TODO - Medium Priority
 
 ### Features
+- [ ] `exec` builtin (like bash: replace the shell process with a command, e.g. `exec vim`;
+      must not replace the shell when running in the interactive line-handler loop —
+      evaluate whether to support `exec` with builtins/functions or external commands only)
 - [ ] Process substitution (`<(cmd)` and `>(cmd)`)
 - [ ] Arithmetic conditionals (`((expr))`)
 - [ ] String manipulation builtins (substring, pattern replace)
@@ -151,9 +212,21 @@
 ## Known Issues to Fix
 
 1. **Here-documents** - File-based input works (scripts, `source`, `.fgshrc`; content delivered via temp file); interactive/`-c` mode and quoted delimiters still pending
-2. **Ctrl+Z handling** - Edge cases with terminal state
+2. **Ctrl+Z handling** - Works for single foreground commands; pipelines and non-Linux
+   (/proc-less) platforms still have edge cases (see Job Control above)
 3. **sudo password input** - Requires `-S` flag to read from stdin
 4. **Performance** - JS/Bun slower than native C shells (quantified 2026-10-07: `fgsh -c` ≈ 27× bash — see "Performance Benchmarks" below)
+5. **`SHELL.prompt` is undefined** - src/fgshell.js:5472 calls `rl.setPrompt(SHELL.prompt)`,
+   but SHELL (src/shell.js:29-37) has no `prompt` property; `setPrompt` turns it into `''`
+   (src/line-editor.js:141) and `prompt()` overwrites it right after, so mostly harmless —
+   but it briefly clears the prompt and the line handler relies on an undefined property
+6. **`ls -1` scope error** - In the `argv['1']` branch (src/fgshell.js:1222-1225), the
+   `for (const name of names)` loop references `f.stat.ino`/`f.stat.size`, but `f` only
+   exists inside the earlier `.map`; `ls -1 -i` or `ls -1 -s` throws a ReferenceError
+   (plain `ls -1` is fine because the ternary short-circuits)
+7. **Stale snapshots** - `src/test-fgshell.js` and `src/test-fgshell2.js` are old copies of
+   `src/fgshell.js` (headers still say "SIGINT only after removal of SIGTSTP"), not tests;
+   they lag the main file by ~1,600 lines and should be deleted or archived
 
 ## Performance Benchmarks (measured 2026-10-07)
 
